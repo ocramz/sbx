@@ -147,7 +147,6 @@ pub enum Reason {
         source: &'static str,
     },
     NamespaceClone,
-    ThreadWithoutSharedFiles,
     SubprocessesDisabled,
     SocketFamily,
     EgressSocketType,
@@ -164,12 +163,6 @@ impl fmt::Display for Reason {
         match self {
             Reason::DenyList { source } => write!(f, "denied by {source}"),
             Reason::NamespaceClone => write!(f, "creating namespaces is not allowed"),
-            Reason::ThreadWithoutSharedFiles => {
-                write!(
-                    f,
-                    "threads must share the file descriptor table (CLONE_THREAD without CLONE_FILES)"
-                )
-            }
             Reason::SubprocessesDisabled => write!(f, "process.subprocesses = false: only threads may be created"),
             Reason::SocketFamily => write!(f, "address family not in seccomp.socket_families"),
             Reason::EgressSocketType => write!(
@@ -310,14 +303,6 @@ pub fn build_table(p: &Policy) -> Result<RuleTable, String> {
             Reason::NamespaceClone,
         );
     }
-    // A thread with its own fd table would make pidfd_getfd (which reads the
-    // thread-group leader's table) see a different socket than the caller.
-    let thread_files = (libc::CLONE_THREAD | libc::CLONE_FILES) as u64;
-    t.add(
-        libc::SYS_clone,
-        vec![Cond::int(0, Op::MaskedEq(thread_files), libc::CLONE_THREAD as u64)],
-        Reason::ThreadWithoutSharedFiles,
-    );
     if !p.process.subprocesses {
         let thread = libc::CLONE_THREAD as u64;
         t.add(
@@ -835,10 +820,12 @@ pub mod tests {
             None,
             "connect is not filtered outside egress mode"
         );
-        let cl = (libc::CLONE_VM | libc::CLONE_SIGHAND | libc::CLONE_THREAD) as u64;
+        let thread = (libc::CLONE_VM | libc::CLONE_SIGHAND | libc::CLONE_THREAD) as u64;
+        assert_eq!(reason(&p, libc::SYS_clone, [thread, 0, 0, 0, 0, 0]), None);
+        let userns = (libc::CLONE_NEWUSER | libc::SIGCHLD) as u64;
         assert_eq!(
-            reason(&p, libc::SYS_clone, [cl, 0, 0, 0, 0, 0]),
-            Some(Reason::ThreadWithoutSharedFiles)
+            reason(&p, libc::SYS_clone, [userns, 0, 0, 0, 0, 0]),
+            Some(Reason::NamespaceClone)
         );
     }
 

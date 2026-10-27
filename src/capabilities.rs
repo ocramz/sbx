@@ -390,8 +390,12 @@ fn ptrace_access(p: &Policy) -> Result<String, String> {
     }
     let theirs = r.as_raw_fd();
     let result = (|| {
-        let pidfd =
-            notify::pidfd_open(pid).map_err(|e| format!("pidfd_open: {}", std::io::Error::from_raw_os_error(e)))?;
+        let pidfd = notify::pidfd_open_thread(pid).map_err(|e| {
+            format!(
+                "pidfd_open(PIDFD_THREAD): {} (needs Linux 6.9+)",
+                std::io::Error::from_raw_os_error(e)
+            )
+        })?;
         crate::egress::pidfd_getfd(&pidfd, theirs).map_err(|e| {
             format!(
                 "pidfd_getfd: {} (needs CAP_SYS_PTRACE, Yama ptrace_scope < 3, and a seccomp profile that \

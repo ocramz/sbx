@@ -189,8 +189,18 @@ pub fn tgid_of(tid: i32) -> Result<i32, String> {
 }
 
 pub fn pidfd_open(pid: i32) -> Result<OwnedFd, i32> {
+    pidfd_open_flags(pid, 0)
+}
+
+/// pidfd for one thread (PIDFD_THREAD, Linux 6.9+): pidfd_getfd on it reads
+/// that thread's own file descriptor table.
+pub fn pidfd_open_thread(tid: i32) -> Result<OwnedFd, i32> {
+    pidfd_open_flags(tid, libc::O_EXCL as libc::c_uint)
+}
+
+fn pidfd_open_flags(pid: i32, flags: libc::c_uint) -> Result<OwnedFd, i32> {
     // SAFETY: plain syscall; the returned fd is owned below.
-    let r = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    let r = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, flags) };
     if r < 0 {
         return Err(errno());
     }

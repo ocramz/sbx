@@ -451,6 +451,15 @@ assert s.connect_ex(("127.0.0.1", int(sys.argv[1]))) == errno.EINPROGRESS
 select.select([], [s], [], 5)
 assert s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) == 0
 """, A.port), pol=EGRESS)
+expect("connect from a thread after the main thread exited", 0, ["--timeout", "20", *py("""
+import ctypes, os, socket, sys, threading, time
+def worker():
+    time.sleep(0.5)
+    s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
+    os._exit(0 if s.recv(6) == b"hello\\n" else 1)
+threading.Thread(target=worker).start()
+ctypes.CDLL(None).pthread_exit(None)
+""", A.port)], pol=EGRESS)
 expect("UDP sockets are refused", 1, py("import socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM)"),
        pol=EGRESS, log="allows TCP sockets only")
 expect("raw sockets are refused", 1, py("import socket; socket.socket(socket.AF_INET, socket.SOCK_RAW, 1)"), pol=EGRESS)

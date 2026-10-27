@@ -18,7 +18,7 @@
 
 use crate::log::{self, errno, os_err};
 use crate::net::{classify, parse_sockaddr, AddrClass, AnswerScope, ConnectTarget};
-use crate::notify::{comm_of, deny, describe, pidfd_open, raise_fatal, tgid_of, Listener, Stats};
+use crate::notify::{comm_of, deny, describe, pidfd_open_thread, raise_fatal, Listener, Stats};
 use crate::policy::{CompiledRule, EgressTarget, Policy, Violation};
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, SocketAddr};
@@ -149,42 +149,28 @@ impl Egress {
         let addr_ptr = n.data.args[1];
         let addr_len = n.data.args[2] as u32;
 
-        // 1. Pin the calling process: the pidfd stays valid even if the pid is
+        // 1. Pin the calling thread: the pidfd stays valid even if the tid is
         //    reused, and ID_VALID proves the caller was still waiting when we
-        //    opened it.
-        let tgid = match tgid_of(tid) {
-            Ok(t) => t,
-            Err(e) => return self.internal(l, n, &e),
-        };
-        let pidfd = match pidfd_open(tgid) {
+        //    opened it. Every failure below answers the caller unless it is gone
+        //    (internal() checks), so no thread is left blocked.
+        let pidfd = match pidfd_open_thread(tid) {
             Ok(fd) => fd,
-            Err(libc::ESRCH) => return Ok(()),
             Err(e) => {
-                return self.internal(
-                    l,
-                    n,
-                    &format!("pidfd_open({tgid}): {}", std::io::Error::from_raw_os_error(e)),
-                )
+                let e = std::io::Error::from_raw_os_error(e);
+                return self.internal(l, n, &format!("pidfd_open(tid {tid}, PIDFD_THREAD): {e}"));
             }
         };
         if !l.id_valid(id) {
             return Ok(());
         }
 
-        // 2. Our own reference to the caller's socket.
+        // 2. Our own reference to the caller's socket, from the caller's own fd table.
         let sock = match pidfd_getfd(&pidfd, fd_num) {
             Ok(s) => s,
             Err(libc::EBADF) => return l.respond(id, libc::EBADF, 0),
-            Err(libc::ESRCH) => return Ok(()),
             Err(e) => {
-                return self.internal(
-                    l,
-                    n,
-                    &format!(
-                        "pidfd_getfd(pid {tgid}, fd {fd_num}): {}",
-                        std::io::Error::from_raw_os_error(e)
-                    ),
-                )
+                let e = std::io::Error::from_raw_os_error(e);
+                return self.internal(l, n, &format!("pidfd_getfd(tid {tid}, fd {fd_num}): {e}"));
             }
         };
         let domain = match sockopt(&sock, libc::SO_DOMAIN) {
@@ -214,7 +200,7 @@ impl Egress {
         }
         let bytes = match read_memory(tid, addr_ptr, addr_len as usize) {
             Ok(b) => b,
-            Err(libc::ESRCH) => return Ok(()),
+            Err(libc::ESRCH) => return self.internal(l, n, &format!("process_vm_readv(tid {tid}): no such task")),
             Err(libc::EPERM) => {
                 return self.internal(
                     l,
