@@ -1,19 +1,31 @@
 //! Process model:
 //!
-//!   sbx (supervisor, unsandboxed, PID 1 in job mode)
-//!    └─ child: setsid → rlimits → drop uid/gid → NO_NEW_PRIVS → Landlock → seccomp → execve
+//!   sbx (supervisor: PID 1 in a container, unsandboxed, never runs payload code)
+//!    ├─ threads, started after fork: seccomp notification dispatcher,
+//!    │  blocking egress connects, DNS proxy
+//!    └─ child: setsid → chdir → rlimits → drop identity and capabilities
+//!              → PDEATHSIG → NO_NEW_PRIVS → Landlock → seccomp prelude
+//!              → policy filter (listener handed to the supervisor) → execve
 //!         └─ untrusted program and all its descendants (inherit every layer)
 //!
-//! The supervisor is single-threaded, so the child may allocate between fork
-//! and exec. Setup failures in the child are sent back over a CLOEXEC pipe.
+//! The supervisor is single-threaded until after fork, so the child may
+//! allocate before exec. Setup failures in the child come back over a
+//! close-on-exec pipe; the listener comes over a SOCK_SEQPACKET socketpair.
 
+use crate::dns;
+use crate::egress::Egress;
 use crate::landlock_layer;
-use crate::policy::Policy;
+use crate::log::{self, errno, os_err};
+use crate::notify::{self, Dispatcher, Listener, Received, Stats};
+use crate::policy::{DnsCfg, Limit, Policy, Timeout};
 use crate::seccomp_layer::{self, Programs};
 use landlock::RulesetCreated;
 use std::ffi::CString;
 use std::io::Read;
-use std::os::fd::{FromRawFd, RawFd};
+use std::net::TcpListener;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub struct Launch {
@@ -21,204 +33,500 @@ pub struct Launch {
     pub argv: Vec<CString>,
     pub envp: Vec<CString>,
     pub landlock: Option<RulesetCreated>,
-    pub seccomp: Option<Programs>,
+    pub seccomp: Programs,
 }
 
-const FORWARDED: [libc::c_int; 6] =
-    [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT, libc::SIGUSR1, libc::SIGUSR2];
-
-fn errno() -> i32 {
-    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+/// Supervisor-side services for the sandbox.
+pub struct Services {
+    pub egress: Option<Arc<Egress>>,
+    pub dns: Option<(TcpListener, DnsCfg)>,
 }
 
-fn os_err(what: &str) -> String {
-    format!("{what}: {}", std::io::Error::last_os_error())
+const FORWARDED: [libc::c_int; 6] = [
+    libc::SIGTERM,
+    libc::SIGINT,
+    libc::SIGHUP,
+    libc::SIGQUIT,
+    libc::SIGUSR1,
+    libc::SIGUSR2,
+];
+
+pub fn run(p: &Policy, l: Launch, svc: Services) -> i32 {
+    match launch(p, l, svc) {
+        Ok(code) => code,
+        Err(e) => {
+            log::error(e);
+            125
+        }
+    }
 }
 
-pub fn run(p: &Policy, mut l: Launch) -> i32 {
+fn pipe() -> Result<(OwnedFd, OwnedFd), String> {
+    let mut fds = [0 as RawFd; 2];
+    // SAFETY: fds has room for two descriptors.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(os_err("pipe2"));
+    }
+    // SAFETY: both fds are new and owned by us.
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
+fn socketpair() -> Result<(OwnedFd, OwnedFd), String> {
+    let mut fds = [0 as RawFd; 2];
+    // SAFETY: fds has room for two descriptors.
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err(os_err("socketpair"));
+    }
+    // SAFETY: both fds are new and owned by us.
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
+/// Block the signals the supervisor handles with sigtimedwait. Threads
+/// started later inherit the mask, so these always reach the main loop.
+fn block_signals() -> Result<libc::sigset_t, String> {
+    // SAFETY: sigset manipulation on a local set.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for s in FORWARDED.iter().copied().chain([libc::SIGCHLD, notify::fatal_signal()]) {
+            if libc::sigaddset(&mut set, s) != 0 {
+                return Err(os_err(format!("sigaddset({s})")));
+            }
+        }
+        if libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) != 0 {
+            return Err(os_err("sigprocmask(SIG_BLOCK)"));
+        }
+        Ok(set)
+    }
+}
+
+fn launch(p: &Policy, mut l: Launch, svc: Services) -> Result<i32, String> {
+    // SAFETY: getpid has no preconditions.
     let am_pid1 = unsafe { libc::getpid() } == 1;
     if !am_pid1 {
-        // Orphaned descendants get reparented to us so we can reap/kill them.
-        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
-    }
-
-    // Block the signals we handle synchronously via sigtimedwait().
-    let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
-    let mut old: libc::sigset_t = unsafe { std::mem::zeroed() };
-    unsafe {
-        libc::sigemptyset(&mut set);
-        libc::sigaddset(&mut set, libc::SIGCHLD);
-        for s in FORWARDED {
-            libc::sigaddset(&mut set, s);
+        // Orphaned descendants get reparented to us so we can reap and kill them.
+        // SAFETY: plain prctl.
+        if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
+            return Err(os_err("prctl(PR_SET_CHILD_SUBREAPER)"));
         }
-        libc::sigprocmask(libc::SIG_BLOCK, &set, &mut old);
     }
-
-    let mut fds = [0 as RawFd; 2];
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        crate::log_error(&os_err("pipe2"));
-        return 125;
-    }
-    let (rd, wr) = (fds[0], fds[1]);
+    let set = block_signals()?;
+    let (err_r, err_w) = pipe()?;
+    let (sock_parent, sock_child) = socketpair()?;
+    // SAFETY: getpid has no preconditions.
     let parent_pid = unsafe { libc::getpid() };
 
+    // SAFETY: the supervisor is single-threaded at this point.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
-        crate::log_error(&os_err("fork"));
-        return 125;
+        return Err(os_err("fork"));
     }
     if pid == 0 {
-        unsafe { libc::close(rd) };
-        let (stage, err) = child(p, &mut l, wr, parent_pid, &old);
-        let msg = format!("{stage}: {err}");
+        drop(err_r);
+        drop(sock_parent);
+        let (stage, e) = child(p, &mut l, err_w.as_raw_fd(), sock_child.as_raw_fd(), parent_pid);
+        let msg = format!("{stage}: {e}");
+        // SAFETY: report and exit without running destructors.
         unsafe {
-            libc::write(wr, msg.as_ptr().cast(), msg.len());
+            libc::write(err_w.as_raw_fd(), msg.as_ptr().cast(), msg.len());
             libc::_exit(if stage == "execve" { 127 } else { 125 });
         }
     }
 
-    // Parent. Drop our copy of the ruleset fd and wait for exec (pipe EOF) or an error.
+    // Parent: drop our copy of the ruleset fd and the child's ends.
     drop(l.landlock.take());
-    unsafe { libc::close(wr) };
-    let mut msg = String::new();
-    let _ = unsafe { std::fs::File::from_raw_fd(rd) }.read_to_string(&mut msg);
-    if !msg.is_empty() {
-        crate::log_error(&format!("sandbox setup failed in child: {msg}"));
-        if msg.starts_with("execve") && msg.contains("Permission denied") {
-            crate::log_error("hint: the program (and its interpreter) need 'x' in an fs rule, e.g. --rx /opt/app");
+    drop(err_w);
+    drop(sock_child);
+    let listener = match notify::recv_fd(sock_parent.as_raw_fd()) {
+        Ok(Received::Fd(fd)) => fd,
+        Ok(Received::Eof) | Ok(Received::Text(_)) => return child_setup_failed(pid, err_r),
+        Err(e) => {
+            kill_and_wait(pid);
+            return Err(format!("receiving the seccomp listener from the child: {e}"));
         }
-        let mut st = 0;
-        unsafe { libc::waitpid(pid, &mut st, 0) };
-        return if libc::WIFEXITED(st) { libc::WEXITSTATUS(st) } else { 125 };
-    }
-    crate::log_info(&format!("started pid {pid}"));
+    };
+    drop(sock_parent);
 
-    supervise(p, pid, am_pid1, &set)
+    let stats = Arc::new(Stats::default());
+    if let Err(e) = start_services(p, &l, listener, svc, &stats) {
+        kill_and_wait(pid);
+        return Err(e);
+    }
+
+    // EOF on the close-on-exec pipe means execve succeeded.
+    let mut msg = String::new();
+    if let Err(e) = std::fs::File::from(err_r).read_to_string(&mut msg) {
+        kill_and_wait(pid);
+        return Err(format!("reading the child's setup status: {e}"));
+    }
+    if !msg.is_empty() {
+        return Ok(report_child_failure(pid, &msg));
+    }
+    log::info(format!("started pid {pid}"));
+    Ok(supervise(p, pid, am_pid1, &set, &stats))
+}
+
+fn start_services(p: &Policy, l: &Launch, listener: OwnedFd, svc: Services, stats: &Arc<Stats>) -> Result<(), String> {
+    let listener = Arc::new(Listener::new(listener)?);
+    Dispatcher {
+        listener,
+        table: l.seccomp.table.clone(),
+        on_violation: p.seccomp.on_violation,
+        egress: svc.egress.clone(),
+        stats: Arc::clone(stats),
+    }
+    .spawn()?;
+    if let Some((tcp, cfg)) = svc.dns {
+        let egress = svc.egress.ok_or("BUG: DNS proxy without an egress filter")?;
+        dns::Proxy::spawn(tcp, cfg, egress)?;
+    }
+    Ok(())
+}
+
+fn child_setup_failed(pid: libc::pid_t, err_r: OwnedFd) -> Result<i32, String> {
+    let mut msg = String::new();
+    if let Err(e) = std::fs::File::from(err_r).read_to_string(&mut msg) {
+        kill_and_wait(pid);
+        return Err(format!("reading the child's setup status: {e}"));
+    }
+    if msg.is_empty() {
+        msg = "the child exited without reporting an error".into();
+    }
+    Ok(report_child_failure(pid, &msg))
+}
+
+fn report_child_failure(pid: libc::pid_t, msg: &str) -> i32 {
+    log::error(format!("sandbox setup failed in the child: {msg}"));
+    if msg.starts_with("execve") && msg.contains("Permission denied") {
+        log::error("hint: the program (and its interpreter) need 'x' in an fs rule, e.g. --rx /opt/app");
+    }
+    match wait_for(pid) {
+        Ok(st) if libc::WIFEXITED(st) => libc::WEXITSTATUS(st),
+        Ok(_) => 125,
+        Err(e) => {
+            log::error(e);
+            125
+        }
+    }
+}
+
+fn wait_for(pid: libc::pid_t) -> Result<libc::c_int, String> {
+    let mut st = 0;
+    loop {
+        // SAFETY: waiting for our own child.
+        let r = unsafe { libc::waitpid(pid, &mut st, 0) };
+        if r == pid {
+            return Ok(st);
+        }
+        if errno() != libc::EINTR {
+            return Err(os_err(format!("waitpid({pid})")));
+        }
+    }
+}
+
+fn kill_and_wait(pid: libc::pid_t) {
+    // SAFETY: killing our own child.
+    if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 && errno() != libc::ESRCH {
+        log::error(os_err(format!("kill({pid}, SIGKILL)")));
+    }
+    if let Err(e) = wait_for(pid) {
+        log::error(e);
+    }
 }
 
 /// Runs in the forked child. Returns only on failure.
-fn child(p: &Policy, l: &mut Launch, err_fd: RawFd, parent: libc::pid_t, mask: &libc::sigset_t) -> (&'static str, String) {
+fn child(p: &Policy, l: &mut Launch, err_fd: RawFd, sock_fd: RawFd, parent: libc::pid_t) -> (&'static str, String) {
+    // SAFETY (whole function): we are the only thread of a freshly forked child.
     unsafe {
-        // Own session + process group: no controlling terminal, killable as a group.
+        // Own session and process group: no controlling terminal, killable as a group.
         if libc::setsid() < 0 {
             return ("setsid", os_err("setsid"));
         }
-        if let Some(dir) = &p.process.workdir {
-            let c = CString::new(dir.as_os_str().as_encoded_bytes()).unwrap();
-            if libc::chdir(c.as_ptr()) != 0 {
-                return ("chdir", os_err(&dir.display().to_string()));
-            }
+        let wd = match CString::new(p.process.workdir.as_os_str().as_bytes()) {
+            Ok(c) => c,
+            Err(_) => return ("chdir", "process.workdir contains a NUL byte".into()),
+        };
+        if libc::chdir(wd.as_ptr()) != 0 {
+            return ("chdir", os_err(p.process.workdir.display()));
         }
-        if let Err(e) = set_limits(p) {
-            return ("setrlimit", e);
+    }
+    if let Err(e) = set_limits(p) {
+        return ("setrlimit", e);
+    }
+    if let Err(e) = drop_identity(p) {
+        return ("identity", e);
+    }
+    unsafe {
+        // Must come after the uid change, which clears it. Kills the child if sbx dies.
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+            return ("pdeathsig", os_err("prctl(PR_SET_PDEATHSIG)"));
         }
-        if libc::geteuid() == 0 {
-            let (uid, gid) = (p.process.uid, p.process.gid);
-            if uid == 0 {
-                return ("setuid", "refusing to run the sandbox as uid 0".into());
-            }
-            if libc::setgroups(0, std::ptr::null()) != 0
-                || libc::setresgid(gid, gid, gid) != 0
-                || libc::setresuid(uid, uid, uid) != 0
-            {
-                return ("drop-privileges", os_err("setres[ug]id"));
-            }
-            if libc::getuid() != uid || libc::geteuid() != uid {
-                return ("drop-privileges", "uid did not change".into());
-            }
-        }
-        libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
-        // Must be set after the uid change (which clears it). Kills the child if sbx dies.
-        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
         if libc::getppid() != parent {
-            return ("pdeathsig", "supervisor exited during setup".into());
+            return ("pdeathsig", "the supervisor exited during setup".into());
         }
         if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-            return ("no_new_privs", os_err("prctl"));
+            return ("no_new_privs", os_err("prctl(PR_SET_NO_NEW_PRIVS)"));
         }
     }
-    if let Some(rs) = l.landlock.take() {
-        if let Err(e) = landlock_layer::enforce(rs) {
-            return ("landlock", e);
-        }
-    }
-    if let Some(sc) = &l.seccomp {
-        if let Err(e) = seccomp_layer::enforce(sc) {
-            return ("seccomp", e);
-        }
-    }
-    close_fds_except(err_fd);
-    unsafe { libc::sigprocmask(libc::SIG_SETMASK, mask, std::ptr::null_mut()) };
-
+    // Everything the child needs after its policy filter is installed is
+    // prepared now: from that point on it only makes the syscalls sbx
+    // reserves (a denied syscall would block on a listener nobody reads yet).
     let mut argv: Vec<*const libc::c_char> = l.argv.iter().map(|a| a.as_ptr()).collect();
     argv.push(std::ptr::null());
     let mut envp: Vec<*const libc::c_char> = l.envp.iter().map(|a| a.as_ptr()).collect();
     envp.push(std::ptr::null());
+    match l.landlock.take() {
+        Some(rs) => {
+            if let Err(e) = landlock_layer::enforce(rs) {
+                return ("landlock", e);
+            }
+        }
+        None => return ("landlock", "BUG: no Landlock ruleset".into()),
+    }
+    if let Err(e) = seccomp_layer::install_prelude(&l.seccomp.prelude) {
+        return ("seccomp", e);
+    }
+    let listener = match seccomp_layer::install_with_listener(&l.seccomp.main) {
+        Ok(fd) => fd,
+        Err(e) => return ("seccomp", e),
+    };
+    if let Err(e) = notify::send_fd(sock_fd, listener) {
+        return ("seccomp", format!("handing the listener to the supervisor: {e}"));
+    }
+    unsafe {
+        libc::close(listener);
+        libc::close(sock_fd);
+    }
+    if let Err(e) = close_fds_except(err_fd) {
+        return ("close_range", e);
+    }
+    if let Err(e) = reset_signals() {
+        return ("signals", e);
+    }
+
+    // SAFETY: argv/envp are NULL-terminated arrays of live C strings.
     unsafe { libc::execve(l.exe.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
-    ("execve", os_err(&l.exe.to_string_lossy()))
+    ("execve", os_err(l.exe.to_string_lossy()))
 }
 
 fn set_limits(p: &Policy) -> Result<(), String> {
-    let set = |res, v: u64, name: &str| -> Result<(), String> {
-        let lim = libc::rlimit { rlim_cur: v as libc::rlim_t, rlim_max: v as libc::rlim_t };
+    let set = |res, v: libc::rlim_t, name: &str| -> Result<(), String> {
+        let lim = libc::rlimit {
+            rlim_cur: v,
+            rlim_max: v,
+        };
+        // SAFETY: plain setrlimit with a valid struct.
         if unsafe { libc::setrlimit(res, &lim) } != 0 {
-            return Err(os_err(name));
+            return Err(os_err(format!(
+                "{name} = {}",
+                if v == libc::RLIM_INFINITY {
+                    "unlimited".into()
+                } else {
+                    v.to_string()
+                }
+            )));
         }
         Ok(())
     };
+    let val = |l: Limit, shift: u32| match l {
+        Limit::Value(n) => (n << shift) as libc::rlim_t,
+        Limit::Unlimited => libc::RLIM_INFINITY,
+    };
     let l = &p.limits;
     set(libc::RLIMIT_CORE, 0, "RLIMIT_CORE")?;
-    if let Some(v) = l.nofile {
-        set(libc::RLIMIT_NOFILE, v, "RLIMIT_NOFILE")?;
+    set(libc::RLIMIT_NOFILE, l.nofile as libc::rlim_t, "RLIMIT_NOFILE")?;
+    set(libc::RLIMIT_NPROC, val(l.nproc, 0), "RLIMIT_NPROC")?;
+    set(libc::RLIMIT_FSIZE, val(l.fsize_mb, 20), "RLIMIT_FSIZE")?;
+    set(libc::RLIMIT_AS, val(l.as_mb, 20), "RLIMIT_AS")?;
+    set(libc::RLIMIT_CPU, val(l.cpu_secs, 0), "RLIMIT_CPU")?;
+    Ok(())
+}
+
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: libc::c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+fn capget() -> Result<[CapData; 2], String> {
+    let mut hdr = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = [CapData::default(); 2];
+    // SAFETY: header and two data structs as required by v3.
+    if unsafe { libc::syscall(libc::SYS_capget, &mut hdr, data.as_mut_ptr()) } != 0 {
+        return Err(os_err("capget"));
     }
-    if let Some(v) = l.nproc {
-        set(libc::RLIMIT_NPROC, v, "RLIMIT_NPROC")?;
+    Ok(data)
+}
+
+fn last_cap() -> Result<u32, String> {
+    std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+        .map_err(|e| format!("read /proc/sys/kernel/cap_last_cap: {e}"))?
+        .trim()
+        .parse()
+        .map_err(|e| format!("parse /proc/sys/kernel/cap_last_cap: {e}"))
+}
+
+/// Switch to the policy identity and leave the child with no capabilities.
+fn drop_identity(p: &Policy) -> Result<(), String> {
+    let (uid, gid) = (p.process.uid, p.process.gid);
+    let last = last_cap()?;
+    // SAFETY: identity syscalls in the single-threaded child.
+    unsafe {
+        if libc::geteuid() == 0 {
+            // While still privileged: empty the bounding set, so nothing in the
+            // sandbox can ever regain a capability.
+            for cap in 0..=last {
+                if libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) != 0 {
+                    return Err(os_err(format!("prctl(PR_CAPBSET_DROP, {cap}) (needs CAP_SETPCAP)")));
+                }
+            }
+            if libc::setgroups(0, std::ptr::null()) != 0 {
+                return Err(os_err("setgroups([])"));
+            }
+            if libc::setresgid(gid, gid, gid) != 0 {
+                return Err(os_err(format!("setresgid({gid})")));
+            }
+            if libc::setresuid(uid, uid, uid) != 0 {
+                return Err(os_err(format!("setresuid({uid})")));
+            }
+        }
+        let (mut r, mut e, mut s) = (0, 0, 0);
+        if libc::getresuid(&mut r, &mut e, &mut s) != 0 || [r, e, s] != [uid; 3] {
+            return Err(format!("uid is {r}/{e}/{s}, expected {uid}"));
+        }
+        if libc::getresgid(&mut r, &mut e, &mut s) != 0 || [r, e, s] != [gid; 3] {
+            return Err(format!("gid is {r}/{e}/{s}, expected {gid}"));
+        }
+        if libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) != 0 {
+            return Err(os_err("prctl(PR_CAP_AMBIENT_CLEAR_ALL)"));
+        }
+        let hdr = CapHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let zero = [CapData::default(); 2];
+        if libc::syscall(libc::SYS_capset, &hdr, zero.as_ptr()) != 0 {
+            return Err(os_err("capset(no capabilities)"));
+        }
     }
-    if let Some(v) = l.fsize_mb {
-        set(libc::RLIMIT_FSIZE, v << 20, "RLIMIT_FSIZE")?;
-    }
-    if let Some(v) = l.as_mb {
-        set(libc::RLIMIT_AS, v << 20, "RLIMIT_AS")?;
-    }
-    if let Some(v) = l.cpu_secs {
-        set(libc::RLIMIT_CPU, v, "RLIMIT_CPU")?;
+    let caps = capget()?;
+    if caps != [CapData::default(); 2] {
+        return Err(format!("capabilities remain after dropping them: {caps:?}"));
     }
     Ok(())
 }
 
 /// Close inherited descriptors (e.g. a parent server's sockets) except stdio and `keep`.
-fn close_fds_except(keep: RawFd) {
+fn close_fds_except(keep: RawFd) -> Result<(), String> {
     let keep = keep as libc::c_uint;
-    let close_range = |lo: libc::c_uint, hi: libc::c_uint| unsafe { libc::syscall(libc::SYS_close_range, lo, hi, 0u32) };
-    let lower_ok = keep <= 3 || close_range(3, keep - 1) == 0;
-    if !(lower_ok && close_range(keep + 1, libc::c_uint::MAX) == 0) {
-        for fd in 3..65536 {
-            if fd != keep as i32 {
-                unsafe { libc::close(fd) };
-            }
+    let close_range = |lo: libc::c_uint, hi: libc::c_uint| -> Result<(), String> {
+        // SAFETY: closing fd ranges in the child.
+        if unsafe { libc::syscall(libc::SYS_close_range, lo, hi, 0u32) } != 0 {
+            return Err(os_err(format!("close_range({lo}, {hi})")));
         }
+        Ok(())
+    };
+    if keep > 3 {
+        close_range(3, keep - 1)?;
     }
+    close_range(keep + 1, libc::c_uint::MAX)
 }
 
-fn supervise(p: &Policy, child: libc::pid_t, am_pid1: bool, set: &libc::sigset_t) -> i32 {
+/// Number of signals the kernel knows (_NSIG) and the size of its sigset.
+const KERNEL_NSIG: libc::c_int = 64;
+const KERNEL_SIGSET_SIZE: usize = 8;
+
+/// The program starts with default dispositions for every signal and an
+/// empty mask, whatever sbx inherited (Rust ignores SIGPIPE, runtimes may
+/// ignore SIGHUP or real-time signals). Handled signals are reset by execve;
+/// ignored ones are not. Raw syscalls are used because libc wrappers refuse
+/// the real-time signals they reserve for themselves.
+fn reset_signals() -> Result<(), String> {
+    // Kernel struct sigaction: handler, flags, [restorer,] mask. All zero is
+    // SIG_DFL with no flags and an empty mask, whichever layout applies.
+    let dfl = [0u64; 4];
+    for sig in 1..=KERNEL_NSIG {
+        if sig == libc::SIGKILL || sig == libc::SIGSTOP {
+            continue;
+        }
+        // SAFETY: dfl is a zeroed kernel sigaction; no old action is requested.
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_rt_sigaction,
+                sig,
+                dfl.as_ptr(),
+                std::ptr::null_mut::<u64>(),
+                KERNEL_SIGSET_SIZE,
+            )
+        };
+        if r != 0 {
+            return Err(os_err(format!("rt_sigaction({sig}, SIG_DFL)")));
+        }
+    }
+    let empty = 0u64;
+    // SAFETY: an empty kernel sigset; the old mask is not requested.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_rt_sigprocmask,
+            libc::SIG_SETMASK,
+            &empty as *const u64,
+            std::ptr::null_mut::<u64>(),
+            KERNEL_SIGSET_SIZE,
+        )
+    };
+    if r != 0 {
+        return Err(os_err("rt_sigprocmask(SIG_SETMASK, {})"));
+    }
+    Ok(())
+}
+
+fn supervise(p: &Policy, child: libc::pid_t, am_pid1: bool, set: &libc::sigset_t, stats: &Stats) -> i32 {
     let started = Instant::now();
-    let deadline = (p.process.timeout_secs > 0).then(|| started + Duration::from_secs(p.process.timeout_secs));
+    let deadline = match p.process.timeout_secs {
+        Timeout::Secs(n) => Some(started + Duration::from_secs(n)),
+        Timeout::None => None,
+    };
     let grace = Duration::from_secs(p.process.kill_grace_secs);
     let mut kill_at: Option<Instant> = None;
     let mut timed_out = false;
+    let mut fatal = false;
 
     let status = loop {
         let now = Instant::now();
         if let Some(d) = deadline {
             if now >= d && !timed_out {
                 timed_out = true;
-                crate::log_error(&format!("timeout after {}s, killing sandbox", p.process.timeout_secs));
+                log::error(format!(
+                    "timeout after {}s, killing the sandbox",
+                    d.duration_since(started).as_secs()
+                ));
                 kill_tree(child, am_pid1);
             }
         }
         if let Some(k) = kill_at {
             if now >= k {
-                crate::log_info("grace period over, sending SIGKILL");
+                log::info("grace period over, sending SIGKILL");
                 kill_tree(child, am_pid1);
                 kill_at = None;
             }
@@ -226,29 +534,49 @@ fn supervise(p: &Policy, child: libc::pid_t, am_pid1: bool, set: &libc::sigset_t
         let next = [deadline.filter(|_| !timed_out), kill_at].into_iter().flatten().min();
         let ts = next.map(|n| {
             let d = n.saturating_duration_since(Instant::now());
-            libc::timespec { tv_sec: d.as_secs() as libc::time_t, tv_nsec: d.subsec_nanos() as _ }
+            libc::timespec {
+                tv_sec: d.as_secs() as _,
+                tv_nsec: d.subsec_nanos() as _,
+            }
         });
+        // SAFETY: zeroed siginfo is valid output storage.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let sig = unsafe {
-            libc::sigtimedwait(set, &mut info, ts.as_ref().map_or(std::ptr::null(), |t| t as *const _))
-        };
+        // SAFETY: set and info are valid; ts is either null or a valid timespec.
+        let sig =
+            unsafe { libc::sigtimedwait(set, &mut info, ts.as_ref().map_or(std::ptr::null(), |t| t as *const _)) };
         if sig < 0 {
             match errno() {
                 libc::EAGAIN | libc::EINTR => continue,
                 _ => {
-                    crate::log_error(&os_err("sigtimedwait"));
+                    log::error(os_err("sigtimedwait"));
+                    fatal = true;
                     kill_tree(child, am_pid1);
+                    match wait_for(child) {
+                        Ok(st) => break st,
+                        Err(e) => {
+                            log::error(e);
+                            return 125;
+                        }
+                    }
                 }
             }
         }
-        if sig == libc::SIGCHLD || sig < 0 {
+        if sig == libc::SIGCHLD {
             if let Some(st) = reap(child) {
                 break st;
             }
             continue;
         }
-        // Forward termination/user signals to the sandbox's process group.
-        unsafe { libc::kill(-child, sig) };
+        if sig == notify::fatal_signal() {
+            fatal = true;
+            kill_tree(child, am_pid1);
+            continue;
+        }
+        // Forward termination and user signals to the sandbox's process group.
+        // SAFETY: signalling our child's process group.
+        if unsafe { libc::kill(-child, sig) } != 0 && errno() != libc::ESRCH {
+            log::error(os_err(format!("forwarding signal {sig} to the sandbox")));
+        }
         if matches!(sig, libc::SIGTERM | libc::SIGINT | libc::SIGHUP | libc::SIGQUIT) {
             if kill_at.is_some() {
                 kill_tree(child, am_pid1); // second signal: don't wait
@@ -261,23 +589,25 @@ fn supervise(p: &Policy, child: libc::pid_t, am_pid1: bool, set: &libc::sigset_t
     // The main program is gone; nothing it left behind may outlive it.
     kill_tree(child, am_pid1);
     reap_all(am_pid1);
+    for line in stats.summary() {
+        log::info(format!("repeated: {line}"));
+    }
 
-    let code = if timed_out {
+    let code = if fatal {
+        125
+    } else if timed_out {
         124
     } else if libc::WIFEXITED(status) {
         libc::WEXITSTATUS(status)
     } else if libc::WIFSIGNALED(status) {
         let s = libc::WTERMSIG(status);
-        if s == libc::SIGSYS {
-            crate::log_error("program killed by SIGSYS: blocked syscall (seccomp on_violation=kill)");
-        } else {
-            crate::log_info(&format!("program killed by signal {s}"));
-        }
+        log::info(format!("program killed by signal {s}"));
         128 + s
     } else {
+        log::error(format!("unexpected wait status {status:#x}"));
         125
     };
-    crate::log_info(&format!("exit {code} after {:.1}s", started.elapsed().as_secs_f64()));
+    log::info(format!("exit {code} after {:.1}s", started.elapsed().as_secs_f64()));
     code
 }
 
@@ -286,7 +616,11 @@ fn reap(child: libc::pid_t) -> Option<libc::c_int> {
     let mut main = None;
     loop {
         let mut st = 0;
+        // SAFETY: non-blocking wait for any child.
         let r = unsafe { libc::waitpid(-1, &mut st, libc::WNOHANG) };
+        if r < 0 && errno() != libc::ECHILD {
+            log::error(os_err("waitpid(-1)"));
+        }
         if r <= 0 {
             return main;
         }
@@ -297,18 +631,26 @@ fn reap(child: libc::pid_t) -> Option<libc::c_int> {
 }
 
 fn kill_tree(child: libc::pid_t, am_pid1: bool) {
+    // SAFETY: signalling our own descendants.
     unsafe {
-        libc::kill(-child, libc::SIGKILL);
+        if libc::kill(-child, libc::SIGKILL) != 0 && errno() != libc::ESRCH {
+            log::error(os_err("kill(sandbox process group, SIGKILL)"));
+        }
         if am_pid1 {
-            // As PID 1 of the container's PID namespace this hits every other process,
-            // including ones that escaped the process group with setsid().
-            libc::kill(-1, libc::SIGKILL);
+            // As PID 1 of the container's PID namespace this reaches every other
+            // process, including ones that left the process group with setsid().
+            if libc::kill(-1, libc::SIGKILL) != 0 && errno() != libc::ESRCH {
+                log::error(os_err("kill(-1, SIGKILL)"));
+            }
         }
     }
     if !am_pid1 {
         // Subreaper: escapees are reparented to us once their parent dies.
         for pid in own_children() {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
+            // SAFETY: signalling our own child.
+            if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 && errno() != libc::ESRCH {
+                log::error(os_err(format!("kill({pid}, SIGKILL)")));
+            }
         }
     }
 }
@@ -317,17 +659,22 @@ fn reap_all(am_pid1: bool) {
     let until = Instant::now() + Duration::from_secs(5);
     loop {
         let mut st = 0;
+        // SAFETY: non-blocking wait for any child.
         let r = unsafe { libc::waitpid(-1, &mut st, libc::WNOHANG) };
-        if r < 0 && errno() == libc::ECHILD {
+        if r < 0 {
+            if errno() != libc::ECHILD {
+                log::error(os_err("waitpid(-1)"));
+            }
             return;
         }
         if r == 0 {
             if Instant::now() > until {
-                crate::log_error("some sandboxed processes did not exit");
+                log::error("some sandboxed processes did not exit within 5s of SIGKILL");
                 return;
             }
             if !am_pid1 {
                 for pid in own_children() {
+                    // SAFETY: signalling our own child.
                     unsafe { libc::kill(pid, libc::SIGKILL) };
                 }
             }
@@ -337,14 +684,21 @@ fn reap_all(am_pid1: bool) {
 }
 
 fn own_children() -> Vec<libc::pid_t> {
+    // SAFETY: getpid has no preconditions.
     let me = unsafe { libc::getpid() };
-    let Ok(dir) = std::fs::read_dir("/proc") else { return vec![] };
+    let dir = match std::fs::read_dir("/proc") {
+        Ok(d) => d,
+        Err(e) => {
+            log::error(format!("cannot list /proc to find leftover sandbox processes: {e}"));
+            return vec![];
+        }
+    };
     dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<libc::pid_t>().ok())
         .filter(|&pid| {
-            std::fs::read_to_string(format!("/proc/{pid}/stat"))
-                .ok()
-                .and_then(|s| s.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().nth(1)?.parse().ok()))
-                == Some(me)
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).ok().and_then(|s| {
+                s.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().nth(1)?.parse().ok())
+            }) == Some(me)
         })
         .collect()
 }
