@@ -11,7 +11,9 @@
 //! swaps an IP socket into the same fd number in the meantime: the sandbox
 //! can only hold TCP sockets (seccomp refuses every other IP socket type and
 //! MSG_FASTOPEN), and Landlock denies any TCP connect made from inside the
-//! sandbox, so the kernel-side connect would fail with EACCES.
+//! sandbox, so the kernel-side connect would fail with EACCES. With
+//! landlock.abi = "off" nothing would stop that connect, so connect() on
+//! non-IP sockets is denied instead (and seccomp denies bind and listen).
 //!
 //! Allowed destinations: CIDR rules, addresses learned from DNS answers to
 //! names matching domain rules (see dns.rs), and the DNS proxy itself.
@@ -19,7 +21,7 @@
 use crate::log::{self, errno, os_err};
 use crate::net::{classify, parse_sockaddr, AddrClass, AnswerScope, ConnectTarget};
 use crate::notify::{comm_of, deny, describe, pidfd_open_thread, raise_fatal, Listener, Stats};
-use crate::policy::{CompiledRule, EgressTarget, Policy, Violation};
+use crate::policy::{CompiledRule, EgressTarget, LandlockAbi, Policy, Violation};
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -40,6 +42,9 @@ pub struct Egress {
     answer_scopes: Vec<AnswerScope>,
     learned: RwLock<HashMap<IpAddr, Learned>>,
     on_violation: Violation,
+    /// Whether Landlock denies TCP connects made from inside the sandbox,
+    /// which is what makes CONTINUE safe for non-IP sockets.
+    landlock: bool,
 }
 
 impl Egress {
@@ -55,6 +60,7 @@ impl Egress {
                 .unwrap_or_default(),
             learned: RwLock::new(HashMap::new()),
             on_violation: p.seccomp.on_violation,
+            landlock: p.landlock.abi != LandlockAbi::Off,
         }
     }
 
@@ -185,6 +191,11 @@ impl Egress {
             }
         };
         if domain != libc::AF_INET && domain != libc::AF_INET6 {
+            if !self.landlock {
+                let why = "connect() on non-IP sockets is denied in egress mode without Landlock \
+                           (landlock.abi = \"off\")";
+                return deny(l, stats, self.on_violation, n, "connect", why, libc::EACCES);
+            }
             return l.respond_continue(id);
         }
         let ty = sockopt(&sock, libc::SO_TYPE);

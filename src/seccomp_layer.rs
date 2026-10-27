@@ -18,7 +18,7 @@
 //! both agree.
 
 use crate::log::os_err;
-use crate::policy::{NetMode, Policy, SocketFamily};
+use crate::policy::{LandlockAbi, NetMode, Policy, SocketFamily};
 use seccompiler::{
     sock_filter, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
     SeccompRule, TargetArch,
@@ -56,7 +56,7 @@ const DEFAULT_DENY: &[(&str, i64)] = syscalls![
     SYS_io_uring_register, SYS_keyctl, SYS_add_key, SYS_request_key, SYS_fanotify_init,
     SYS_name_to_handle_at, SYS_open_by_handle_at,
     // system administration
-    SYS_kexec_load, SYS_kexec_file_load, SYS_init_module, SYS_finit_module, SYS_delete_module,
+    SYS_kexec_load, SYS_init_module, SYS_finit_module, SYS_delete_module,
     SYS_acct, SYS_swapon, SYS_swapoff, SYS_reboot, SYS_sethostname, SYS_setdomainname,
     SYS_syslog, SYS_quotactl, SYS_settimeofday, SYS_clock_settime, SYS_clock_adjtime,
     SYS_adjtimex, SYS_vhangup,
@@ -64,6 +64,7 @@ const DEFAULT_DENY: &[(&str, i64)] = syscalls![
 
 #[cfg(target_arch = "x86_64")]
 const DEFAULT_DENY_ARCH: &[(&str, i64)] = syscalls![
+    SYS_kexec_file_load,
     SYS_iopl,
     SYS_ioperm,
     SYS_modify_ldt,
@@ -72,8 +73,10 @@ const DEFAULT_DENY_ARCH: &[(&str, i64)] = syscalls![
     SYS_ustat,
     SYS_sysfs
 ];
+// libc's aarch64 musl bindings lack kexec_file_load; 294 is its number in
+// the generic syscall table aarch64 uses.
 #[cfg(target_arch = "aarch64")]
-const DEFAULT_DENY_ARCH: &[(&str, i64)] = &[];
+const DEFAULT_DENY_ARCH: &[(&str, i64)] = &[("SYS_kexec_file_load", 294)];
 
 /// Extra names accepted in `seccomp.deny`.
 #[rustfmt::skip]
@@ -154,6 +157,7 @@ pub enum Reason {
     SourceRouting,
     TerminalInjection,
     Personality,
+    BindWithoutLandlock,
     /// Not a denial: the egress filter decides.
     EgressConnect,
 }
@@ -174,6 +178,10 @@ impl fmt::Display for Reason {
             Reason::SourceRouting => write!(f, "IP source routing options would change the destination"),
             Reason::TerminalInjection => write!(f, "terminal input injection (TIOCSTI/TIOCLINUX)"),
             Reason::Personality => write!(f, "personality flag outside the allowed set"),
+            Reason::BindWithoutLandlock => write!(
+                f,
+                "bind and listen are denied in egress mode without Landlock (landlock.abi = \"off\")"
+            ),
             Reason::EgressConnect => write!(f, "egress filter"),
         }
     }
@@ -382,6 +390,13 @@ pub fn build_table(p: &Policy) -> Result<RuleTable, String> {
                 vec![Cond::int(1, Op::Eq, level), Cond::int(2, Op::Eq, opt)],
                 Reason::SourceRouting,
             );
+        }
+        // Landlock limits TCP binds to network.bind_tcp; without it, no binds
+        // at all. listen() is included because it binds an unbound socket.
+        if p.landlock.abi == LandlockAbi::Off {
+            for nr in [libc::SYS_bind, libc::SYS_listen] {
+                t.add(nr, vec![], Reason::BindWithoutLandlock);
+            }
         }
     }
 
@@ -715,6 +730,8 @@ pub mod tests {
         }
         for nr in [
             libc::SYS_connect,
+            libc::SYS_bind,
+            libc::SYS_listen,
             libc::SYS_read,
             libc::SYS_write,
             libc::SYS_ptrace,
@@ -755,6 +772,36 @@ pub mod tests {
         check_agreement(&policy("egress", "\"unix\", \"inet\", \"inet6\"", true));
         check_agreement(&policy("egress", "\"unix\", \"inet\"", false));
         check_agreement(&policy("unrestricted", "\"unix\", \"inet\", \"inet6\"", true));
+        check_agreement(&without_landlock(policy(
+            "egress",
+            "\"unix\", \"inet\", \"inet6\"",
+            true,
+        )));
+        check_agreement(&without_landlock(policy("none", "\"unix\"", true)));
+    }
+
+    fn without_landlock(mut p: Policy) -> Policy {
+        p.landlock.abi = LandlockAbi::Off;
+        p
+    }
+
+    #[test]
+    fn bind_and_listen_without_landlock() {
+        let args = [3, 0, 16, 0, 0, 0];
+        let off = without_landlock(policy("egress", "\"unix\", \"inet\"", true));
+        for nr in [libc::SYS_bind, libc::SYS_listen] {
+            assert_eq!(
+                reason(&off, nr, args),
+                Some(Reason::BindWithoutLandlock),
+                "{}",
+                syscall_name(nr)
+            );
+            let on = policy("egress", "\"unix\", \"inet\"", true);
+            assert_eq!(reason(&on, nr, args), None, "Landlock limits binds to bind_tcp");
+            let none = without_landlock(policy("none", "\"unix\"", true));
+            assert_eq!(reason(&none, nr, args), None, "mode none has no IP sockets to bind");
+        }
+        assert_eq!(reason(&off, libc::SYS_connect, args), Some(Reason::EgressConnect));
     }
 
     fn reason(p: &Policy, nr: i64, args: [u64; 6]) -> Option<Reason> {

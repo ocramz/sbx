@@ -15,7 +15,7 @@ mod policy;
 mod seccomp_layer;
 mod supervisor;
 
-use policy::{NetMode, Overrides, Policy};
+use policy::{LandlockAbi, NetMode, Overrides, Policy};
 use std::collections::BTreeSet;
 use std::ffi::{CString, OsString};
 use std::os::fd::{AsRawFd, BorrowedFd};
@@ -181,17 +181,25 @@ fn run(p: Policy, cmd: Vec<OsString>) -> Result<i32, Vec<String>> {
     let envp = build_env(&p).map_err(one)?;
     let exe = resolve_program(&cmd[0], &envp).map_err(one)?;
     capabilities::require(&p)?;
+    // Held until sbx exits.
+    let _slot = supervisor::claim_sandbox_slot().map_err(one)?;
 
+    // Without Landlock nothing stops an IP socket inherited on stdio from
+    // connecting in mode none either.
+    if p.network.mode == NetMode::Egress || (p.network.mode == NetMode::None && p.landlock.abi == LandlockAbi::Off) {
+        check_stdio().map_err(one)?;
+    }
     let mut svc = supervisor::Services {
         egress: None,
         dns: None,
     };
+    // Puts /etc/resolv.conf back when run() returns, after the sandbox is gone.
+    let mut _resolv_conf = None;
     if p.network.mode == NetMode::Egress {
-        check_stdio().map_err(one)?;
         let egress = Arc::new(egress::Egress::new(&p));
         log::info(egress.summary());
         if let Some(d) = &p.network.dns {
-            dns::setup_resolv_conf(d).map_err(one)?;
+            _resolv_conf = dns::setup_resolv_conf(d).map_err(one)?;
             let listener = dns::bind(d).map_err(one)?;
             svc.dns = Some((listener, d.clone()));
         }
@@ -214,7 +222,7 @@ fn run(p: Policy, cmd: Vec<OsString>) -> Result<i32, Vec<String>> {
             .into_iter()
             .map(|(k, v)| cstr(format!("{k}={v}").into_bytes(), "an environment variable"))
             .collect::<Result<_, _>>()?,
-        landlock: Some(ll.ruleset),
+        landlock: ll.ruleset,
         seccomp: sc,
     };
     Ok(supervisor::run(&p, launch, svc))
@@ -283,7 +291,8 @@ fn resolve_program(prog: &OsString, envp: &[(String, String)]) -> Result<PathBuf
     Err(format!("{}: not found in the sandbox PATH ({path})", p.display()))
 }
 
-/// In egress mode an inherited IP socket on stdio would bypass the filter.
+/// An inherited IP socket on stdio would bypass the egress filter (and,
+/// without Landlock, mode none).
 fn check_stdio() -> Result<(), String> {
     for fd in 0..3 {
         // SAFETY: fds 0-2 are only inspected, never closed, and outlive this call.
@@ -316,7 +325,7 @@ fn check_stdio() -> Result<(), String> {
         }
         if dom == libc::AF_INET || dom == libc::AF_INET6 {
             return Err(format!(
-                "fd {fd} is an IP socket; the program would inherit it and bypass egress filtering \
+                "fd {fd} is an IP socket; the program would inherit it and bypass network filtering \
                  (give sbx pipes, files or UNIX sockets as stdio)"
             ));
         }
@@ -336,7 +345,8 @@ fn probe(p: &Policy) -> i32 {
             }
         }
     }
-    if let landlock_layer::Probe::Available(v) = landlock_layer::probe() {
+    let landlock_on = p.landlock.abi != LandlockAbi::Off;
+    if let (true, landlock_layer::Probe::Available(v)) = (landlock_on, landlock_layer::probe()) {
         let f = |min: u8, what: &str| {
             println!(
                 "         landlock v{min}+ {:<4} {what}",

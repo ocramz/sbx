@@ -8,8 +8,9 @@
 use crate::landlock_layer::{self, abi_kernel, Probe};
 use crate::log::{errno, os_err};
 use crate::notify::{self, Listener, Received};
-use crate::policy::{NetMode, Policy, ResolvConfMode, RESOLV_CONF};
+use crate::policy::{LandlockAbi, NetMode, Policy, ResolvConfMode, RESOLV_CONF};
 use crate::seccomp_layer::{self, AUDIT_ARCH};
+use crate::supervisor;
 use seccompiler::sock_filter;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
@@ -43,7 +44,17 @@ pub fn check(p: &Policy) -> Vec<Check> {
             name: "identity",
             outcome: identity(p),
         },
+        Check {
+            name: "one sandbox per container",
+            outcome: supervisor::claim_sandbox_slot().map(|_| "no other sbx sandbox is running here".into()),
+        },
     ];
+    if p.landlock.abi == LandlockAbi::Off {
+        v.push(Check {
+            name: "sandbox uid unused",
+            outcome: uid_unused(p.process.uid),
+        });
+    }
     // SAFETY: getpid has no preconditions.
     if unsafe { libc::getpid() } != 1 {
         v.push(Check {
@@ -105,7 +116,12 @@ fn kernel() -> Result<String, String> {
 }
 
 fn landlock(p: &Policy) -> Result<String, String> {
-    let pinned = p.landlock.abi;
+    let LandlockAbi::V(pinned) = p.landlock.abi else {
+        return Ok(format!(
+            "off (landlock.abi = \"off\"); the kernel's Landlock: {}",
+            landlock_layer::probe()
+        ));
+    };
     match landlock_layer::probe() {
         Probe::Available(v) if v >= pinned => Ok(format!("ABI v{v}; the policy pins v{pinned}")),
         Probe::Available(v) => Err(format!(
@@ -132,6 +148,12 @@ fn identity(p: &Policy) -> Result<String, String> {
     if euid == 0 {
         return Ok(format!("sbx runs as root and will run the program as {uid}:{gid}"));
     }
+    if p.landlock.abi == LandlockAbi::Off {
+        return Err(format!(
+            "landlock.abi = \"off\" needs sbx to start as root: as uid {ruid} the program would share the \
+             supervisor's uid and could read or rewrite its memory through /proc/<pid>/mem"
+        ));
+    }
     if ruid != uid || rgid != gid {
         return Err(format!(
             "sbx runs as {ruid}:{rgid} (not root), so it cannot switch to process.uid:gid {uid}:{gid}; \
@@ -146,6 +168,38 @@ fn identity(p: &Policy) -> Result<String, String> {
         ));
     }
     Ok(format!("sbx runs as {ruid}:{rgid}; the program shares that identity"))
+}
+
+/// Without Landlock only the uid separates the sandbox from other processes:
+/// one already running as the sandbox uid could be signalled, or read and
+/// written through /proc/<pid>/mem.
+fn uid_unused(uid: u32) -> Result<String, String> {
+    let dir = std::fs::read_dir("/proc").map_err(|e| format!("read /proc: {e}"))?;
+    let mut found = Vec::new();
+    for entry in dir {
+        let entry = entry.map_err(|e| format!("read /proc: {e}"))?;
+        let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        // A process that exits meanwhile is no concern.
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            continue;
+        };
+        let field = |name: &str| status.lines().find_map(|l| l.strip_prefix(name)).map(str::trim);
+        // Real, effective, saved and filesystem uid.
+        let uses = field("Uid:").is_some_and(|ids| ids.split_whitespace().any(|id| id.parse() == Ok(uid)));
+        if uses {
+            found.push(format!("{} (pid {pid})", field("Name:").unwrap_or("?")));
+        }
+    }
+    if found.is_empty() {
+        return Ok(format!("no process runs as uid {uid}"));
+    }
+    Err(format!(
+        "{} already run as uid {uid}; with landlock.abi = \"off\" the sandbox could signal them or read and \
+         write their memory through /proc/<pid>/mem, so give process.uid a uid nothing else uses",
+        found.join(", ")
+    ))
 }
 
 fn supplementary_groups() -> Result<Vec<libc::gid_t>, String> {

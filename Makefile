@@ -11,14 +11,19 @@ SHELL := bash
 MAKEFLAGS += --warn-undefined-variables --no-builtin-rules
 .DEFAULT_GOAL := help
 
+# Images default to the host's architecture: under QEMU, x86_64 rustc
+# segfaults and Landlock and seccomp return ENOSYS, so `smoke` needs a native
+# platform.
+HOST_ARCH       := $(patsubst x86_64,amd64,$(patsubst aarch64,arm64,$(shell uname -m)))
+
 REGISTRY        ?= ghcr.io
 IMAGE_NAME      ?= ocramz/sbx
 VERSION         ?= $(shell git rev-parse --short=12 HEAD)
 BASE_IMAGE      ?= debian:bookworm-slim
 TEST_BASE_IMAGE ?= python:3.13-slim-bookworm
-PLATFORM        ?= linux/amd64
+PLATFORM        ?= linux/$(HOST_ARCH)
 PUSH_TAGS       ?=
-DOCKER          ?= docker
+DOCKER          ?= podman
 CARGO           ?= cargo
 
 IMAGE        := $(REGISTRY)/$(IMAGE_NAME)
@@ -71,15 +76,15 @@ test-image: ## build the test image (runtime stage on TEST_BASE_IMAGE plus the s
 
 .PHONY: smoke
 smoke: image test-image ## integration suite in the test image, then checks of the runtime image
-	$(DOCKER) run --rm --platform $(PLATFORM) --cap-add SYS_PTRACE \
+	$(DOCKER) run --rm --pull=never --platform $(PLATFORM) --cap-add SYS_PTRACE \
 		--tmpfs /mnt/sbx-vol:rw,mode=0755 \
-		-e SBX=/usr/local/bin/sbx -e TEST_VOLUME=/mnt/sbx-vol -e TEST_REQUIRE_IPV6=true \
+		-e SBX=/usr/local/bin/sbx -e TEST_VOLUME=/mnt/sbx-vol -e TEST_REQUIRE_IPV6=true -e TEST_REQUIRE_LANDLOCK=true \
 		--entrypoint python3 $(TEST_IMAGE):$(VERSION) /opt/sbx/tests/smoke.py
 	DOCKER="$(DOCKER)" PLATFORM="$(PLATFORM)" tests/image-checks.sh $(IMAGE):$(VERSION)
 
 .PHONY: probe
 probe: ## run `sbx probe` with the default policy in the runtime image
-	$(DOCKER) run --rm --platform $(PLATFORM) --entrypoint /usr/local/bin/sbx $(IMAGE):$(VERSION) probe
+	$(DOCKER) run --rm --pull=never --platform $(PLATFORM) --entrypoint /usr/local/bin/sbx $(IMAGE):$(VERSION) probe
 
 .PHONY: push
 push: ## push $(IMAGE):$(VERSION), then tag and push each of PUSH_TAGS
@@ -89,8 +94,20 @@ push: ## push $(IMAGE):$(VERSION), then tag and push each of PUSH_TAGS
 		$(DOCKER) push $(IMAGE):$$tag; \
 	done
 
+.PHONY: live
+live: ## live tests on a Cloud Run service: build, push, deploy, run the suites, logs (README)
+	tests/cloud-run.sh all
+
+.PHONY: live-down
+live-down: ## delete the live tests' Cloud Run service and image repository
+	tests/cloud-run.sh down
+
 .PHONY: ci
 ci: lint test smoke ## everything CI runs before pushing
+
+# `make print-VAR` prints a variable, e.g. for tests/cloud-run.sh.
+print-%:
+	@echo '$($*)'
 
 .PHONY: clean
 clean: ## remove build outputs

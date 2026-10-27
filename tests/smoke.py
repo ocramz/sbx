@@ -11,6 +11,12 @@ Required environment:
   TEST_REQUIRE_IPV6  true: fail instead of reporting IPv6 tests as n/a when the
                      kernel has no IPv6 (ipv6.disable=1)
 
+Optional:
+  TEST_REQUIRE_LANDLOCK  true (default): fail when the kernel lacks Landlock
+                     ABI 6. false (Cloud Run): then check that sbx refuses
+                     Landlock policies, report the Landlock-only tests as n/a
+                     and run everything else with landlock.abi = "off"
+
 The suite rewrites /etc/resolv.conf for the DNS tests and starts local TCP
 servers on 127.0.0.1-3, so never run it directly on a host you care about.
 Every prerequisite is checked up front; nothing is skipped silently.
@@ -64,6 +70,8 @@ if os.listdir(VOLUME):
     die(f"TEST_VOLUME {VOLUME} is not empty")
 if not os.path.isfile("/etc/resolv.conf") or os.path.islink("/etc/resolv.conf"):
     die("/etc/resolv.conf must be a regular file (the DNS tests rewrite it)")
+with open("/etc/resolv.conf") as f:
+    ORIGINAL_RESOLV_CONF = f.read()
 SETPRIV = shutil.which("setpriv") or die("setpriv (util-linux) is required")
 REQUIRE_IPV6 = os.environ.get("TEST_REQUIRE_IPV6", "false")
 if REQUIRE_IPV6 not in ("true", "false"):
@@ -75,6 +83,9 @@ except OSError:
     HAVE_IPV6 = False
 if REQUIRE_IPV6 == "true" and not HAVE_IPV6:
     die("TEST_REQUIRE_IPV6=true but this kernel has no IPv6")
+REQUIRE_LANDLOCK = os.environ.get("TEST_REQUIRE_LANDLOCK", "true")
+if REQUIRE_LANDLOCK not in ("true", "false"):
+    die("TEST_REQUIRE_LANDLOCK must be true or false")
 PY = os.path.realpath(sys.executable)
 VOLUME = os.path.realpath(VOLUME)
 
@@ -88,8 +99,15 @@ def kernel_landlock_abi():
 
 
 KABI = kernel_landlock_abi()
-if KABI < 6:
-    die(f"the kernel's Landlock ABI is v{KABI}; the suite needs v6 (Linux 6.12+)")
+LANDLOCK = KABI >= 6
+if not LANDLOCK:
+    have = f"v{KABI}" if KABI > 0 else f"unavailable ({os.strerror(ctypes.get_errno())})"
+    why = f"the kernel's Landlock ABI is {have}; the Landlock tests need v6 (Linux 6.12+)"
+    if REQUIRE_LANDLOCK == "true":
+        die(f"{why} (set TEST_REQUIRE_LANDLOCK=false to run the rest without Landlock)")
+    print(f'smoke: {why}: they are n/a, and the rest runs with landlock.abi = "off"', flush=True)
+# The landlock.abi of the test policies.
+ABI = 6 if LANDLOCK else "off"
 
 # A clean environment for sbx: nothing from the caller leaks into the tests.
 BASE_ENV = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
@@ -138,9 +156,13 @@ def toml_value(v):
 
 def policy(mode="none", families=("unix",), egress=(), bind_tcp=(), dns=None, subprocesses=True,
            on_violation="errno", deny=(), allow=(), extra_fs=(), workdir="/tmp", timeout="none",
-           env_pass=(), drop=None, uid=65534, gid=65534, abi=6):
+           env_pass=(), drop=None, uid=65534, gid=65534, abi=ABI, fs=None):
+    """abi="off": no scopes and, unless fs is given, no fs rules."""
+    landlock = abi != "off"
+    if fs is None:
+        fs = fs_rules(extra_fs) if landlock else []
     sections = {
-        "landlock": {"abi": abi, "scope_signals": True, "scope_abstract_unix": True},
+        "landlock": {"abi": abi, "scope_signals": landlock, "scope_abstract_unix": landlock},
         "process": {"uid": uid, "gid": gid, "workdir": workdir, "timeout_secs": timeout, "kill_grace_secs": 2,
                     "subprocesses": subprocesses},
         "limits": {"nofile": 1024, "nproc": 512, "fsize_mb": 1024, "as_mb": "unlimited", "cpu_secs": "unlimited"},
@@ -152,7 +174,8 @@ def policy(mode="none", families=("unix",), egress=(), bind_tcp=(), dns=None, su
     }
     if dns:
         sections["network.dns"] = dns
-    out = []
+    # Plain keys come before the first table in TOML.
+    out = [] if fs else ["fs = []", ""]
     for name, body in sections.items():
         out.append(f"[{name}]")
         for k, v in body.items():
@@ -160,7 +183,7 @@ def policy(mode="none", families=("unix",), egress=(), bind_tcp=(), dns=None, su
                 continue
             out.append(f"{k} = {toml_value(v)}")
         out.append("")
-    for path, access in fs_rules(extra_fs):
+    for path, access in fs:
         out += ["[[fs]]", f"path = {toml_value(path)}", f"access = {toml_value(access)}", ""]
     fd, path = tempfile.mkstemp(prefix="policy.", suffix=".toml", dir=W)
     with os.fdopen(fd, "w") as f:
@@ -223,12 +246,15 @@ expect("flag given twice", 125, ["--timeout", "1", "--timeout", "2", "--", "/bin
 expect("env.pass of an unset variable", 125, ["--", "/bin/true"], pol=policy(env_pass=["SBX_SMOKE_UNSET"]), log="not set")
 expect("egress rule outside egress mode", 125, ["--egress", "example.com:443", "--", "/bin/true"], log="only used with mode")
 expect("bad boolean", 125, ["--", "/bin/true"], env={"SBX_SUBPROCESSES": "0"}, log="expected true or false")
-if KABI < 9:
+if not LANDLOCK:
+    expect("a Landlock policy is refused (the kernel lacks ABI 6)", 125, ["--", "/bin/true"], pol=policy(abi=6),
+           log="required capability missing: landlock")
+elif KABI < 9:
     expect("Landlock ABI above the kernel's", 125, ["--", "/bin/true"], pol=policy(abi=KABI + 1), log=f"provides ABI v{KABI}")
 else:
     print("  n/a  Landlock ABI above the kernel's (kernel already has the newest ABI this build knows)")
 expect("non-root sbx cannot switch identity", 125, ["--", "/bin/true"],
-       pol=policy(uid=12345, gid=12345), wrap=(SETPRIV, "--reuid", "65534", "--regid", "65534", "--clear-groups"),
+       pol=policy(uid=12345, gid=12345, abi=6), wrap=(SETPRIV, "--reuid", "65534", "--regid", "65534", "--clear-groups"),
        log="cannot switch")
 
 # ---------------------------------------------------------------- baseline
@@ -254,20 +280,23 @@ SECRET = "/var/tmp/sbx-secret"
 with open(SECRET, "w") as f:
     f.write("topsecret\n")
 os.chmod(SECRET, 0o644)
-expect("cannot read outside the allow-list", "nonzero", ["--", "/bin/cat", SECRET])
-expect("cannot list /etc", "nonzero", ["--", "/bin/ls", "/etc"])
-expect("can read an allowed file", 0, ["--", "/bin/cat", "/etc/passwd"])
-expect("cannot write to world-writable /var/tmp", "nonzero", ["--", "/bin/sh", "-c", "echo x > /var/tmp/sbx-pwn"])
-expect("can write to /tmp", 0, ["--", "/bin/sh", "-c", "echo x > /tmp/sbx-ok-$$ && rm /tmp/sbx-ok-$$"])
-shutil.copy("/bin/true", f"{W}/t")
-os.chmod(f"{W}/t", 0o755)
-expect("cannot exec from rw-only /tmp", 127, [f"--", f"{W}/t"], log="need 'x' in an fs rule")
-expect("subprocess inherits fs rules", "nonzero", ["--", "/bin/sh", "-c", f"/bin/sh -c '/bin/cat {SECRET}'"])
-os.chmod(VOLUME, 0o777)
-expect("volume granted rw is writable", 0, ["--rw", VOLUME, "--", "/bin/sh", "-c", f"echo x > {VOLUME}/f"])
-expect("volume granted ro is read-only", "nonzero", ["--ro", VOLUME, "--", "/bin/sh", "-c", f"echo y > {VOLUME}/g"])
-expect("volume granted ro is readable", 0, ["--ro", VOLUME, "--", "/bin/cat", f"{VOLUME}/f"])
-expect("ungranted volume is invisible", "nonzero", ["--", "/bin/cat", f"{VOLUME}/f"])
+if LANDLOCK:
+    expect("cannot read outside the allow-list", "nonzero", ["--", "/bin/cat", SECRET])
+    expect("cannot list /etc", "nonzero", ["--", "/bin/ls", "/etc"])
+    expect("can read an allowed file", 0, ["--", "/bin/cat", "/etc/passwd"])
+    expect("cannot write to world-writable /var/tmp", "nonzero", ["--", "/bin/sh", "-c", "echo x > /var/tmp/sbx-pwn"])
+    expect("can write to /tmp", 0, ["--", "/bin/sh", "-c", "echo x > /tmp/sbx-ok-$$ && rm /tmp/sbx-ok-$$"])
+    shutil.copy("/bin/true", f"{W}/t")
+    os.chmod(f"{W}/t", 0o755)
+    expect("cannot exec from rw-only /tmp", 127, [f"--", f"{W}/t"], log="need 'x' in an fs rule")
+    expect("subprocess inherits fs rules", "nonzero", ["--", "/bin/sh", "-c", f"/bin/sh -c '/bin/cat {SECRET}'"])
+    os.chmod(VOLUME, 0o777)
+    expect("volume granted rw is writable", 0, ["--rw", VOLUME, "--", "/bin/sh", "-c", f"echo x > {VOLUME}/f"])
+    expect("volume granted ro is read-only", "nonzero", ["--ro", VOLUME, "--", "/bin/sh", "-c", f"echo y > {VOLUME}/g"])
+    expect("volume granted ro is readable", 0, ["--ro", VOLUME, "--", "/bin/cat", f"{VOLUME}/f"])
+    expect("ungranted volume is invisible", "nonzero", ["--", "/bin/cat", f"{VOLUME}/f"])
+else:
+    print("  n/a  filesystem rules (no Landlock)")
 
 # ---------------------------------------------------------------- supervision
 
@@ -288,11 +317,27 @@ expect("--no-subprocesses blocks fork", "nonzero", ["--no-subprocesses", "--", "
        log="process.subprocesses = false")
 
 NR = (SETPRIV, "--reuid", "65534", "--regid", "65534", "--clear-groups")
-expect("same-uid: runs", 0, ["--", "/bin/true"], wrap=NR)
-expect("same-uid: fs rules still enforced", "nonzero", ["--", "/bin/cat", SECRET], wrap=NR)
-expect("same-uid: cannot signal the supervisor", "nonzero", ["--", "/bin/sh", "-c", "kill -0 $PPID"], wrap=NR)
-expect("same-uid: cannot read the supervisor's environ", "nonzero",
-       ["--", "/bin/sh", "-c", "grep -q SBX_POLICY_FILE /proc/$PPID/environ"], wrap=NR)
+if LANDLOCK:
+    expect("same-uid: runs", 0, ["--", "/bin/true"], wrap=NR)
+    expect("same-uid: fs rules still enforced", "nonzero", ["--", "/bin/cat", SECRET], wrap=NR)
+    expect("same-uid: cannot signal the supervisor", "nonzero", ["--", "/bin/sh", "-c", "kill -0 $PPID"], wrap=NR)
+    expect("same-uid: cannot read the supervisor's environ", "nonzero",
+           ["--", "/bin/sh", "-c", "grep -q SBX_POLICY_FILE /proc/$PPID/environ"], wrap=NR)
+else:
+    print("  n/a  same-uid sbx (needs Landlock scoping; refused without Landlock, see below)")
+
+print("== one sandbox per container")
+first = subprocess.Popen([SBX, "run", "--", "/bin/sleep", "60"], env=dict(BASE_ENV, SBX_POLICY_FILE=BASE),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+for line in first.stderr:
+    if "started pid" in line:
+        break
+expect("a second sbx is refused while one runs", 125, ["--", "/bin/true"], log="another sbx sandbox is running")
+rc, so, se = sbx([], cmd="probe")
+check("probe reports the slot as taken", rc == 1 and "MISSING  one sandbox per container" in so, so + se)
+first.terminate()
+first.communicate(timeout=30)
+expect("the slot is free again once it exits", 0, ["--", "/bin/true"])
 
 # ---------------------------------------------------------------- seccomp
 
@@ -472,13 +517,16 @@ s.sendto(b"x", socket.MSG_FASTOPEN, ("127.0.0.1", int(sys.argv[1])))
 expect("IP source routing options are refused", 1,
        py("import socket; socket.socket().setsockopt(socket.IPPROTO_IP, socket.IP_OPTIONS, bytes(8))"),
        pol=EGRESS, log="source routing")
-expect("AF_UNIX connect still works", 0, py("""
+if LANDLOCK:
+    expect("AF_UNIX connect still works", 0, py("""
 import socket, os
 p = "/tmp/sbx-unix-%d" % os.getpid()
 srv = socket.socket(socket.AF_UNIX); srv.bind(p); srv.listen(1)
 c = socket.socket(socket.AF_UNIX); c.connect(p)
 os.unlink(p)
 """), pol=EGRESS)
+else:
+    print("  n/a  AF_UNIX connect still works (denied without Landlock, see below)")
 
 RESOLVE = """
 import socket, sys
@@ -498,8 +546,31 @@ expect("other names get NXDOMAIN", 3, py(RESOLVE, "other.test"), pol=EGRESS, log
 check("denied names never reach the upstream", all(n != "other.test" for n, _ in UP.seen), UP.seen)
 expect("link-local answers are not learned", 1, py(RESOLVE, "meta.allowed.test", C.port), pol=EGRESS,
        log="not added to the egress allow-set")
-with open("/etc/resolv.conf") as f:
-    check("resolv.conf points at the proxy over TCP", "nameserver 127.0.0.53" in f.read(), "")
+
+
+def resolv_conf():
+    with open("/etc/resolv.conf") as f:
+        return f.read()
+
+
+before = resolv_conf()
+check("resolv.conf is back to what it was before the egress tests", before == ORIGINAL_RESOLV_CONF,
+      f"{before!r} vs {ORIGINAL_RESOLV_CONF!r}")
+expect("resolv.conf points at the proxy over TCP while sbx runs", 0, ["--", "/bin/cat", "/etc/resolv.conf"],
+       pol=EGRESS, out="nameserver 127.0.0.53\noptions use-vc")
+check("resolv.conf is restored when sbx exits", resolv_conf() == before, resolv_conf())
+first = subprocess.Popen([SBX, "run", "--", "/bin/sleep", "2"], env=dict(BASE_ENV, SBX_POLICY_FILE=EGRESS),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+for line in first.stderr:
+    if "started pid" in line:
+        break
+with open("/etc/resolv.conf", "w") as f:
+    f.write("nameserver 10.9.9.9\n")
+_, se = first.communicate(timeout=30)
+check("resolv.conf changed by someone else meanwhile is left alone",
+      resolv_conf() == "nameserver 10.9.9.9\n" and "not restoring it" in se, f"{resolv_conf()!r} {se[-300:]!r}")
+with open("/etc/resolv.conf", "w") as f:
+    f.write(before)
 
 RACE_MEMORY = """
 import ctypes, socket, struct, sys, threading
@@ -553,9 +624,78 @@ with open("/etc/resolv.conf", "w") as f:
     f.write("nameserver 8.8.8.8\n")
 expect("resolv.conf mismatch is refused", 125, ["--", "/bin/true"], pol=VERIFY, log="does not point the sandbox")
 
+# ---------------------------------------------------------------- without Landlock
+
+print('== without Landlock (landlock.abi = "off")')
+OFF = policy(abi="off")
+rc, so, se = sbx([], pol=OFF, cmd="probe")
+check("off: probe: the policy is enforceable", rc == 0, so + se)
+expect("off: runs a program", 0, ["--", "/bin/echo", "hi"], pol=OFF, out="hi", log="landlock: off")
+rc, so, se = sbx(["--quiet", "--", "/bin/cat", "/proc/self/status"], pol=OFF)
+fields = dict(l.split(":\t", 1) for l in so.splitlines() if ":\t" in l)
+check("off: uid 65534, no capabilities, no_new_privs, sbx's two seccomp filters",
+      fields.get("Uid", "").split() == ["65534"] * 4
+      and all(fields.get(k, "?").strip() == "0000000000000000" for k in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"))
+      and fields.get("NoNewPrivs") == "1" and fields.get("Seccomp_filters", "").strip() == str(OUTER_FILTERS + 2), so)
+expect("off: world-readable files outside any rule are readable (the documented loss)", 0,
+       ["--", "/bin/cat", SECRET], pol=OFF, out="topsecret")
+PRIVATE = f"{W}/private"
+with open(PRIVATE, "w") as f:
+    f.write("private\n")
+os.chmod(PRIVATE, 0o600)
+expect("off: file permissions still apply", 1, ["--", "/bin/cat", PRIVATE], pol=OFF, log="Permission denied")
+expect("off: fs rules are refused", 125, ["--ro", "/usr", "--", "/bin/true"], pol=OFF, log="fs rules need Landlock")
+expect("off: non-root sbx is refused", 125, ["--", "/bin/true"], pol=OFF, wrap=NR, log="needs sbx to start as root")
+with socket.socket() as s:
+    p = subprocess.run([SBX, "run", "--", "/bin/true"], env=dict(BASE_ENV, SBX_POLICY_FILE=OFF), stdin=s.fileno(),
+                       capture_output=True, text=True, timeout=60)
+check("off: an IP socket on stdio is refused in mode none", p.returncode == 125 and "is an IP socket" in p.stderr,
+      f"rc={p.returncode} stderr={p.stderr[-600:]!r}")
+squatter = subprocess.Popen([*NR, "/bin/sleep", "60"], stdin=subprocess.DEVNULL)
+for _ in range(50):
+    with open(f"/proc/{squatter.pid}/status") as f:
+        if "\nUid:\t65534\t" in f.read():
+            break
+    time.sleep(0.1)
+expect("off: refused while another process runs as the sandbox uid", 125, ["--", "/bin/true"], pol=OFF,
+       log="already run as uid 65534")
+squatter.kill()
+squatter.wait()
+
+EGRESS_OFF = policy(
+    abi="off", mode="egress", families=("unix", "inet", "inet6"), dns=DNS,
+    egress=[{"cidr": "127.0.0.1/32", "ports": [A.port]}, {"domain": "allowed.test", "ports": [C.port]}])
+rc, so, se = sbx([], pol=EGRESS_OFF, cmd="probe")
+check("off: probe: the egress policy is enforceable", rc == 0, so + se)
+eo = lambda name, want, *argv, **kw: expect(name, want, py(CONNECT, *argv), pol=EGRESS_OFF, **kw)
+eo("off: allowed CIDR port connects", 0, "127.0.0.1", A.port)
+eo("off: other port is denied (EACCES)", 13, "127.0.0.1", B.port, log=f"denied connect to 127.0.0.1:{B.port}")
+expect("off: allowed name resolves and connects", 0, py(RESOLVE, "allowed.test", C.port), pol=EGRESS_OFF,
+       out="127.0.0.2")
+expect("off: other names get NXDOMAIN", 3, py(RESOLVE, "other.test"), pol=EGRESS_OFF, log="dns: denied A other.test")
+UNIX_CONNECT = """
+import socket, sys
+try:
+    socket.socket(socket.AF_UNIX).connect(sys.argv[1])
+except PermissionError:
+    sys.exit(13)
+"""
+expect("off: AF_UNIX connect is denied", 13, py(UNIX_CONNECT, "/nonexistent-sbx.sock"), pol=EGRESS_OFF,
+       log="non-IP sockets is denied")
+expect("off: bind is denied", 1, py("import socket; socket.socket().bind(('127.0.0.1', 0))"), pol=EGRESS_OFF,
+       log="denied bind")
+expect("off: listen is denied", 1, py("import socket; socket.socket().listen(1)"), pol=EGRESS_OFF, log="denied listen")
+before = B.accepted
+expect("off: fd swap: AF_UNIX <-> TCP during connect", 0, ["--quiet", *py(RACE_FDS, B.port)], pol=EGRESS_OFF,
+       timeout=300)
+time.sleep(0.2)
+check("off: fd swap: the denied server saw no connection", B.accepted == before, f"accepted {B.accepted - before}")
+
 # ---------------------------------------------------------------- cleanup
 
 shutil.rmtree(W, ignore_errors=True)
+with open("/etc/resolv.conf", "w") as f:
+    f.write(ORIGINAL_RESOLV_CONF)
 for p in (SECRET, "/var/tmp/sbx-pwn"):
     if os.path.exists(p):
         os.unlink(p)

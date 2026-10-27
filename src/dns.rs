@@ -483,23 +483,64 @@ pub fn verify_resolv_conf(listen: IpAddr, contents: &str) -> Result<(), String> 
     }
 }
 
-/// Apply network.dns.resolv_conf: write the file, or verify it.
-pub fn setup_resolv_conf(cfg: &DnsCfg) -> Result<(), String> {
+/// Apply network.dns.resolv_conf: write the file, or verify it. With
+/// "write", the returned guard puts the original file back when dropped.
+pub fn setup_resolv_conf(cfg: &DnsCfg) -> Result<Option<ResolvConfRestore>, String> {
     let listen = cfg.listen.ip();
+    let mut restore = None;
     if cfg.resolv_conf == ResolvConfMode::Write {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(RESOLV_CONF)
-            .map_err(|e| format!("cannot write {RESOLV_CONF}: {e}"))?;
-        f.write_all(resolv_conf_contents(listen).as_bytes())
-            .map_err(|e| format!("cannot write {RESOLV_CONF}: {e}"))?;
+        let original = std::fs::read(RESOLV_CONF).map_err(|e| format!("cannot read {RESOLV_CONF}: {e}"))?;
+        let written = resolv_conf_contents(listen).into_bytes();
+        if let Err(e) = write_resolv_conf(&written) {
+            // A failed write may have truncated the file already.
+            if let Err(e) = write_resolv_conf(&original) {
+                log::error(format!("restoring {RESOLV_CONF}: {e}"));
+            }
+            return Err(e);
+        }
+        restore = Some(ResolvConfRestore { original, written });
         log::info(format!("wrote {RESOLV_CONF}: nameserver {listen}, options use-vc"));
     }
     let contents = std::fs::read_to_string(RESOLV_CONF).map_err(|e| format!("cannot read {RESOLV_CONF}: {e}"))?;
-    verify_resolv_conf(listen, &contents)
+    verify_resolv_conf(listen, &contents)?;
+    Ok(restore)
+}
+
+/// Rewrite the file in place: container runtimes often bind-mount it, so it
+/// cannot be replaced by a rename.
+fn write_resolv_conf(contents: &[u8]) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(RESOLV_CONF)
+        .and_then(|mut f| f.write_all(contents))
+        .map_err(|e| format!("cannot write {RESOLV_CONF}: {e}"))
+}
+
+/// The resolv.conf sbx found, written back when sbx exits so the rest of the
+/// container (e.g. a service's own server) resolves names as before. If the
+/// file no longer holds what sbx wrote, someone else changed it, and it is
+/// left alone.
+pub struct ResolvConfRestore {
+    original: Vec<u8>,
+    written: Vec<u8>,
+}
+
+impl Drop for ResolvConfRestore {
+    fn drop(&mut self) {
+        match std::fs::read(RESOLV_CONF) {
+            Ok(now) if now == self.written => match write_resolv_conf(&self.original) {
+                Ok(()) => log::info(format!("restored {RESOLV_CONF}")),
+                Err(e) => log::error(format!("restoring {RESOLV_CONF}: {e}")),
+            },
+            Ok(_) => log::warn(format!(
+                "{RESOLV_CONF} was changed by someone else while sbx ran; not restoring it"
+            )),
+            Err(e) => log::error(format!("restoring {RESOLV_CONF}: cannot read it: {e}")),
+        }
+    }
 }
 
 #[cfg(test)]
