@@ -56,7 +56,7 @@ const DEFAULT_DENY: &[(&str, i64)] = syscalls![
     SYS_io_uring_register, SYS_keyctl, SYS_add_key, SYS_request_key, SYS_fanotify_init,
     SYS_name_to_handle_at, SYS_open_by_handle_at,
     // system administration
-    SYS_kexec_load, SYS_kexec_file_load, SYS_init_module, SYS_finit_module, SYS_delete_module,
+    SYS_kexec_load, SYS_init_module, SYS_finit_module, SYS_delete_module,
     SYS_acct, SYS_swapon, SYS_swapoff, SYS_reboot, SYS_sethostname, SYS_setdomainname,
     SYS_syslog, SYS_quotactl, SYS_settimeofday, SYS_clock_settime, SYS_clock_adjtime,
     SYS_adjtimex, SYS_vhangup,
@@ -64,6 +64,7 @@ const DEFAULT_DENY: &[(&str, i64)] = syscalls![
 
 #[cfg(target_arch = "x86_64")]
 const DEFAULT_DENY_ARCH: &[(&str, i64)] = syscalls![
+    SYS_kexec_file_load,
     SYS_iopl,
     SYS_ioperm,
     SYS_modify_ldt,
@@ -72,8 +73,10 @@ const DEFAULT_DENY_ARCH: &[(&str, i64)] = syscalls![
     SYS_ustat,
     SYS_sysfs
 ];
+// libc's aarch64 musl bindings lack kexec_file_load; 294 is its number in
+// the generic syscall table aarch64 uses.
 #[cfg(target_arch = "aarch64")]
-const DEFAULT_DENY_ARCH: &[(&str, i64)] = &[];
+const DEFAULT_DENY_ARCH: &[(&str, i64)] = &[("SYS_kexec_file_load", 294)];
 
 /// Extra names accepted in `seccomp.deny`.
 #[rustfmt::skip]

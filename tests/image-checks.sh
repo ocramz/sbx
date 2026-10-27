@@ -13,7 +13,9 @@ pass=0
 fail=0
 ok() { pass=$((pass + 1)); echo "  ok   $1"; }
 bad() { fail=$((fail + 1)); printf '  FAIL %s\n       %s\n' "$1" "$2"; }
-run() { "$docker" run --rm --platform "$platform" "$@"; }
+# --pull=never: check the image just built. With --platform, podman otherwise
+# pulls the tag from the registry if it exists there.
+run() { "$docker" run --rm --pull=never --platform "$platform" "$@"; }
 
 echo "== runtime image $image"
 
@@ -42,7 +44,7 @@ run "$image" -- /bin/sh -c 'setsid /bin/sleep 300 >/dev/null 2>&1 & echo started
 took=$(($(date +%s) - start))
 [ "$took" -lt 30 ] && ok "leftover processes are killed when the program exits" || bad "leftover processes" "container ran ${took}s"
 
-cid=$("$docker" run -d --platform "$platform" "$image" -- /bin/sleep 300)
+cid=$("$docker" run -d --pull=never --platform "$platform" "$image" -- /bin/sleep 300)
 sleep 1
 "$docker" stop -t 10 "$cid" >/dev/null
 code=$("$docker" inspect -f '{{.State.ExitCode}}' "$cid")
