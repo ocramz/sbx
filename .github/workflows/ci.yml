@@ -1,0 +1,54 @@
+# Lint and unit-test the code, build the image, run the integration suite in
+# Docker, and push the image to ghcr.io for main and v* tags. Every step is a
+# Makefile target, so CI and local runs are the same commands.
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    # Branches of this repository are built by the push event; pull_request
+    # runs only for forks.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the Rust toolchain pinned in rust-toolchain.toml
+        run: rustup toolchain install
+      - run: make lint
+      - run: make test
+
+  image:
+    needs: check
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Report the kernel the integration suite runs on
+        run: uname -r
+      - name: Build the images and run the integration suite
+        run: make smoke
+      - name: Log in to ghcr.io
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push the image (main)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: make push PUSH_TAGS=main
+      - name: Push the image (release tag)
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        run: make push PUSH_TAGS="$GITHUB_REF_NAME latest"

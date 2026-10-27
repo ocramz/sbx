@@ -1,55 +1,58 @@
 # syntax=docker/dockerfile:1.7
 #
-# Build:   docker build -t sbx .
-#          docker build -t sbx-python --build-arg BASE_IMAGE=python:3.13-slim-bookworm .
-# Local:   docker run --rm sbx -- /bin/sh -c 'id; cat /etc/hostname'      # 2nd command is denied
-#
-# Docker's default seccomp profile blocks the landlock_* syscalls on older
-# Docker releases; if `sbx probe` says ENOSYS locally, run with
-# --security-opt seccomp=unconfined (the platform's outer sandbox still applies).
+# Built through the Makefile, which passes every build argument:
+#   make image       runtime image on BASE_IMAGE
+#   make test-image  runtime stage on a Python base, plus the integration suite
+# There are deliberately no defaults: a missing build argument fails the build.
 
-ARG BASE_IMAGE=debian:bookworm-slim
+ARG RUST_VERSION
+ARG BASE_IMAGE
 
 # ---------------------------------------------------------------- build
-FROM rust:1.91-slim-bookworm AS build
+FROM rust:${RUST_VERSION}-slim-bookworm AS build
 ARG TARGETARCH
-RUN apt-get update \
- && apt-get install -y --no-install-recommends musl-tools \
- && rm -rf /var/lib/apt/lists/*
-RUN case "${TARGETARCH:-amd64}" in \
+RUN case "${TARGETARCH}" in \
       amd64) echo x86_64-unknown-linux-musl ;; \
       arm64) echo aarch64-unknown-linux-musl ;; \
-      *) echo "unsupported arch ${TARGETARCH}" >&2; exit 1 ;; \
+      *) echo "unsupported TARGETARCH '${TARGETARCH}'" >&2; exit 1 ;; \
     esac > /rust-target \
  && rustup target add "$(cat /rust-target)"
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-COPY policy ./policy
-# Static binary: no libc dependency, so it can be dropped into any base image.
+# Static binary (the musl target is self-contained and every dependency is
+# pure Rust), so it can be dropped into any base image.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked --target "$(cat /rust-target)" \
  && cp "target/$(cat /rust-target)/release/sbx" /sbx
+RUN if readelf -lW /sbx | grep -q INTERP; then echo "sbx is not statically linked" >&2; exit 1; fi
 
 # ---------------------------------------------------------------- runtime
-# Any glibc or musl base works: the payload's runtime (python, node, ...)
-# comes from here. Pin by digest in production.
-FROM ${BASE_IMAGE}
+# The payload's runtime (python, node, ...) comes from BASE_IMAGE. Pin it by
+# digest in production.
+FROM ${BASE_IMAGE} AS runtime
+LABEL org.opencontainers.image.source="https://github.com/ocramz/sbx" \
+      org.opencontainers.image.description="Landlock + seccomp sandbox launcher for untrusted programs" \
+      org.opencontainers.image.licenses="Apache-2.0"
 
 COPY --from=build /sbx /usr/local/bin/sbx
 COPY policy/default.toml /etc/sbx/policy.toml
-COPY tests/smoke.sh /opt/sbx/smoke.sh
+COPY policy/egress.example.toml /etc/sbx/egress.example.toml
+ENV SBX_POLICY_FILE=/etc/sbx/policy.toml
 
 # Scratch dir for the sandboxed uid. On Cloud Run, mount an in-memory volume
 # here instead so each instance starts clean.
 RUN mkdir -p /workspace && chmod 1777 /workspace
 
-# Deliberately root: sbx is PID 1 and needs root only to drop the payload to
-# uid 65534. That uid split is what stops the payload from signalling,
-# ptracing or reading /proc of the supervisor on kernels without Landlock
-# scoping (ABI < 6). sbx itself never runs payload code.
+# The shipped policies must match this image: a missing or symlinked path in
+# a rule fails the build here instead of at run time.
+RUN ["/usr/local/bin/sbx", "policy", "--quiet"]
+RUN ["/usr/local/bin/sbx", "policy", "--quiet", "--policy", "/etc/sbx/egress.example.toml"]
+
+# Deliberately root: sbx is PID 1 and needs root only to drop the program to
+# uid 65534 and empty its capability sets. sbx itself never runs payload code.
 USER 0:0
 WORKDIR /workspace
 STOPSIGNAL SIGTERM
@@ -57,4 +60,9 @@ STOPSIGNAL SIGTERM
 # Everything after ENTRYPOINT is overridable per execution
 # (Cloud Run: --args; docker: trailing arguments).
 ENTRYPOINT ["/usr/local/bin/sbx", "run"]
-CMD ["--", "/bin/sh", "-c", "echo 'sbx: no program given, pass e.g. -- python3 /workspace/main.py' >&2; exit 2"]
+CMD ["--", "/bin/sh", "-c", "echo 'sbx: no program given; pass e.g. -- python3 /workspace/main.py' >&2; exit 2"]
+
+# ---------------------------------------------------------------- test
+# Runtime stage built on a Python base (BASE_IMAGE=python:...), plus the suite.
+FROM runtime AS test
+COPY tests/smoke.py /opt/sbx/tests/smoke.py
