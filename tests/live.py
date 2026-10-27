@@ -162,6 +162,7 @@ print(f"  CapBnd          {status['CapBnd'].strip()}")
 print(f"  seccomp         mode {status.get('Seccomp', '?').strip()}, {status.get('Seccomp_filters', '?').strip()} filters")
 print(f"  NoNewPrivs      {status.get('NoNewPrivs', '?').strip()}")
 print(f"  ptrace_scope    {read('/proc/sys/kernel/yama/ptrace_scope')}")
+RESOLV_BEFORE = read(RESOLV)
 kind = f"symlink to {os.readlink(RESOLV)}" if os.path.islink(RESOLV) else "regular file" if os.path.isfile(RESOLV) else "missing"
 print(f"  resolv.conf     {kind}: {' | '.join(read(RESOLV).splitlines())}")
 
@@ -243,6 +244,9 @@ expect(N + "AF_UNIX connect is denied", 13, ["--", PY, "-c", UNIX_CONNECT, "/non
        log="non-IP sockets is denied")
 expect(N + "bind is denied", 1, ["--", PY, "-c", "import socket; socket.socket().bind(('127.0.0.1', 0))"],
        pol=NO_LANDLOCK, log="denied bind")
+
+check("resolv.conf is restored after the egress runs", read(RESOLV) == RESOLV_BEFORE,
+      f"{read(RESOLV)!r} vs {RESOLV_BEFORE!r}")
 
 print(f"== {len(PASS)} passed, {len(FAIL)} failed")
 for name in FAIL:

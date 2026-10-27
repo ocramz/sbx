@@ -70,6 +70,8 @@ if os.listdir(VOLUME):
     die(f"TEST_VOLUME {VOLUME} is not empty")
 if not os.path.isfile("/etc/resolv.conf") or os.path.islink("/etc/resolv.conf"):
     die("/etc/resolv.conf must be a regular file (the DNS tests rewrite it)")
+with open("/etc/resolv.conf") as f:
+    ORIGINAL_RESOLV_CONF = f.read()
 SETPRIV = shutil.which("setpriv") or die("setpriv (util-linux) is required")
 REQUIRE_IPV6 = os.environ.get("TEST_REQUIRE_IPV6", "false")
 if REQUIRE_IPV6 not in ("true", "false"):
@@ -544,8 +546,31 @@ expect("other names get NXDOMAIN", 3, py(RESOLVE, "other.test"), pol=EGRESS, log
 check("denied names never reach the upstream", all(n != "other.test" for n, _ in UP.seen), UP.seen)
 expect("link-local answers are not learned", 1, py(RESOLVE, "meta.allowed.test", C.port), pol=EGRESS,
        log="not added to the egress allow-set")
-with open("/etc/resolv.conf") as f:
-    check("resolv.conf points at the proxy over TCP", "nameserver 127.0.0.53" in f.read(), "")
+
+
+def resolv_conf():
+    with open("/etc/resolv.conf") as f:
+        return f.read()
+
+
+before = resolv_conf()
+check("resolv.conf is back to what it was before the egress tests", before == ORIGINAL_RESOLV_CONF,
+      f"{before!r} vs {ORIGINAL_RESOLV_CONF!r}")
+expect("resolv.conf points at the proxy over TCP while sbx runs", 0, ["--", "/bin/cat", "/etc/resolv.conf"],
+       pol=EGRESS, out="nameserver 127.0.0.53\noptions use-vc")
+check("resolv.conf is restored when sbx exits", resolv_conf() == before, resolv_conf())
+first = subprocess.Popen([SBX, "run", "--", "/bin/sleep", "2"], env=dict(BASE_ENV, SBX_POLICY_FILE=EGRESS),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+for line in first.stderr:
+    if "started pid" in line:
+        break
+with open("/etc/resolv.conf", "w") as f:
+    f.write("nameserver 10.9.9.9\n")
+_, se = first.communicate(timeout=30)
+check("resolv.conf changed by someone else meanwhile is left alone",
+      resolv_conf() == "nameserver 10.9.9.9\n" and "not restoring it" in se, f"{resolv_conf()!r} {se[-300:]!r}")
+with open("/etc/resolv.conf", "w") as f:
+    f.write(before)
 
 RACE_MEMORY = """
 import ctypes, socket, struct, sys, threading
@@ -669,6 +694,8 @@ check("off: fd swap: the denied server saw no connection", B.accepted == before,
 # ---------------------------------------------------------------- cleanup
 
 shutil.rmtree(W, ignore_errors=True)
+with open("/etc/resolv.conf", "w") as f:
+    f.write(ORIGINAL_RESOLV_CONF)
 for p in (SECRET, "/var/tmp/sbx-pwn"):
     if os.path.exists(p):
         os.unlink(p)

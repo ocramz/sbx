@@ -193,11 +193,13 @@ fn run(p: Policy, cmd: Vec<OsString>) -> Result<i32, Vec<String>> {
         egress: None,
         dns: None,
     };
+    // Puts /etc/resolv.conf back when run() returns, after the sandbox is gone.
+    let mut _resolv_conf = None;
     if p.network.mode == NetMode::Egress {
         let egress = Arc::new(egress::Egress::new(&p));
         log::info(egress.summary());
         if let Some(d) = &p.network.dns {
-            dns::setup_resolv_conf(d).map_err(one)?;
+            _resolv_conf = dns::setup_resolv_conf(d).map_err(one)?;
             let listener = dns::bind(d).map_err(one)?;
             svc.dns = Some((listener, d.clone()));
         }

@@ -52,7 +52,8 @@ egress = [
 listen = "127.0.0.53:53"           # loopback, port 53; the sandbox reaches it over TCP
 upstream = "169.254.169.254:53"    # Cloud Run / GCE metadata resolver; adjust for your platform
 upstream_transport = "udp"         # a truncated UDP reply is answered with SERVFAIL; use "tcp" if needed
-resolv_conf = "write"              # write /etc/resolv.conf (nameserver 127.0.0.53, options use-vc), or "verify"
+resolv_conf = "write"              # write /etc/resolv.conf (nameserver 127.0.0.53, options use-vc)
+                                   # and restore it on exit, or "verify"
 timeout_ms = 2000
 answer_scopes = ["global"]         # learn only public addresses; also "private", "loopback"
 
