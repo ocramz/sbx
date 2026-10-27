@@ -56,8 +56,9 @@ pub struct Policy {
 pub struct LandlockCfg {
     /// The Landlock ABI whose access rights are enforced. The kernel must
     /// support at least this version; rights added by newer ABIs are not
-    /// handled (sbx warns when the kernel is newer).
-    pub abi: u8,
+    /// handled (sbx warns when the kernel is newer). "off" runs without
+    /// Landlock, for kernels built without it.
+    pub abi: LandlockAbi,
     /// Deny signals to processes outside the sandbox (needs abi >= 6).
     pub scope_signals: bool,
     /// Deny connecting to abstract UNIX sockets created outside the sandbox (needs abi >= 6).
@@ -232,6 +233,14 @@ pub enum Timeout {
     None,
 }
 
+/// A Landlock ABI version, or "off": no Landlock at all, so files are
+/// protected by their permissions only (see the README, "Without Landlock").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LandlockAbi {
+    V(u8),
+    Off,
+}
+
 fn ser_keyword<S: Serializer>(s: S, n: Option<u64>, kw: &str) -> Result<S::Ok, S::Error> {
     match n {
         Some(n) => s.serialize_u64(n),
@@ -307,6 +316,30 @@ impl<'de> Deserialize<'de> for Timeout {
             Some(n) => Timeout::Secs(n),
             None => Timeout::None,
         })
+    }
+}
+
+impl Serialize for LandlockAbi {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        ser_keyword(
+            s,
+            match self {
+                LandlockAbi::V(v) => Some(u64::from(*v)),
+                LandlockAbi::Off => None,
+            },
+            "off",
+        )
+    }
+}
+
+impl<'de> Deserialize<'de> for LandlockAbi {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        match d.deserialize_any(KeywordVisitor("off"))? {
+            Some(n) => u8::try_from(n)
+                .map(LandlockAbi::V)
+                .map_err(|_| de::Error::custom(format!("Landlock ABI {n} is out of range"))),
+            None => Ok(LandlockAbi::Off),
+        }
     }
 }
 
@@ -648,7 +681,7 @@ impl Policy {
     pub fn validate(&self) -> Result<Vec<String>, Vec<String>> {
         let mut errs = Vec::new();
         let mut warn = Vec::new();
-        self.validate_landlock(&mut errs);
+        self.validate_landlock(&mut errs, &mut warn);
         self.validate_fs(&mut errs, &mut warn);
         self.validate_process(&mut errs);
         self.validate_limits(&mut errs);
@@ -662,8 +695,11 @@ impl Policy {
         }
     }
 
-    fn validate_landlock(&self, errs: &mut Vec<String>) {
-        let abi = self.landlock.abi;
+    fn validate_landlock(&self, errs: &mut Vec<String>, warn: &mut Vec<String>) {
+        let LandlockAbi::V(abi) = self.landlock.abi else {
+            self.validate_without_landlock(errs, warn);
+            return;
+        };
         if !(1..=MAX_LANDLOCK_ABI).contains(&abi) {
             errs.push(format!(
                 "landlock.abi must be between 1 and {MAX_LANDLOCK_ABI}, got {abi}"
@@ -682,6 +718,39 @@ impl Policy {
                 self.network.mode
             ));
         }
+    }
+
+    /// landlock.abi = "off": refuse every setting that only Landlock can
+    /// enforce, so nothing in the policy promises more than sbx delivers.
+    fn validate_without_landlock(&self, errs: &mut Vec<String>, warn: &mut Vec<String>) {
+        if self.landlock.scope_signals || self.landlock.scope_abstract_unix {
+            errs.push(
+                "landlock.scope_signals/scope_abstract_unix need Landlock, but landlock.abi = \"off\"; \
+                 set them to false"
+                    .into(),
+            );
+        }
+        if !self.fs.is_empty() {
+            let paths: Vec<String> = self.fs.iter().map(|r| r.path.display().to_string()).collect();
+            errs.push(format!(
+                "fs rules need Landlock, but landlock.abi = \"off\": the program can access every file its uid \
+                 can, so remove the rules for {} (including --ro/--rw/--rx and SBX_FS_*)",
+                paths.join(", ")
+            ));
+        }
+        if self.network.mode == NetMode::Egress && !self.network.bind_tcp.is_empty() {
+            errs.push(
+                "network.bind_tcp needs Landlock, but landlock.abi = \"off\" (bind and listen are then denied \
+                 in egress mode); remove the ports"
+                    .into(),
+            );
+        }
+        warn.push(format!(
+            "landlock.abi = \"off\": files are protected by their permissions only, so make sure nothing \
+             uid {} must not read is world-readable; sbx must start as root and no other process may run \
+             as uid {}",
+            self.process.uid, self.process.uid
+        ));
     }
 
     fn validate_fs(&self, errs: &mut Vec<String>, warn: &mut Vec<String>) {
@@ -726,11 +795,14 @@ impl Policy {
         }
     }
 
-    /// The fs rule granting `letter` on `path` or one of its ancestors.
+    /// The fs rule granting `letter` on `path` or one of its ancestors. With
+    /// Landlock off only file permissions apply, so every path counts.
     pub fn covered(&self, path: &Path, letter: char) -> bool {
-        self.fs
-            .iter()
-            .any(|r| path.starts_with(&r.path) && r.access.contains(letter))
+        self.landlock.abi == LandlockAbi::Off
+            || self
+                .fs
+                .iter()
+                .any(|r| path.starts_with(&r.path) && r.access.contains(letter))
     }
 
     fn validate_process(&self, errs: &mut Vec<String>) {
@@ -1117,6 +1189,50 @@ access = "rw"
         assert!(errs.iter().any(|e| e.contains("abi >= 6")), "{errs:?}");
         let src = MINIMAL.replacen("abi = 4", "abi = 10", 1);
         assert!(parse(&src).unwrap().validate().is_err());
+        let src = MINIMAL.replacen("abi = 4", "abi = 300", 1);
+        assert!(parse(&src).unwrap_err().contains("out of range"));
+        let src = MINIMAL.replacen("abi = 4", "abi = \"none\"", 1);
+        assert!(parse(&src).unwrap_err().contains("\"off\""));
+    }
+
+    /// MINIMAL with landlock.abi = "off": no scopes and no fs rules (an
+    /// empty top-level `fs`, since every field is required).
+    pub fn without_landlock(src: &str) -> String {
+        let src =
+            src.replacen("abi = 4", "abi = \"off\"", 1)
+                .replacen("[[fs]]\npath = \"/tmp\"\naccess = \"rw\"\n", "", 1);
+        format!("fs = []\n{src}")
+    }
+
+    #[test]
+    fn landlock_off_is_explicit_and_round_trips() {
+        let p = parse(&without_landlock(MINIMAL)).unwrap();
+        assert_eq!(p.landlock.abi, LandlockAbi::Off);
+        let warn = p.validate().unwrap();
+        assert!(warn.iter().any(|w| w.contains("permissions only")), "{warn:?}");
+        let again = parse(&toml::to_string_pretty(&p).unwrap()).unwrap();
+        assert_eq!(again.landlock.abi, LandlockAbi::Off);
+        assert!(again.fs.is_empty());
+    }
+
+    #[test]
+    fn landlock_off_refuses_what_only_landlock_enforces() {
+        let src = without_landlock(MINIMAL);
+        let errs = |src: &str| parse(src).unwrap().validate().unwrap_err();
+        let e = errs(&src.replacen("scope_signals = false", "scope_signals = true", 1));
+        assert!(
+            e.iter().any(|e| e.contains("scope_abstract_unix need Landlock")),
+            "{e:?}"
+        );
+        let e = errs(&src.replacen("fs = []", "fs = [{ path = \"/tmp\", access = \"r\" }]", 1));
+        assert!(e.iter().any(|e| e.contains("fs rules need Landlock")), "{e:?}");
+
+        let mut p = parse(&src).unwrap();
+        p.network.mode = NetMode::Egress;
+        p.network.bind_tcp = vec![8080];
+        p.seccomp.socket_families = vec![SocketFamily::Unix, SocketFamily::Inet];
+        let e = p.validate().unwrap_err();
+        assert!(e.iter().any(|e| e.contains("bind_tcp needs Landlock")), "{e:?}");
     }
 
     #[test]
@@ -1159,6 +1275,12 @@ access = "rw"
         assert!(
             errs.iter().any(|e| e.contains("not readable in the sandbox")),
             "{errs:?}"
+        );
+        let src =
+            without_landlock(MINIMAL).replacen("workdir = \"/tmp\"", &format!("workdir = \"{}\"", t.0.display()), 1);
+        assert!(
+            parse(&src).unwrap().validate().is_ok(),
+            "without Landlock only permissions apply"
         );
     }
 

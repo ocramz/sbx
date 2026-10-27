@@ -3,11 +3,18 @@
 
 Runs in the test image on the Cloud Run service that tests/cloud-run.sh deploys
 (through tests/live_server.py), as root, with the policies shipped in the image.
-It prints the platform facts first, then checks sbx on this platform. The egress
-policy rewrites /etc/resolv.conf, so never run it on a host you care about.
+It prints the platform facts first, then checks sbx on this platform: with the
+shipped Landlock policies if the kernel has Landlock, and with the no-Landlock
+example in any case. The egress policies rewrite /etc/resolv.conf, so never
+run it on a host you care about.
 
 Required environment:
   SBX  path to the sbx binary
+
+Optional:
+  TEST_REQUIRE_LANDLOCK  true (default): fail when the kernel lacks Landlock ABI 6,
+                         which the shipped Landlock policies pin. false (Cloud Run):
+                         then check that sbx refuses them and report their checks as n/a
 """
 
 import ctypes
@@ -45,9 +52,13 @@ if not os.access(SBX, os.X_OK):
     die(f"{SBX} is not executable")
 DEFAULT = "/etc/sbx/policy.toml"
 EGRESS = "/etc/sbx/egress.example.toml"
-for path in (DEFAULT, EGRESS):
+NO_LANDLOCK = "/etc/sbx/no-landlock.example.toml"
+for path in (DEFAULT, EGRESS, NO_LANDLOCK):
     if not os.path.isfile(path):
         die(f"{path} is missing (run in the test image)")
+REQUIRE_LANDLOCK = os.environ.get("TEST_REQUIRE_LANDLOCK", "true")
+if REQUIRE_LANDLOCK not in ("true", "false"):
+    die("TEST_REQUIRE_LANDLOCK must be true or false")
 PY = os.path.realpath(sys.executable)
 BASE_ENV = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
 
@@ -87,9 +98,14 @@ def errname(e):
     return errno.errorcode.get(e, str(e))
 
 
+KABI = LIBC.syscall(ctypes.c_long(NR_LANDLOCK_CREATE_RULESET), None, ctypes.c_size_t(0), ctypes.c_uint(1))
+KABI_ERRNO = ctypes.get_errno()
+# The shipped Landlock policies pin ABI 6.
+LANDLOCK = KABI >= 6
+
+
 def landlock_abi():
-    abi = LIBC.syscall(ctypes.c_long(NR_LANDLOCK_CREATE_RULESET), None, ctypes.c_size_t(0), ctypes.c_uint(1))
-    return f"v{abi}" if abi >= 0 else f"unavailable ({os.strerror(ctypes.get_errno())})"
+    return f"v{KABI}" if KABI >= 0 else f"unavailable ({os.strerror(KABI_ERRNO)})"
 
 
 def active_lsms():
@@ -150,24 +166,16 @@ kind = f"symlink to {os.readlink(RESOLV)}" if os.path.islink(RESOLV) else "regul
 print(f"  resolv.conf     {kind}: {' | '.join(read(RESOLV).splitlines())}")
 
 print("== probe")
-for name, pol in (("default policy", DEFAULT), ("egress example", EGRESS)):
+for name, pol in (("default policy", DEFAULT), ("egress example", EGRESS), ("no-Landlock example", NO_LANDLOCK)):
     rc, so, se = sbx([], pol, cmd="probe")
     for line in (so + se).splitlines():
         print(f"       {line}")
-    check(f"probe: {name}", rc == 0, f"rc={rc}")
+    if pol == NO_LANDLOCK or LANDLOCK or REQUIRE_LANDLOCK == "true":
+        check(f"probe: {name}", rc == 0, f"rc={rc}")
+    else:
+        check(f"probe: {name} is refused for lack of Landlock ABI 6", rc == 1 and "MISSING  landlock" in so,
+              f"rc={rc}")
 
-# ---------------------------------------------------------------- sandbox
-
-print("== sandbox (default policy)")
-expect("runs a program", 0, ["--", "/bin/echo", "hello"], out="hello")
-expect("drops to uid 65534", 0, ["--", "/bin/sh", "-c", 'test "$(id -u):$(id -g)" = 65534:65534'])
-expect("Landlock denies files outside the policy", 1, ["--", "/bin/cat", "/etc/debian_version"],
-       log="Permission denied")
-expect("timeout kills the tree (exit 124)", 124, ["--timeout", "2", "--", "/bin/sleep", "30"], log="timeout after 2s")
-
-# ---------------------------------------------------------------- egress
-
-print("== egress (egress example policy, real network)")
 CONNECT = """
 import socket, sys
 try:
@@ -180,14 +188,61 @@ except socket.gaierror as e:
 """
 
 
-def connect(name, want, host, port, **kw):
-    expect(name, want, ["--", PY, "-c", CONNECT, host, str(port)], pol=EGRESS, **kw)
+def egress_checks(pol, prefix=""):
+    """Egress on the real network: an allowed name resolves through the metadata server's DNS and connects."""
+    def connect(name, want, host, port, **kw):
+        expect(prefix + name, want, ["--", PY, "-c", CONNECT, host, str(port)], pol=pol, **kw)
+
+    connect("allowed name resolves and connects", 0, "api.github.com", 443, log="dns: api.github.com ->")
+    connect("unlisted address is denied (EACCES)", 13, "1.1.1.1", 443, log="denied connect to 1.1.1.1:443")
+    connect("metadata server is denied", 13, "169.254.169.254", 80, log="denied connect to 169.254.169.254:80")
+    connect("unlisted name gets NXDOMAIN", 3, "example.com", 443, log="dns: denied A example.com")
 
 
-connect("allowed name resolves and connects", 0, "api.github.com", 443, log="dns: api.github.com ->")
-connect("unlisted address is denied (EACCES)", 13, "1.1.1.1", 443, log="denied connect to 1.1.1.1:443")
-connect("metadata server is denied", 13, "169.254.169.254", 80, log="denied connect to 169.254.169.254:80")
-connect("unlisted name gets NXDOMAIN", 3, "example.com", 443, log="dns: denied A example.com")
+# ---------------------------------------------------------------- with Landlock
+
+if LANDLOCK:
+    print("== sandbox (default policy)")
+    expect("runs a program", 0, ["--", "/bin/echo", "hello"], out="hello")
+    expect("drops to uid 65534", 0, ["--", "/bin/sh", "-c", 'test "$(id -u):$(id -g)" = 65534:65534'])
+    expect("Landlock denies files outside the policy", 1, ["--", "/bin/cat", "/etc/debian_version"],
+           log="Permission denied")
+    expect("timeout kills the tree (exit 124)", 124, ["--timeout", "2", "--", "/bin/sleep", "30"],
+           log="timeout after 2s")
+    print("== egress (egress example policy, real network)")
+    egress_checks(EGRESS)
+elif REQUIRE_LANDLOCK == "true":
+    print("== sandbox and egress with Landlock")
+    bad("sandbox and egress with Landlock", f"skipped: the kernel lacks Landlock ABI 6 ({landlock_abi()})")
+else:
+    print("== sandbox and egress with Landlock")
+    print(f"  n/a  the kernel lacks Landlock ABI 6 ({landlock_abi()})")
+
+# ---------------------------------------------------------------- without Landlock
+
+print('== without Landlock (no-Landlock example policy, landlock.abi = "off")')
+N = "off: "
+expect(N + "runs a program", 0, ["--", "/bin/echo", "hello"], pol=NO_LANDLOCK, out="hello", log="landlock: off")
+expect(N + "drops to uid 65534", 0, ["--", "/bin/sh", "-c", 'test "$(id -u):$(id -g)" = 65534:65534'],
+       pol=NO_LANDLOCK)
+expect(N + "world-readable files are readable (the documented loss)", 0, ["--", "/bin/cat", "/etc/debian_version"],
+       pol=NO_LANDLOCK)
+expect(N + "file permissions still apply", 1, ["--", "/bin/cat", "/etc/shadow"], pol=NO_LANDLOCK,
+       log="Permission denied")
+expect(N + "timeout kills the tree (exit 124)", 124, ["--timeout", "2", "--", "/bin/sleep", "30"], pol=NO_LANDLOCK,
+       log="timeout after 2s")
+egress_checks(NO_LANDLOCK, N)
+UNIX_CONNECT = """
+import socket, sys
+try:
+    socket.socket(socket.AF_UNIX).connect(sys.argv[1])
+except PermissionError:
+    sys.exit(13)
+"""
+expect(N + "AF_UNIX connect is denied", 13, ["--", PY, "-c", UNIX_CONNECT, "/nonexistent-sbx.sock"], pol=NO_LANDLOCK,
+       log="non-IP sockets is denied")
+expect(N + "bind is denied", 1, ["--", PY, "-c", "import socket; socket.socket().bind(('127.0.0.1', 0))"],
+       pol=NO_LANDLOCK, log="denied bind")
 
 print(f"== {len(PASS)} passed, {len(FAIL)} failed")
 for name in FAIL:

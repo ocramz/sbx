@@ -5,7 +5,7 @@
 //! be mounted (the platform mounts them before the entrypoint starts).
 
 use crate::log;
-use crate::policy::{NetMode, Policy};
+use crate::policy::{LandlockAbi, NetMode, Policy};
 use landlock::{
     Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath, PathFd, Ruleset, RulesetAttr,
     RulesetCreated, RulesetCreatedAttr, RulesetStatus, Scope, ABI,
@@ -116,7 +116,8 @@ fn rights(letters: &str, abi: ABI) -> BitFlags<AccessFs> {
 }
 
 pub struct Prepared {
-    pub ruleset: RulesetCreated,
+    /// None only for landlock.abi = "off".
+    pub ruleset: Option<RulesetCreated>,
     pub summary: String,
 }
 
@@ -124,7 +125,12 @@ pub struct Prepared {
 /// policy errors are reported clearly and the child only has to call
 /// landlock_restrict_self().
 pub fn prepare(p: &Policy) -> Result<Prepared, String> {
-    let pinned = p.landlock.abi;
+    let LandlockAbi::V(pinned) = p.landlock.abi else {
+        return Ok(Prepared {
+            ruleset: None,
+            summary: "landlock: off (landlock.abi = \"off\"): file access is limited by permissions only".into(),
+        });
+    };
     let kernel = match probe() {
         Probe::Available(v) => v,
         other => return Err(format!("Landlock is required but {other}")),
@@ -207,7 +213,7 @@ pub fn prepare(p: &Policy) -> Result<Prepared, String> {
         scopes.join(", ")
     );
     Ok(Prepared {
-        ruleset: created.no_new_privs(true),
+        ruleset: Some(created.no_new_privs(true)),
         summary,
     })
 }

@@ -78,7 +78,7 @@ test-image: ## build the test image (runtime stage on TEST_BASE_IMAGE plus the s
 smoke: image test-image ## integration suite in the test image, then checks of the runtime image
 	$(DOCKER) run --rm --pull=never --platform $(PLATFORM) --cap-add SYS_PTRACE \
 		--tmpfs /mnt/sbx-vol:rw,mode=0755 \
-		-e SBX=/usr/local/bin/sbx -e TEST_VOLUME=/mnt/sbx-vol -e TEST_REQUIRE_IPV6=true \
+		-e SBX=/usr/local/bin/sbx -e TEST_VOLUME=/mnt/sbx-vol -e TEST_REQUIRE_IPV6=true -e TEST_REQUIRE_LANDLOCK=true \
 		--entrypoint python3 $(TEST_IMAGE):$(VERSION) /opt/sbx/tests/smoke.py
 	DOCKER="$(DOCKER)" PLATFORM="$(PLATFORM)" tests/image-checks.sh $(IMAGE):$(VERSION)
 

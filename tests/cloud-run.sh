@@ -137,6 +137,9 @@ cmd_deploy() {
 	[ -n "$digest" ] || die "Artifact Registry has no digest for $IMAGE:$version"
 	echo "== deploy $SERVICE ($IMAGE@$digest)"
 	# The suites run as root inside one gen2 instance, one request at a time.
+	# sbx-deployed changes on every run, so each deploy creates a new revision
+	# and the suites start on a fresh instance (sbx rewrites /etc/resolv.conf,
+	# and a reused instance would keep that from the previous run).
 	cat >"$TMP/service.yaml" <<EOF
 apiVersion: serving.knative.dev/v1
 kind: Service
@@ -147,6 +150,7 @@ spec:
     metadata:
       labels:
         sbx-version: $version
+        sbx-deployed: "$(date -u +%Y%m%dt%H%M%Sz)"
       annotations:
         run.googleapis.com/execution-environment: gen2
         autoscaling.knative.dev/maxScale: "1"
@@ -162,6 +166,7 @@ spec:
             - {name: SBX, value: /usr/local/bin/sbx}
             - {name: TEST_VOLUME, value: /mnt/sbx-vol}
             - {name: TEST_REQUIRE_IPV6, value: "false"}
+            - {name: TEST_REQUIRE_LANDLOCK, value: "false"}
           resources:
             limits: {cpu: "1", memory: 1Gi}
           volumeMounts:

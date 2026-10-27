@@ -4,9 +4,13 @@
 //!    ├─ threads, started after fork: seccomp notification dispatcher,
 //!    │  blocking egress connects, DNS proxy
 //!    └─ child: setsid → chdir → rlimits → drop identity and capabilities
-//!              → PDEATHSIG → NO_NEW_PRIVS → Landlock → seccomp prelude
+//!              → PDEATHSIG → NO_NEW_PRIVS → Landlock (unless "off") → seccomp prelude
 //!              → policy filter (listener handed to the supervisor) → execve
 //!         └─ untrusted program and all its descendants (inherit every layer)
+//!
+//! One sandbox per container: `sbx run` claims a slot (an abstract UNIX
+//! socket) before it changes anything (resolv.conf, the DNS proxy) and holds
+//! it until it exits.
 //!
 //! The supervisor is single-threaded until after fork, so the child may
 //! allocate before exec. Setup failures in the child come back over a
@@ -17,14 +21,16 @@ use crate::egress::Egress;
 use crate::landlock_layer;
 use crate::log::{self, errno, os_err};
 use crate::notify::{self, Dispatcher, Listener, Received, Stats};
-use crate::policy::{DnsCfg, Limit, Policy, Timeout};
+use crate::policy::{DnsCfg, LandlockAbi, Limit, Policy, Timeout};
 use crate::seccomp_layer::{self, Programs};
 use landlock::RulesetCreated;
 use std::ffi::CString;
 use std::io::Read;
 use std::net::TcpListener;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::linux::net::SocketAddrExt;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::net::{SocketAddr, UnixDatagram};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -40,6 +46,24 @@ pub struct Launch {
 pub struct Services {
     pub egress: Option<Arc<Egress>>,
     pub dns: Option<(TcpListener, DnsCfg)>,
+}
+
+/// Abstract UNIX socket name that a running `sbx run` holds.
+const SLOT_NAME: &[u8] = b"sbx/sandbox";
+
+/// Claim the container's single sandbox slot, held until the socket is
+/// dropped or sbx exits. Abstract names are per network namespace, so the
+/// slot is shared by everything in that namespace (a container, a pod, or
+/// the host with `--network host`). The socket is close-on-exec and never
+/// read; nothing can be gained by sending to it.
+pub fn claim_sandbox_slot() -> Result<UnixDatagram, String> {
+    let addr = SocketAddr::from_abstract_name(SLOT_NAME).map_err(|e| format!("abstract socket name: {e}"))?;
+    UnixDatagram::bind_addr(&addr).map_err(|e| match e.raw_os_error() {
+        Some(libc::EADDRINUSE) => {
+            "another sbx sandbox is running in this container; sbx runs one sandbox per container".to_string()
+        }
+        _ => format!("binding the abstract UNIX socket @sbx/sandbox: {e}"),
+    })
 }
 
 const FORWARDED: [libc::c_int; 6] = [
@@ -283,13 +307,14 @@ fn child(p: &Policy, l: &mut Launch, err_fd: RawFd, sock_fd: RawFd, parent: libc
     argv.push(std::ptr::null());
     let mut envp: Vec<*const libc::c_char> = l.envp.iter().map(|a| a.as_ptr()).collect();
     envp.push(std::ptr::null());
-    match l.landlock.take() {
-        Some(rs) => {
+    match (l.landlock.take(), p.landlock.abi) {
+        (Some(rs), _) => {
             if let Err(e) = landlock_layer::enforce(rs) {
                 return ("landlock", e);
             }
         }
-        None => return ("landlock", "BUG: no Landlock ruleset".into()),
+        (None, LandlockAbi::Off) => {}
+        (None, LandlockAbi::V(_)) => return ("landlock", "BUG: no Landlock ruleset".into()),
     }
     if let Err(e) = seccomp_layer::install_prelude(&l.seccomp.prelude) {
         return ("seccomp", e);

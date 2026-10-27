@@ -46,6 +46,7 @@ LABEL org.opencontainers.image.source="https://github.com/ocramz/sbx" \
 COPY --from=build /sbx /usr/local/bin/sbx
 COPY policy/default.toml /etc/sbx/policy.toml
 COPY policy/egress.example.toml /etc/sbx/egress.example.toml
+COPY policy/no-landlock.example.toml /etc/sbx/no-landlock.example.toml
 ENV SBX_POLICY_FILE=/etc/sbx/policy.toml
 
 # Scratch dir for the sandboxed uid. On Cloud Run, mount an in-memory volume
@@ -56,6 +57,7 @@ RUN mkdir -p /workspace && chmod 1777 /workspace
 # a rule fails the build here instead of at run time.
 RUN ["/usr/local/bin/sbx", "policy", "--quiet"]
 RUN ["/usr/local/bin/sbx", "policy", "--quiet", "--policy", "/etc/sbx/egress.example.toml"]
+RUN ["/usr/local/bin/sbx", "policy", "--quiet", "--policy", "/etc/sbx/no-landlock.example.toml"]
 
 # Deliberately root: sbx is PID 1 and needs root only to drop the program to
 # uid 65534 and empty its capability sets. sbx itself never runs payload code.

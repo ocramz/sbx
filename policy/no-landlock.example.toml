@@ -1,0 +1,70 @@
+# Example policy for kernels without Landlock (Cloud Run, both generations):
+# the egress example with landlock.abi = "off". See the README, "Without
+# Landlock", for what this gives up. In short, files are protected by their
+# permissions only, so the program can read everything world-readable in the
+# image and volumes, write everything world-writable, and run any
+# world-executable binary. Use it only if:
+#
+#   * sbx starts as root (the image default) and runs the program as a uid
+#     nothing else in the container uses (sbx checks both);
+#   * one sandbox runs per container (sbx enforces it);
+#   * nothing that uid must not read is world-readable: application code,
+#     configuration, mounted secrets;
+#   * volumes with code to run are mounted read-only.
+#
+# Without Landlock, egress mode also denies bind, listen and connect() on
+# non-IP sockets (AF_UNIX). Mode none needs no such changes.
+
+# Rules need Landlock. The empty list goes first: TOML puts plain keys
+# before the first table.
+fs = []
+
+[landlock]
+abi = "off"
+scope_signals = false
+scope_abstract_unix = false
+
+[process]
+uid = 65534
+gid = 65534
+workdir = "/workspace"
+timeout_secs = "none"
+kill_grace_secs = 5
+subprocesses = true
+
+[limits]
+nofile = 1024
+nproc = 512
+fsize_mb = 1024
+as_mb = "unlimited"
+cpu_secs = "unlimited"
+
+[env]
+pass = []
+[env.set]
+PATH = "/usr/local/bin:/usr/bin:/bin"
+HOME = "/tmp"
+TMPDIR = "/tmp"
+LANG = "C.UTF-8"
+
+[network]
+mode = "egress"
+bind_tcp = []                      # must stay empty without Landlock
+egress = [
+  { domain = "api.github.com", ports = [443] },
+  { domain = "*.githubusercontent.com", ports = [443] },
+]
+
+[network.dns]
+listen = "127.0.0.53:53"
+upstream = "169.254.169.254:53"    # Cloud Run / GCE metadata resolver; adjust for your platform
+upstream_transport = "udp"
+resolv_conf = "write"
+timeout_ms = 2000
+answer_scopes = ["global"]
+
+[seccomp]
+on_violation = "errno"
+deny = []
+allow = []
+socket_families = ["unix", "inet", "inet6"]
