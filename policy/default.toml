@@ -1,0 +1,134 @@
+# sbx default policy: deny by default, allow the minimum a typical
+# interpreter/binary needs. Copy and edit, then point SBX_POLICY_FILE at it
+# (e.g. mounted from Secret Manager), or extend it with SBX_FS_* / --rw etc.
+
+[landlock]
+required = true            # fail closed if the kernel has no Landlock (e.g. gVisor)
+min_abi = 1
+scope_signals = true       # ABI v6+: can't signal processes outside the sandbox
+scope_abstract_unix = true # ABI v6+: can't reach abstract UNIX sockets outside it
+
+[process]
+uid = 65534                # used when sbx starts as root (recommended)
+gid = 65534
+workdir = "/workspace"
+timeout_secs = 0           # 0 = no wall-clock limit
+kill_grace_secs = 5
+subprocesses = true        # false = threads only, no fork/exec of children
+
+[limits]
+nofile = 1024
+nproc = 512
+fsize_mb = 1024
+# as_mb = 2048             # breaks Go/JVM/V8, which reserve large address space
+# cpu_secs = 60
+
+[env]
+pass = ["LANG", "LC_ALL", "TZ", "TERM"]
+[env.set]
+PATH = "/usr/local/bin:/usr/bin:/bin"
+HOME = "/tmp"
+TMPDIR = "/tmp"
+
+[network]
+mode = "none"              # none | restricted | unrestricted
+connect_tcp = []           # used by "restricted"; needs Landlock ABI v4 (Linux 6.7+)
+bind_tcp = []
+allow_udp = false
+
+[seccomp]
+enabled = true
+on_violation = "errno"     # errno | kill | log
+deny = []                  # e.g. ["memfd_create", "execveat"]
+allow = []                 # e.g. ["ptrace"] to permit debuggers inside the sandbox
+
+# ---------------------------------------------------------------- filesystem
+# Runtime: code and libraries (read + execute).
+[[fs]]
+path = "/usr"
+access = "rx"
+[[fs]]
+path = "/bin"
+access = "rx"
+optional = true
+[[fs]]
+path = "/lib"
+access = "rx"
+optional = true
+[[fs]]
+path = "/lib64"
+access = "rx"
+optional = true
+
+# Just the /etc files most runtimes need; not the whole directory.
+[[fs]]
+path = "/etc/ld.so.cache"
+access = "r"
+optional = true
+[[fs]]
+path = "/etc/localtime"
+access = "r"
+optional = true
+[[fs]]
+path = "/etc/passwd"
+access = "r"
+optional = true
+[[fs]]
+path = "/etc/group"
+access = "r"
+optional = true
+[[fs]]
+path = "/etc/nsswitch.conf"
+access = "r"
+optional = true
+[[fs]]
+path = "/etc/hosts"
+access = "r"
+optional = true
+[[fs]]
+path = "/etc/resolv.conf"
+access = "r"
+optional = true
+[[fs]]
+path = "/etc/ssl"
+access = "r"
+optional = true
+[[fs]]
+path = "/etc/ca-certificates"
+access = "r"
+optional = true
+
+# Pseudo-filesystems. /proc is needed by most runtimes (/proc/self/*);
+# other processes' sensitive entries stay protected by the UID drop.
+[[fs]]
+path = "/proc"
+access = "r"
+[[fs]]
+path = "/sys/fs/cgroup"
+access = "r"
+optional = true
+[[fs]]
+path = "/dev/null"
+access = "rw"
+[[fs]]
+path = "/dev/zero"
+access = "r"
+[[fs]]
+path = "/dev/full"
+access = "rw"
+optional = true
+[[fs]]
+path = "/dev/urandom"
+access = "r"
+[[fs]]
+path = "/dev/random"
+access = "r"
+
+# Scratch space. On Cloud Run mount an in-memory volume at /workspace.
+[[fs]]
+path = "/tmp"
+access = "rw"
+[[fs]]
+path = "/workspace"
+access = "rw"
+optional = true
