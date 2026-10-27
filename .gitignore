@@ -2,3 +2,5 @@
 
 # secrets and sensitive configuration
 .env
+
+**/*.pyc

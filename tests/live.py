@@ -11,6 +11,7 @@ Required environment:
 """
 
 import ctypes
+import errno
 import os
 import subprocess
 import sys
@@ -67,12 +68,56 @@ def expect(name, want, args, pol=DEFAULT, log=None, out=None, **kw):
 # ---------------------------------------------------------------- platform
 
 
+LIBC = ctypes.CDLL(None, use_errno=True)
+LIBC.syscall.restype = ctypes.c_long
+# Syscall numbers from 424 on are the same on x86_64 and aarch64.
+NR_LANDLOCK_CREATE_RULESET = 444
+NR_LSM_LIST_MODULES = 461
+# Syscalls every Linux 6.9 build has, called with arguments the kernel rejects.
+# ENOSYS from one of them comes from the container's seccomp filter, not the kernel.
+NEWER_SYSCALLS = {439: "faccessat2", 441: "epoll_pwait2", 442: "mount_setattr", 448: "process_mrelease",
+                  449: "futex_waitv", 452: "fchmodat2", 454: "futex_wake", 457: "statmount", 458: "listmount"}
+# include/uapi/linux/lsm.h
+LSM_IDS = {100: "capability", 101: "selinux", 102: "smack", 103: "tomoyo", 104: "apparmor", 105: "yama",
+           106: "loadpin", 107: "safesetid", 108: "lockdown", 109: "bpf", 110: "landlock", 111: "ima", 112: "evm",
+           113: "ipe"}
+
+
+def errname(e):
+    return errno.errorcode.get(e, str(e))
+
+
 def landlock_abi():
-    libc = ctypes.CDLL(None, use_errno=True)
-    libc.syscall.restype = ctypes.c_long
-    nr = {"x86_64": 444, "aarch64": 444}[os.uname().machine]
-    abi = libc.syscall(ctypes.c_long(nr), None, ctypes.c_size_t(0), ctypes.c_uint(1))
+    abi = LIBC.syscall(ctypes.c_long(NR_LANDLOCK_CREATE_RULESET), None, ctypes.c_size_t(0), ctypes.c_uint(1))
     return f"v{abi}" if abi >= 0 else f"unavailable ({os.strerror(ctypes.get_errno())})"
+
+
+def active_lsms():
+    ids = (ctypes.c_uint64 * 32)()
+    size = ctypes.c_uint32(ctypes.sizeof(ids))
+    n = LIBC.syscall(ctypes.c_long(NR_LSM_LIST_MODULES), ids, ctypes.byref(size), ctypes.c_uint32(0))
+    if n < 0:
+        return f"unavailable ({errname(ctypes.get_errno())})"
+    return ", ".join(LSM_IDS.get(ids[i], str(ids[i])) for i in range(n))
+
+
+def landlock_symbols():
+    """Landlock's own kernel symbols. A kernel built without Landlock has only the syscall stubs."""
+    try:
+        with open("/proc/kallsyms") as f:
+            names = [line.split()[2] for line in f if "landlock" in line]
+    except OSError as e:
+        return f"unreadable ({e.strerror})"
+    own = [n for n in names if "sys_landlock" not in n]
+    return f"{len(own)} (built in), e.g. {', '.join(own[:3])}" if own else f"none besides {len(names)} syscall stubs"
+
+
+def newer_syscalls():
+    out = []
+    for nr, name in NEWER_SYSCALLS.items():
+        r = LIBC.syscall(ctypes.c_long(nr), *[ctypes.c_long(0)] * 6)
+        out.append(f"{name} {'ok' if r >= 0 else errname(ctypes.get_errno())}")
+    return ", ".join(out)
 
 
 def read(path):
@@ -92,6 +137,10 @@ CAP_SYS_PTRACE = 19
 RESOLV = "/etc/resolv.conf"
 print(f"  kernel          {u.release} {u.version} ({u.machine})")
 print(f"  Landlock ABI    {landlock_abi()}")
+print(f"  active LSMs     {active_lsms()} (lsm_list_modules)")
+print(f"  securityfs lsm  {read('/sys/kernel/security/lsm')}")
+print(f"  kallsyms        Landlock symbols: {landlock_symbols()}")
+print(f"  newer syscalls  {newer_syscalls()}")
 print(f"  CapEff          {status['CapEff'].strip()} (CAP_SYS_PTRACE {'present' if cap_eff >> CAP_SYS_PTRACE & 1 else 'absent'})")
 print(f"  CapBnd          {status['CapBnd'].strip()}")
 print(f"  seccomp         mode {status.get('Seccomp', '?').strip()}, {status.get('Seccomp_filters', '?').strip()} filters")

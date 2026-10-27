@@ -14,7 +14,8 @@ use landlock::{
 #[derive(Debug, Clone, Copy)]
 pub enum Probe {
     Available(u8),
-    /// ENOSYS: not built in (or the "kernel" is gVisor, e.g. Cloud Run gen1).
+    /// ENOSYS: not built in, denied by the container runtime's seccomp
+    /// profile, or the "kernel" is gVisor (e.g. Cloud Run gen1).
     NotImplemented,
     /// EOPNOTSUPP: built in but not enabled at boot.
     NotEnabled,
@@ -48,8 +49,8 @@ impl std::fmt::Display for Probe {
             Probe::Available(v) => write!(f, "available, ABI v{v}"),
             Probe::NotImplemented => write!(
                 f,
-                "not implemented (ENOSYS): kernel built without Landlock, or a gVisor sandbox \
-                 such as Cloud Run gen1; use --execution-environment=gen2"
+                "not implemented (ENOSYS): kernel built without Landlock, a container seccomp \
+                 profile that denies it, or a gVisor sandbox such as Cloud Run gen1"
             ),
             Probe::NotEnabled => write!(f, "built in but disabled at boot (EOPNOTSUPP): add landlock to lsm="),
             Probe::Error(e) => write!(f, "probe failed: {}", std::io::Error::from_raw_os_error(*e)),

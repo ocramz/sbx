@@ -89,7 +89,8 @@ def kernel_landlock_abi():
 
 KABI = kernel_landlock_abi()
 if KABI < 6:
-    die(f"the kernel's Landlock ABI is v{KABI}; the suite needs v6 (Linux 6.12+)")
+    have = f"v{KABI}" if KABI > 0 else f"unavailable ({os.strerror(ctypes.get_errno())})"
+    die(f"the kernel's Landlock ABI is {have}; the suite needs v6 (Linux 6.12+)")
 
 # A clean environment for sbx: nothing from the caller leaks into the tests.
 BASE_ENV = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}

@@ -113,7 +113,9 @@ CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `make lint`, `m
 
 ## Deploying on Cloud Run
 
-Use Cloud Run **jobs** (or a service pinned to `--execution-environment=gen2`). The first-generation environment is gVisor, which returns `ENOSYS` for Landlock, and sbx refuses to run there. First check what the platform provides, because Google does not document the Landlock ABI or the capabilities of its gen2 guests:
+**sbx does not run on Cloud Run today.** The first-generation environment is gVisor, which returns `ENOSYS` for Landlock. The second-generation guest kernel was Linux 6.9.12 built without Landlock when last measured with `make live` (October 2026, europe-north1). Its active LSMs were capability, lockdown, loadpin, selinux and bpf, and `/proc/kallsyms` had no Landlock symbols. sbx refuses to start on both. Everything else sbx needs is there: seccomp user notification, `pidfd_getfd`, all capabilities except `CAP_SYS_MODULE`, `CAP_SYS_RAWIO` and `CAP_MKNOD`, no Yama, and a writable `/etc/resolv.conf`. Even with Landlock, 6.9 would provide at most ABI 4, below the default policy's 6.
+
+Google does not document the gen2 kernel, so check again before deploying: run `make live` ([Live tests on Cloud Run](#live-tests-on-cloud-run)), or probe the image as a job. If Landlock does appear, use Cloud Run **jobs** (or a service pinned to `--execution-environment=gen2`):
 
 ```sh
 gcloud run jobs create sbx-probe --image=$IMAGE --region=$REGION \
@@ -151,7 +153,7 @@ gcloud splits `--set-env-vars` on commas, so use `:` between paths, and gcloud's
 
 [`tests/cloud-run.sh`](tests/cloud-run.sh) finds out what Cloud Run's gen2 Linux provides by running sbx there. It builds the test image on this machine for `linux/amd64` (the only architecture Cloud Run runs), pushes it to Artifact Registry, creates or updates the private service `sbx-live` (gen2, one instance, one request at a time), runs two suites on it and prints the service's logs:
 
-* [`tests/live.py`](tests/live.py) prints the platform facts (kernel, Landlock ABI, the container's capabilities and seccomp state, Yama, `/etc/resolv.conf`, and `sbx probe` for both shipped policies), then checks the sandbox and egress filtering on the real network: an allowed name resolves through the metadata server's DNS and connects; another address, the metadata server and an unlisted name are refused.
+* [`tests/live.py`](tests/live.py) prints the platform facts (kernel, Landlock ABI, the active LSMs and whether the kernel has Landlock at all, whether the container's seccomp filter lets newer syscalls through, the container's capabilities and seccomp state, Yama, `/etc/resolv.conf`, and `sbx probe` for both shipped policies), then checks the sandbox and egress filtering on the real network: an allowed name resolves through the metadata server's DNS and connects; another address, the metadata server and an unlisted name are refused.
 * [`tests/smoke.py`](tests/smoke.py), the integration suite.
 
 A service has to serve HTTP, so the service runs [`tests/live_server.py`](tests/live_server.py), which runs one suite per request (`GET /suite/live`, `GET /suite/smoke`) and streams its output back. A failure there can be a finding about the platform rather than a bug in sbx: for example, without `CAP_SYS_PTRACE` the egress mode cannot run at all.
