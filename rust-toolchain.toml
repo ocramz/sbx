@@ -1,0 +1,6 @@
+# Single source of the Rust version: cargo/rustup read it locally and in CI,
+# and the Makefile passes it to the image build (rust:<version> builder).
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

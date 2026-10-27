@@ -1,0 +1,107 @@
+# sbx default policy for the sbx image (base: debian:bookworm-slim).
+#
+# Every field is required and unknown fields are rejected; sbx has no
+# built-in defaults. Point SBX_POLICY_FILE (or --policy) at a copy to change
+# it, e.g. mounted from Secret Manager, or extend it per run with
+# SBX_FS_RO/RW/RX, SBX_EGRESS, --rw, --egress ... (see the README).
+#
+# The image build runs `sbx policy` on this file, so a rule naming a path
+# that does not exist (or is a symlink) in the image fails the build.
+
+[landlock]
+abi = 6                    # Linux 6.12+: the kernel must support at least this ABI
+scope_signals = true       # can't signal processes outside the sandbox
+scope_abstract_unix = true # can't reach abstract UNIX sockets outside it
+
+[process]
+uid = 65534                # sbx starts as root and runs the program as nobody
+gid = 65534
+workdir = "/workspace"
+timeout_secs = "none"      # or a number of seconds (exit 124 when exceeded)
+kill_grace_secs = 5
+subprocesses = true        # false = threads only, no fork/exec of children
+
+[limits]
+nofile = 1024
+nproc = 512
+fsize_mb = 1024
+as_mb = "unlimited"        # an address-space cap breaks Go, the JVM and V8
+cpu_secs = "unlimited"
+
+[env]
+pass = []                  # names copied from sbx's environment; each must be set
+[env.set]
+PATH = "/usr/local/bin:/usr/bin:/bin"
+HOME = "/tmp"
+TMPDIR = "/tmp"
+LANG = "C.UTF-8"
+
+[network]
+mode = "none"              # none | egress | unrestricted
+bind_tcp = []              # egress mode only
+egress = []                # egress mode only, see policy/egress.example.toml
+
+[seccomp]
+on_violation = "errno"     # errno | kill
+deny = []                  # e.g. ["memfd_create", "execveat"]
+allow = []                 # e.g. ["ptrace"] to permit debuggers inside the sandbox
+socket_families = ["unix"]
+
+# ---------------------------------------------------------------- filesystem
+# Paths must exist and be canonical. On merged-/usr systems /bin, /lib and
+# /lib64 are symlinks into /usr, so /usr covers them.
+[[fs]]
+path = "/usr"
+access = "rx"
+
+# Just the /etc files most runtimes need; not the whole directory.
+[[fs]]
+path = "/etc/ld.so.cache"
+access = "r"
+[[fs]]
+path = "/etc/passwd"
+access = "r"
+[[fs]]
+path = "/etc/group"
+access = "r"
+[[fs]]
+path = "/etc/nsswitch.conf"
+access = "r"
+[[fs]]
+path = "/etc/hosts"
+access = "r"
+[[fs]]
+path = "/etc/resolv.conf"
+access = "r"
+
+# Pseudo-filesystems. /proc is needed by most runtimes (/proc/self/*);
+# other processes' entries stay protected by the uid switch and Landlock.
+[[fs]]
+path = "/proc"
+access = "r"
+[[fs]]
+path = "/sys/fs/cgroup"
+access = "r"
+[[fs]]
+path = "/dev/null"
+access = "rw"
+[[fs]]
+path = "/dev/zero"
+access = "r"
+[[fs]]
+path = "/dev/full"
+access = "rw"
+[[fs]]
+path = "/dev/urandom"
+access = "r"
+[[fs]]
+path = "/dev/random"
+access = "r"
+
+# Scratch space. On Cloud Run mount an in-memory volume at /workspace.
+[[fs]]
+path = "/tmp"
+access = "rw"
+[[fs]]
+path = "/workspace"
+access = "rw"

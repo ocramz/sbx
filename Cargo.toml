@@ -1,0 +1,20 @@
+[package]
+name = "sbx"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97"
+description = "Seccomp + Landlock sandbox launcher for running untrusted programs in serverless containers"
+license = "Apache-2.0"
+
+[dependencies]
+landlock = "0.4.7"
+seccompiler = "0.5"
+libc = "0.2.170"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

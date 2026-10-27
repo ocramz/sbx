@@ -1,0 +1,112 @@
+# Example policy with egress filtering: the sandbox may open TCP connections
+# only to the destinations allowed below, and resolves names through the sbx
+# DNS proxy. Copy it, adjust the rules and [network.dns].upstream for your
+# platform, and point SBX_POLICY_FILE at your copy.
+#
+# Egress filtering needs CAP_SYS_PTRACE in the container
+# (docker run --cap-add=SYS_PTRACE ...); `sbx probe` checks everything.
+
+[landlock]
+abi = 6
+scope_signals = true
+scope_abstract_unix = true
+
+[process]
+uid = 65534
+gid = 65534
+workdir = "/workspace"
+timeout_secs = "none"
+kill_grace_secs = 5
+subprocesses = true
+
+[limits]
+nofile = 1024
+nproc = 512
+fsize_mb = 1024
+as_mb = "unlimited"
+cpu_secs = "unlimited"
+
+[env]
+pass = []
+[env.set]
+PATH = "/usr/local/bin:/usr/bin:/bin"
+HOME = "/tmp"
+TMPDIR = "/tmp"
+LANG = "C.UTF-8"
+
+[network]
+mode = "egress"
+bind_tcp = []
+# Each rule names a CIDR block or a domain, and the TCP ports allowed for it:
+#   { cidr = "10.0.0.0/8", ports = [5432] }
+#   { domain = "api.example.com", ports = [443] }       exactly this name
+#   { domain = "*.example.com", ports = [443] }         any name below example.com
+# Addresses returned by the DNS proxy for an allowed name are allowed (for that
+# rule's ports) until sbx exits.
+egress = [
+  { domain = "api.github.com", ports = [443] },
+  { domain = "*.githubusercontent.com", ports = [443] },
+]
+
+[network.dns]
+listen = "127.0.0.53:53"           # loopback, port 53; the sandbox reaches it over TCP
+upstream = "169.254.169.254:53"    # Cloud Run / GCE metadata resolver; adjust for your platform
+upstream_transport = "udp"         # a truncated UDP reply is answered with SERVFAIL; use "tcp" if needed
+resolv_conf = "write"              # write /etc/resolv.conf (nameserver 127.0.0.53, options use-vc), or "verify"
+timeout_ms = 2000
+answer_scopes = ["global"]         # learn only public addresses; also "private", "loopback"
+
+[seccomp]
+on_violation = "errno"
+deny = []
+allow = []
+socket_families = ["unix", "inet", "inet6"]
+
+[[fs]]
+path = "/usr"
+access = "rx"
+[[fs]]
+path = "/etc/ld.so.cache"
+access = "r"
+[[fs]]
+path = "/etc/passwd"
+access = "r"
+[[fs]]
+path = "/etc/group"
+access = "r"
+[[fs]]
+path = "/etc/nsswitch.conf"
+access = "r"
+[[fs]]
+path = "/etc/hosts"
+access = "r"
+[[fs]]
+path = "/etc/resolv.conf"
+access = "r"
+[[fs]]
+path = "/proc"
+access = "r"
+[[fs]]
+path = "/sys/fs/cgroup"
+access = "r"
+[[fs]]
+path = "/dev/null"
+access = "rw"
+[[fs]]
+path = "/dev/zero"
+access = "r"
+[[fs]]
+path = "/dev/full"
+access = "rw"
+[[fs]]
+path = "/dev/urandom"
+access = "r"
+[[fs]]
+path = "/dev/random"
+access = "r"
+[[fs]]
+path = "/tmp"
+access = "rw"
+[[fs]]
+path = "/workspace"
+access = "rw"
