@@ -9,8 +9,14 @@ ARG RUST_VERSION
 ARG BASE_IMAGE
 
 # ---------------------------------------------------------------- build
-FROM rust:${RUST_VERSION}-slim-bookworm AS build
+# Runs on the build machine's own architecture and cross-compiles for the
+# target, since x86_64 rustc segfaults under QEMU (amd64 images on arm64 Macs,
+# for Cloud Run). The musl targets link with rust-lld and Rust's bundled musl,
+# so no C cross toolchain is needed.
+FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-slim-bookworm AS build
 ARG TARGETARCH
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
 RUN case "${TARGETARCH}" in \
       amd64) echo x86_64-unknown-linux-musl ;; \
       arm64) echo aarch64-unknown-linux-musl ;; \
@@ -63,6 +69,7 @@ ENTRYPOINT ["/usr/local/bin/sbx", "run"]
 CMD ["--", "/bin/sh", "-c", "echo 'sbx: no program given; pass e.g. -- python3 /workspace/main.py' >&2; exit 2"]
 
 # ---------------------------------------------------------------- test
-# Runtime stage built on a Python base (BASE_IMAGE=python:...), plus the suite.
+# Runtime stage built on a Python base (BASE_IMAGE=python:...), plus the suites
+# and the HTTP front that runs them on a Cloud Run service (tests/cloud-run.sh).
 FROM runtime AS test
-COPY tests/smoke.py /opt/sbx/tests/smoke.py
+COPY tests/smoke.py tests/live.py tests/live_server.py /opt/sbx/tests/

@@ -103,10 +103,11 @@ make smoke            # build images; integration suite in Docker; checks of the
 make smoke-local      # integration suite on this host (root, private mount namespace)
 make probe            # sbx probe in the runtime image
 make push PUSH_TAGS="main"
+make live             # live tests on a Cloud Run service (see below)
 make help             # everything else
 ```
 
-The Rust version comes from `rust-toolchain.toml`. Images are built for the host's architecture (`linux/amd64` or `linux/arm64`); pass `PLATFORM=` to override, though the integration suite cannot run under emulation. Docker builds a static musl binary on `rust:<version>-slim-bookworm` and fails if it is not static. The integration suite ([`tests/smoke.py`](tests/smoke.py)) runs in a test image (the runtime stage on `python:3.13-slim-bookworm`) with `--cap-add SYS_PTRACE`. It covers escape attempts that only Landlock or seccomp can stop, strictness errors, egress allow/deny decisions, DNS learning and refusals, and two race tests: one flips the sockaddr from another thread during `connect`, the other swaps an AF_UNIX and a TCP socket under the same fd number. Both assert that the denied server never sees a connection. [`tests/image-checks.sh`](tests/image-checks.sh) then exercises the runtime image as shipped (PID 1, signal forwarding, cleanup of leftover processes).
+The Rust version comes from `rust-toolchain.toml`. Images are built for the host's architecture (`linux/amd64` or `linux/arm64`); pass `PLATFORM=` to override, though the integration suite cannot run under emulation. The build stage runs on the build machine's own architecture and cross-compiles a static musl binary on `rust:<version>-slim-bookworm`, linked with `rust-lld`, so an amd64 image can be built on an arm64 Mac (x86_64 rustc crashes under QEMU); the build fails if the binary is not static. The integration suite ([`tests/smoke.py`](tests/smoke.py)) runs in a test image (the runtime stage on `python:3.13-slim-bookworm`) with `--cap-add SYS_PTRACE`. It covers escape attempts that only Landlock or seccomp can stop, strictness errors, egress allow/deny decisions, DNS learning and refusals, and two race tests: one flips the sockaddr from another thread during `connect`, the other swaps an AF_UNIX and a TCP socket under the same fd number. Both assert that the denied server never sees a connection. [`tests/image-checks.sh`](tests/image-checks.sh) then exercises the runtime image as shipped (PID 1, signal forwarding, cleanup of leftover processes).
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `make lint`, `make test` and `make smoke` on every push and pull request. Pushes to `main` publish `ghcr.io/ocramz/sbx:<sha>` and `:main`; tags `v*` publish `:<tag>` and `:latest`.
 
@@ -146,6 +147,51 @@ gcloud splits `--set-env-vars` on commas, so use `:` between paths, and gcloud's
 
 **Services** have to serve HTTP on `$PORT`, so the server is the entrypoint and spawns one sandbox per request, for example `subprocess.run(["sbx", "run", "--quiet", "--timeout", "30", "--rw", job_dir, "--workdir", job_dir, "--", "python3", "main.py"], capture_output=True)` with `SBX_POLICY_FILE` set. Give each request its own directory, because concurrent requests on one instance share `/tmp`.
 
+## Live tests on Cloud Run
+
+[`tests/cloud-run.sh`](tests/cloud-run.sh) finds out what Cloud Run's gen2 Linux provides by running sbx there. It builds the test image on this machine for `linux/amd64` (the only architecture Cloud Run runs), pushes it to Artifact Registry, creates or updates the private service `sbx-live` (gen2, one instance, one request at a time), runs two suites on it and prints the service's logs:
+
+* [`tests/live.py`](tests/live.py) prints the platform facts (kernel, Landlock ABI, the container's capabilities and seccomp state, Yama, `/etc/resolv.conf`, and `sbx probe` for both shipped policies), then checks the sandbox and egress filtering on the real network: an allowed name resolves through the metadata server's DNS and connects; another address, the metadata server and an unlisted name are refused.
+* [`tests/smoke.py`](tests/smoke.py), the integration suite.
+
+A service has to serve HTTP, so the service runs [`tests/live_server.py`](tests/live_server.py), which runs one suite per request (`GET /suite/live`, `GET /suite/smoke`) and streams its output back. A failure there can be a finding about the platform rather than a bug in sbx: for example, without `CAP_SYS_PTRACE` the egress mode cannot run at all.
+
+```sh
+make live                               # tests/cloud-run.sh all: up, deploy, test, logs
+make live-down                          # delete the service and the repository
+tests/cloud-run.sh up|deploy|test|logs|down    # one step at a time
+```
+
+The script authenticates only with a service account JSON key, activated in a throwaway gcloud configuration, so your own gcloud login is never used or changed. The registry login uses a one-hour access token derived from the key and is written to a temporary file, never to the engine's configuration. Settings come from the environment or from `.env` at the repository root (ignored by git; the environment wins):
+
+```sh
+GCP_KEY_FILE=/path/outside/the/repo/key.json   # required
+GCP_REGION=europe-west1                        # required
+GCP_PROJECT=...                                # default: the key's project_id
+GCP_RUNTIME_SA=...                             # default: <key's account>-runtime@PROJECT.iam.gserviceaccount.com
+DOCKER=podman                                  # as in the Makefile
+```
+
+The service scales to zero between runs, so `make live` again just deploys a new revision; `make live-down` removes the service and the repository. Run one at a time per project, since the names are fixed.
+
+One-time setup, with your own login (a dedicated project is best):
+
+```sh
+P=my-project
+SA=sbx-testing@$P.iam.gserviceaccount.com
+gcloud services enable run.googleapis.com artifactregistry.googleapis.com logging.googleapis.com --project=$P
+gcloud iam service-accounts create sbx-testing --project=$P            # the key's identity
+gcloud iam service-accounts create sbx-testing-runtime --project=$P    # the service's identity: no roles
+for role in run.developer run.invoker artifactregistry.admin logging.viewer; do
+  gcloud projects add-iam-policy-binding $P --role=roles/$role --member=serviceAccount:$SA --condition=None
+done
+gcloud iam service-accounts add-iam-policy-binding sbx-testing-runtime@$P.iam.gserviceaccount.com \
+  --role=roles/iam.serviceAccountUser --member=serviceAccount:$SA --project=$P
+gcloud iam service-accounts keys create /path/outside/the/repo/key.json --iam-account=$SA
+```
+
+The key can deploy and call Cloud Run services, create, push to and delete Artifact Registry repositories, and read logs in that project; it can act as `sbx-testing-runtime` and no other service account. Organisations that enforce `iam.disableServiceAccountKeyCreation` refuse the last command. To remove everything, run `make live-down`, then delete both service accounts (which also revokes the key).
+
 ## Threat model and limitations
 
 The sandbox assumes a hostile payload and a correct kernel. It narrows what the payload can reach (files, sockets, destinations, other processes, dangerous syscalls). The payload still shares the kernel with the supervisor, so a kernel exploit through an allowed syscall defeats it. On Cloud Run the gen2 microVM is the outer boundary.
@@ -164,7 +210,7 @@ Cloud Run also has a native **sandboxes** feature (public preview since July 202
 
 ```
 Dockerfile                  build (static musl binary), runtime and test stages
-Makefile                    build, lint, test, image, smoke, push targets
+Makefile                    build, lint, test, image, smoke, push, live targets
 rust-toolchain.toml         the Rust version, for cargo, CI and the image build
 policy/default.toml         shipped policy (no network)
 policy/egress.example.toml  egress rules + DNS proxy example
@@ -182,4 +228,7 @@ src/log.rs                  stderr logging
 tests/smoke.py              integration suite (run as root in a disposable environment)
 tests/run-local.sh          runs the suite on a host inside a private mount namespace
 tests/image-checks.sh       checks of the runtime image as shipped
+tests/cloud-run.sh          live tests: build, push, deploy a Cloud Run service, run the suites, logs
+tests/live.py               Cloud Run platform facts and checks (run on the service)
+tests/live_server.py        HTTP front that runs the suites on the service
 ```
