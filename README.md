@@ -104,7 +104,7 @@ With `network.mode = "egress"` the sandbox may create TCP sockets only (no UDP, 
 
 seccomp also refuses `MSG_FASTOPEN` (TCP Fast Open connects from inside `sendto`/`sendmsg`, which Landlock does not check on most kernels) and the socket options that change where packets go (`IP_OPTIONS` source routing, `IPV6_RTHDR`, `IPV6_2292RTHDR`, `IPV6_2292PKTOPTIONS`). An IP socket inherited on stdio would bypass the filter, so sbx refuses to start if fd 0-2 is one.
 
-**DNS.** With domain rules, sbx serves DNS over TCP on a loopback address (`network.dns.listen`, port 53) and `/etc/resolv.conf` must name it with `options use-vc` (`resolv_conf = "write"` makes sbx write the file and put the original back when it exits; `"verify"` only checks it). The proxy answers NXDOMAIN for names no rule matches (and logs them), NODATA for record types other than A/AAAA, and forwards everything else to the single `upstream` (no failover; a failed or truncated reply becomes SERVFAIL and is logged). A/AAAA records in an allowed answer are added to the allow-set, with that rule's ports, for the rest of the run, if their address class is listed in `answer_scopes` (`global`, `private`, `loopback`). Link-local (including the metadata server 169.254.169.254), multicast and reserved addresses are never learned. glibc and Go honour `use-vc`. musl (Alpine) resolvers do not and cannot resolve names in egress mode; give such programs IP rules.
+**DNS.** With domain rules, sbx serves DNS over TCP on a loopback address (`network.dns.listen`, port 53) and `/etc/resolv.conf` must name it with `options use-vc` (`resolv_conf = "write"` makes sbx write the file and put the original back when it exits; `"verify"` only checks it). The proxy answers NXDOMAIN for names no rule matches (and logs them), NODATA for record types other than A/AAAA, and forwards everything else to the single `upstream` (no failover; a failed or truncated reply becomes SERVFAIL and is logged). A/AAAA records in an allowed answer are added to the allow-set, with that rule's ports, for the rest of the run, if their address class is listed in `answer_scopes` (`global`, `private`, `loopback`). Link-local (including the metadata server 169.254.169.254), multicast and reserved addresses are never learned. glibc and Go honour `use-vc`. musl (Alpine) resolvers do not and cannot resolve names in egress mode; give such programs IP rules. Names in `/etc/hosts` are resolved without asking the proxy, so a domain rule for one of them allows nothing; give it a CIDR rule. On Cloud Run, `/etc/hosts` lists `metadata.google.internal` and `appengine.googleapis.internal`, both at link-local addresses, which stay denied.
 
 Egress mode needs `CAP_SYS_PTRACE` in the container (`docker run --cap-add=SYS_PTRACE`; Kubernetes `securityContext.capabilities.add: [SYS_PTRACE]`). Docker and containerd's default seccomp profiles allow `pidfd_getfd` only with it, and reading another uid's memory needs it. The payload never has it.
 
@@ -147,7 +147,7 @@ make smoke            # build images; integration suite in Docker; checks of the
 make smoke-local      # integration suite on this host (root, private mount namespace)
 make probe            # sbx probe in the runtime image
 make push PUSH_TAGS="main"
-make live             # live tests on a Cloud Run service (see below)
+make live             # live tests on a Cloud Run service and jobs (see below)
 make help             # everything else
 ```
 
@@ -162,7 +162,7 @@ CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `make lint`, `m
 * The first-generation environment is gVisor, which returns `ENOSYS` for Landlock.
 * The second-generation guest kernel is Linux 6.9.12 built without Landlock. `landlock_create_ruleset` returns `ENOSYS`. The kernel's active LSMs are capability, lockdown, loadpin, selinux and bpf. `/proc/kallsyms` has no Landlock symbols. The container's seccomp profile is not the cause: newer syscalls such as `fchmodat2`, `statmount` and `listmount` reach the kernel. Even if Google enabled Landlock, 6.9 provides at most ABI 4, below the default policy's 6.
 
-Everything else sbx needs is there: seccomp user notification, `pidfd_getfd`, all capabilities except `CAP_SYS_MODULE`, `CAP_SYS_RAWIO` and `CAP_MKNOD`, no Yama, and a writable `/etc/resolv.conf`. The shipped Landlock policies therefore cannot run on Cloud Run. Use [`policy/no-landlock.example.toml`](policy/no-landlock.example.toml) under the conditions in [Without Landlock](#without-landlock). Google does not document its gen2 kernel, so run `make live` again to see whether this has changed.
+Everything else sbx needs is there: seccomp user notification, `pidfd_getfd`, all capabilities except `CAP_SYS_MODULE`, `CAP_SYS_RAWIO` and `CAP_MKNOD`, no Yama, and a writable `/etc/resolv.conf`. Services and jobs run the same kernel with the same capabilities. On both, the no-Landlock example's egress filtering works on the real network, and in a job sbx runs as PID 1, an in-memory volume is writable by the sandbox uid, and sbx's exit code reaches the task (124 on timeout fails it). Outbound IPv6 works too, so AAAA answers are learned and used. The shipped Landlock policies therefore cannot run on Cloud Run. Use [`policy/no-landlock.example.toml`](policy/no-landlock.example.toml) under the conditions in [Without Landlock](#without-landlock). Google does not document its gen2 kernel, so run `make live` again to see whether this has changed.
 
 Use Cloud Run **jobs** (or a service pinned to `--execution-environment=gen2`) with a policy the platform supports, and check it there first. On a platform whose kernel has an older Landlock ABI, lower `landlock.abi` (and the features that need it) explicitly instead of turning Landlock off.
 
@@ -197,19 +197,23 @@ gcloud splits `--set-env-vars` on commas, so use `:` between paths, and gcloud's
 
 ## Live tests on Cloud Run
 
-[`tests/cloud-run.sh`](tests/cloud-run.sh) finds out what Cloud Run's gen2 Linux provides by running sbx there. It builds the test image on this machine for `linux/amd64` (the only architecture Cloud Run runs), pushes it to Artifact Registry, creates or updates the private service `sbx-live` (gen2, one instance, one request at a time), runs two suites on it and prints the service's logs:
+[`tests/cloud-run.sh`](tests/cloud-run.sh) finds out what Cloud Run's gen2 Linux provides by running sbx there. It builds the test image on this machine for `linux/amd64` (the only architecture Cloud Run runs), pushes it to Artifact Registry, creates or updates the targets (both by default), runs the tests on them and prints their logs. Every target is gen2 and runs as the runtime service account:
 
-* [`tests/live.py`](tests/live.py) prints the platform facts (kernel, Landlock ABI, the container's capabilities and seccomp state, Yama, `/etc/resolv.conf`, the active LSMs, Landlock symbols in `/proc/kallsyms`, whether newer syscalls reach the kernel, and `sbx probe` for the three shipped policies). It then checks the sandbox and egress filtering on the real network: an allowed name resolves through the metadata server's DNS and connects; another address, the metadata server and an unlisted name are refused. It runs these checks with the Landlock policies if the kernel has Landlock ABI 6, and always with the no-Landlock example, which adds the checks that AF_UNIX connects and binds are refused.
+* **service**: the private service `sbx-live` (one instance, one request at a time) runs both suites. A service has to serve HTTP, so it runs [`tests/live_server.py`](tests/live_server.py), which runs one suite per request (`GET /suite/live`, `GET /suite/smoke`) and streams its output back.
+* **job**: the job `sbx-live-suites` runs each suite as its task, one execution per suite. The job `sbx-live-pid1` is the job from [Deploying on Cloud Run](#deploying-on-cloud-run): the image's entrypoint `sbx run` is PID 1, configured with `SBX_POLICY_FILE` (the no-Landlock example) and `SBX_EGRESS`, with an in-memory volume as `/workspace`. It runs every case of [`tests/live_net.py`](tests/live_net.py) in one sandbox and checks that sbx is the program's parent (PID 1), the program runs as uid 65534 and the volume is writable. A second execution overrides the arguments (`--timeout=2 -- /bin/sleep 30`), and sbx's exit code 124 must fail the task. A job's output reaches the script only through Cloud Logging, so the script waits for each execution to finish and for its last line to be logged, then prints and checks the log.
+
+The suites:
+
+* [`tests/live.py`](tests/live.py) prints the platform facts (kernel, Landlock ABI, the container's capabilities and seccomp state, Yama, `/etc/resolv.conf`, `/etc/hosts`, the active LSMs, Landlock symbols in `/proc/kallsyms`, whether newer syscalls reach the kernel, and `sbx probe` for the three shipped policies). It then checks the sandbox, and egress filtering on the real network with names resolved through the metadata server's DNS. The egress cases are those of [`tests/live_net.py`](tests/live_net.py), each in its own sbx run, with the example policy's rules (`api.github.com:443`, `*.githubusercontent.com:443`) plus `1.1.1.1/32:443`, `www.github.com:443` and `metadata.google.internal:80` in `SBX_EGRESS`. Allowed: a name, a verified TLS session with an HTTP reply, a name below the wildcard, a name answered with a CNAME, the CIDR address, and a non-blocking connect to it. Denied, each with the line sbx logs: an allowed name and the CIDR address on another port, the address next to the CIDR block, a public resolver over TCP, the metadata server by address and by an allowed name (which on Cloud Run comes from `/etc/hosts`), a link-local DNS answer for that name asked of the proxy directly (never learned), and, with NXDOMAIN, the wildcard's bare domain and an unlisted name. The cases need github.com, Cloudflare (1.1.1.1, 1.0.0.1), Google DNS (8.8.8.8) and the metadata DNS to answer from Cloud Run. live.py runs these checks with the Landlock policies if the kernel has Landlock ABI 6, and always with the no-Landlock example, which adds the checks that AF_UNIX connects and binds are refused.
 * [`tests/smoke.py`](tests/smoke.py), the integration suite.
 
-The service sets `TEST_REQUIRE_LANDLOCK=false` (`make smoke` sets it to `true`, the default). On a kernel without Landlock ABI 6, both suites then check that sbx refuses the Landlock policies, report the Landlock-only tests as n/a, and run everything else with `landlock.abi = "off"`. So `make live` passes on Cloud Run when everything that can run there works.
-
-A service has to serve HTTP, so the service runs [`tests/live_server.py`](tests/live_server.py), which runs one suite per request (`GET /suite/live`, `GET /suite/smoke`) and streams its output back. A failure there can be a finding about the platform rather than a bug in sbx: for example, without `CAP_SYS_PTRACE` the egress mode cannot run at all.
+The service and the suites job set `TEST_REQUIRE_LANDLOCK=false` (`make smoke` sets it to `true`, the default). On a kernel without Landlock ABI 6, both suites then check that sbx refuses the Landlock policies, report the Landlock-only tests as n/a, and run everything else with `landlock.abi = "off"`. So `make live` passes on Cloud Run when everything that can run there works. A failure can be a finding about the platform rather than a bug in sbx: for example, without `CAP_SYS_PTRACE` the egress mode cannot run at all.
 
 ```sh
 make live                               # tests/cloud-run.sh all: up, deploy, test, logs
-make live-down                          # delete the service and the repository
+make live-down                          # delete the service, the jobs and the repository
 tests/cloud-run.sh up|deploy|test|logs|down    # one step at a time
+TARGETS=job make live                   # only the jobs
 ```
 
 The script authenticates only with a service account JSON key, activated in a throwaway gcloud configuration, so your own gcloud login is never used or changed. The registry login uses a one-hour access token derived from the key and is written to a temporary file, never to the engine's configuration. Settings come from the environment or from `.env` at the repository root (ignored by git; the environment wins):
@@ -220,9 +224,10 @@ GCP_REGION=europe-west1                        # required
 GCP_PROJECT=...                                # default: the key's project_id
 GCP_RUNTIME_SA=...                             # default: <key's account>-runtime@PROJECT.iam.gserviceaccount.com
 DOCKER=podman                                  # as in the Makefile
+TARGETS="service job"                          # default; or only service, or only job
 ```
 
-The service scales to zero between runs. Each `make live` deploys a new revision, even when nothing changed, so the suites always start on a fresh instance; `make live-down` removes the service and the repository. Run one at a time per project, since the names are fixed.
+The service scales to zero between runs. Each `make live` deploys a new revision, even when nothing changed, so the suites always start on a fresh instance; every job execution starts on one anyway. `make live-down` removes the service, the jobs with their executions, and the repository. Run one at a time per project, since the names are fixed.
 
 One-time setup, with your own login (a dedicated project is best):
 
@@ -231,7 +236,7 @@ P=my-project
 SA=sbx-testing@$P.iam.gserviceaccount.com
 gcloud services enable run.googleapis.com artifactregistry.googleapis.com logging.googleapis.com --project=$P
 gcloud iam service-accounts create sbx-testing --project=$P            # the key's identity
-gcloud iam service-accounts create sbx-testing-runtime --project=$P    # the service's identity: no roles
+gcloud iam service-accounts create sbx-testing-runtime --project=$P    # the targets' identity: no roles
 for role in run.developer run.invoker artifactregistry.admin logging.viewer; do
   gcloud projects add-iam-policy-binding $P --role=roles/$role --member=serviceAccount:$SA --condition=None
 done
@@ -240,7 +245,7 @@ gcloud iam service-accounts add-iam-policy-binding sbx-testing-runtime@$P.iam.gs
 gcloud iam service-accounts keys create /path/outside/the/repo/key.json --iam-account=$SA
 ```
 
-The key can deploy and call Cloud Run services, create, push to and delete Artifact Registry repositories, and read logs in that project; it can act as `sbx-testing-runtime` and no other service account. Organisations that enforce `iam.disableServiceAccountKeyCreation` refuse the last command. To remove everything, run `make live-down`, then delete both service accounts (which also revokes the key).
+The key can deploy and call Cloud Run services, create and run jobs, create, push to and delete Artifact Registry repositories, and read logs in that project; it can act as `sbx-testing-runtime` and no other service account. Organisations that enforce `iam.disableServiceAccountKeyCreation` refuse the last command. To remove everything, run `make live-down`, then delete both service accounts (which also revokes the key).
 
 ## Threat model and limitations
 
@@ -279,7 +284,8 @@ src/log.rs                       stderr logging
 tests/smoke.py                   integration suite (run as root in a disposable environment)
 tests/run-local.sh               runs the suite on a host inside a private mount namespace
 tests/image-checks.sh            checks of the runtime image as shipped
-tests/cloud-run.sh               live tests: build, push, deploy a Cloud Run service, run the suites, logs
-tests/live.py                    Cloud Run platform facts and checks (run on the service)
+tests/cloud-run.sh               live tests: build, push, deploy a Cloud Run service and jobs, run the tests, logs
+tests/live.py                    Cloud Run platform facts and checks (run on the service and a job)
+tests/live_net.py                egress cases on the real network (run by live.py, and by a job with sbx as PID 1)
 tests/live_server.py             HTTP front that runs the suites on the service
 ```

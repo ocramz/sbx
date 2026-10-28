@@ -95,11 +95,11 @@ push: ## push $(IMAGE):$(VERSION), then tag and push each of PUSH_TAGS
 	done
 
 .PHONY: live
-live: ## live tests on a Cloud Run service: build, push, deploy, run the suites, logs (README)
+live: ## live tests on a Cloud Run service and jobs: build, push, deploy, run the tests, logs (README)
 	tests/cloud-run.sh all
 
 .PHONY: live-down
-live-down: ## delete the live tests' Cloud Run service and image repository
+live-down: ## delete the live tests' Cloud Run service, jobs and image repository
 	tests/cloud-run.sh down
 
 .PHONY: ci

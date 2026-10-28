@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Cloud Run checks for sbx: what the platform provides, and egress on the real network.
 
-Runs in the test image on the Cloud Run service that tests/cloud-run.sh deploys
-(through tests/live_server.py), as root, with the policies shipped in the image.
+Runs in the test image on the Cloud Run service (through tests/live_server.py)
+and job that tests/cloud-run.sh deploys, as root, with the policies shipped in
+the image.
 It prints the platform facts first, then checks sbx on this platform: with the
 shipped Landlock policies if the kernel has Landlock, and with the no-Landlock
-example in any case. The egress policies rewrite /etc/resolv.conf, so never
-run it on a host you care about.
+example in any case. The egress checks are the real-network cases of
+tests/live_net.py, one sbx run each, with its RULES added through SBX_EGRESS.
+The egress policies rewrite /etc/resolv.conf, so never run it on a host you
+care about.
 
 Required environment:
   SBX  path to the sbx binary
@@ -22,6 +25,8 @@ import errno
 import os
 import subprocess
 import sys
+
+import live_net
 
 PASS, FAIL = [], []
 
@@ -63,9 +68,9 @@ PY = os.path.realpath(sys.executable)
 BASE_ENV = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
 
 
-def sbx(args, pol, cmd="run", timeout=60):
-    p = subprocess.run([SBX, cmd, *args], env=dict(BASE_ENV, SBX_POLICY_FILE=pol), capture_output=True, text=True,
-                       timeout=timeout, stdin=subprocess.DEVNULL)
+def sbx(args, pol, cmd="run", timeout=60, env=None):
+    p = subprocess.run([SBX, cmd, *args], env=dict(BASE_ENV, SBX_POLICY_FILE=pol, **(env or {})),
+                       capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
     return p.returncode, p.stdout, p.stderr
 
 
@@ -165,6 +170,9 @@ print(f"  ptrace_scope    {read('/proc/sys/kernel/yama/ptrace_scope')}")
 RESOLV_BEFORE = read(RESOLV)
 kind = f"symlink to {os.readlink(RESOLV)}" if os.path.islink(RESOLV) else "regular file" if os.path.isfile(RESOLV) else "missing"
 print(f"  resolv.conf     {kind}: {' | '.join(read(RESOLV).splitlines())}")
+# Names listed here never reach the sbx DNS proxy: glibc reads /etc/hosts first.
+hosts = [l for l in read("/etc/hosts").splitlines() if l.strip() and not l.lstrip().startswith("#")]
+print(f"  hosts           {' | '.join(hosts)}")
 
 print("== probe")
 for name, pol in (("default policy", DEFAULT), ("egress example", EGRESS), ("no-Landlock example", NO_LANDLOCK)):
@@ -177,27 +185,15 @@ for name, pol in (("default policy", DEFAULT), ("egress example", EGRESS), ("no-
         check(f"probe: {name} is refused for lack of Landlock ABI 6", rc == 1 and "MISSING  landlock" in so,
               f"rc={rc}")
 
-CONNECT = """
-import socket, sys
-try:
-    socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=10).close()
-except PermissionError:
-    sys.exit(13)
-except socket.gaierror as e:
-    print("gaierror", e, file=sys.stderr)
-    sys.exit(3)
-"""
+with open(live_net.__file__) as f:
+    NET = f.read()
 
 
-def egress_checks(pol, prefix=""):
-    """Egress on the real network: an allowed name resolves through the metadata server's DNS and connects."""
-    def connect(name, want, host, port, **kw):
-        expect(prefix + name, want, ["--", PY, "-c", CONNECT, host, str(port)], pol=pol, **kw)
-
-    connect("allowed name resolves and connects", 0, "api.github.com", 443, log="dns: api.github.com ->")
-    connect("unlisted address is denied (EACCES)", 13, "1.1.1.1", 443, log="denied connect to 1.1.1.1:443")
-    connect("metadata server is denied", 13, "169.254.169.254", 80, log="denied connect to 169.254.169.254:80")
-    connect("unlisted name gets NXDOMAIN", 3, "example.com", 443, log="dns: denied A example.com")
+def egress_checks(pol, prefix="", grants=()):
+    """The real-network cases of tests/live_net.py, names resolved through the metadata server's DNS."""
+    for name, kind, host, port, want, log in live_net.CASES:
+        expect(prefix + name, want, [*grants, "--", PY, "-c", NET, "one", kind, host, str(port)], pol=pol, log=log,
+               env={"SBX_EGRESS": live_net.RULES})
 
 
 # ---------------------------------------------------------------- with Landlock
@@ -211,7 +207,8 @@ if LANDLOCK:
     expect("timeout kills the tree (exit 124)", 124, ["--timeout", "2", "--", "/bin/sleep", "30"],
            log="timeout after 2s")
     print("== egress (egress example policy, real network)")
-    egress_checks(EGRESS)
+    # The CA bundle that the TLS case reads resolves to /etc/ssl.
+    egress_checks(EGRESS, grants=("--ro", "/etc/ssl"))
 elif REQUIRE_LANDLOCK == "true":
     print("== sandbox and egress with Landlock")
     bad("sandbox and egress with Landlock", f"skipped: the kernel lacks Landlock ABI 6 ({landlock_abi()})")
