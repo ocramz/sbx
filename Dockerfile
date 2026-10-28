@@ -71,7 +71,8 @@ ENTRYPOINT ["/usr/local/bin/sbx", "run"]
 CMD ["--", "/bin/sh", "-c", "echo 'sbx: no program given; pass e.g. -- python3 /workspace/main.py' >&2; exit 2"]
 
 # ---------------------------------------------------------------- test
-# Runtime stage built on a Python base (BASE_IMAGE=python:...), plus the suites
-# and the HTTP front that runs them on a Cloud Run service (tests/cloud-run.sh).
+# Runtime stage built on a Python base (BASE_IMAGE=python:...), plus the suites,
+# the HTTP front that runs them on a Cloud Run service and the egress cases
+# that the Cloud Run jobs run (tests/cloud-run.sh).
 FROM runtime AS test
-COPY tests/smoke.py tests/live.py tests/live_server.py /opt/sbx/tests/
+COPY tests/smoke.py tests/live.py tests/live_net.py tests/live_server.py /opt/sbx/tests/
