@@ -924,7 +924,52 @@ else:
     cgroup_report("cgroup: a normal run is accounted", ["--", "/bin/sh", "-c", "/bin/true; /bin/true"],
                   lambda r: r["exit_code"] == 0 and r["cgroup"]["memory_mb"] == 64 and r["cgroup"]["pids"] == 32
                   and r["cgroup"]["oom_kills"] == 0 and r["cgroup"]["memory_peak_kib"] > 0, pol=delegated(64, 32))
-    HOG = "x = b'x' * (256 << 20)"
+    # Since kernel commit d245698d727a a task that was reaped or joined still
+    # counts in its cgroup until its last context switch, so sbx's own check
+    # children and threads can briefly keep C or sbx-supervisor busy (issue
+    # #8). One cgroup for every round: a leftover also fails the next round.
+    d, wrap = cgroup_run()
+    flaky = []
+    for i in range(50):
+        rc, so, se = sbx([], pol=delegated(64, 32), cmd="probe", wrap=wrap)
+        if rc != 0 or not restored(d):
+            flaky.append(("probe", i, rc, se[-300:]))
+        rc, so, se, r = reported(["--", "/bin/true"], pol=delegated(64, 32), wrap=wrap)
+        if rc != 0 or r is None or r["setup_error"] is not None or not restored(d):
+            flaky.append(("run", i, rc, se[-300:]))
+    check("cgroup: 50 probes and runs in a row each leave sbx's cgroup as it was", not flaky, flaky[:3])
+
+    def hold_supervisor(d, held):
+        """Keep C/sbx-supervisor busy from setup until shortly after sbx's
+        teardown has removed sbx-sandbox: sbx must wait for it, on any kernel."""
+        def wait(cond):
+            for _ in range(500):
+                if cond():
+                    return True
+                time.sleep(0.01)
+            return False
+        if not wait(lambda: os.path.isdir(f"{d}/sbx-sandbox")):
+            return
+        p = subprocess.Popen(["/bin/sleep", "60"])
+        try:
+            with open(f"{d}/sbx-supervisor/cgroup.procs", "w") as f:
+                f.write(str(p.pid))
+            held.append(p.pid)
+            wait(lambda: not os.path.exists(f"{d}/sbx-sandbox"))
+            time.sleep(0.2)
+        finally:
+            p.kill()
+            p.wait()
+
+    d, wrap = cgroup_run()
+    held = []
+    t = threading.Thread(target=hold_supervisor, args=(d, held))
+    t.start()
+    rc, so, se, r = reported(["--", "/bin/sleep", "1"], pol=delegated(), wrap=wrap)
+    t.join()
+    check("cgroup: teardown waits for a busy sbx-supervisor", held and rc == 0 and r is not None
+          and "restoring sbx's cgroup" not in se and restored(d), f"held={held} rc={rc} stderr={se[-600:]!r}")
+    HOG ="x = b'x' * (256 << 20)"
     cgroup_report("cgroup: the OOM killer kills the program, not sbx", py(HOG),
                   lambda r: r["exit_code"] == 137 and r["program"] == {"signaled": 9} and r["cgroup"]["oom_kills"] >= 1,
                   pol=delegated(memory_mb=64))

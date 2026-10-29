@@ -172,7 +172,7 @@ Where a delegated cgroup comes from:
 
 * **podman**: `podman run --systemd=always` mounts a writable cgroup2 in the container's own cgroup namespace. `make smoke` runs the suite that way.
 * **Docker and Kubernetes** mount `/sys/fs/cgroup` read-only unless the container is privileged, which the sandbox does not need otherwise. sbx then says `/sys/fs/cgroup is mounted read-only`.
-* **A server that spawns sbx** (the Cloud Run service pattern) shares the container's cgroup with it, so C is never sbx's alone. The server must give each sbx a cgroup of its own, e.g. `mkdir /sys/fs/cgroup/job-42` and start sbx with a `preexec_fn` that writes `0` to its `cgroup.procs`, with the controllers enabled in the parent and the server itself moved out of the root cgroup.
+* **A server that spawns sbx** (the Cloud Run service pattern) shares the container's cgroup with it, so C is never sbx's alone. The server must give each sbx a cgroup of its own, e.g. `mkdir /sys/fs/cgroup/job-42` and start sbx with a `preexec_fn` that writes `0` to its `cgroup.procs`, with the controllers enabled in the parent and the server itself moved out of the root cgroup. On recent kernels the reaped sbx can still count in its cgroup for a moment, so retry `rmdir` of that cgroup while it fails with EBUSY.
 * **Cloud Run**: `make live` prints what the platform provides ([Live tests on Cloud Run](#live-tests-on-cloud-run)).
 
 ## Configuration

@@ -35,3 +35,23 @@ Plan: [plans/multiarch-images.md](plans/multiarch-images.md).
 - Deviation from the plan: `manifest create LIST IMAGE…` ignored `--tls-verify` for its images in podman 5.3, so the target creates an empty list and adds images one at a time.
 - Found while testing: on an arm64 host, `make image PLATFORM=linux/amd64` gives an image whose config says amd64 but whose base layers are arm64. podman reuses the locally stored `debian:bookworm-slim`, as `tests/cloud-run.sh` already notes. The config then carries `variant: v8`, so an amd64 pull from an index containing it fails. `push`'s architecture check cannot see this. CI builds each architecture natively, so it does not happen there; a comment above `push` says to push natively built images only.
 - Not verified here: the arm64 runner's kernel (Landlock ABI 6, `TEST_REQUIRE_LANDLOCK=true`) and cgroup delegation under podman `--systemd=always`; `rustup` on that runner; podman 4.9 `manifest add`/`push` against ghcr.io with docker's auth file. These are checked by the first branch push and the first push to `main`.
+
+## 2026-10-29: delegated cgroup, retry EBUSY in setup and teardown (issue #8)
+
+Plan: [plans/cgroup-ebusy.md](plans/cgroup-ebusy.md).
+
+- Cause: since kernel commit d245698d727a a reaped or joined task still counts in its cgroup until its last context switch. So enabling `+memory +pids` in C just after the capability checks' children exit can fail with EBUSY. So can removing `sbx-supervisor` while an sbx thread is still exiting, because moving sbx back to C does not move such a thread.
+- `src/cgroup.rs`:
+  - `retry_busy` retries an operation that fails with EBUSY every 10 ms for up to 2 s. After that the error ends in ", still after 2s". Any other errno fails at once.
+  - It is used for both `cgroup.subtree_control` writes (new `subtree_control` helper) and both `rmdir`s.
+  - `rmdir` now uses `std::fs::remove_dir` instead of `unsafe libc::rmdir`.
+  - `write` is split into `write_io` (the I/O) and `write` (the message).
+- Tests (smoke, "cgroup limits"):
+  - 50 rounds of `sbx probe` and `sbx run -- /bin/true` in one cgroup, each required to succeed and to leave C restored
+  - a deterministic teardown test: a harness thread keeps `C/sbx-supervisor` busy with a `sleep` until 0.2 s after teardown removed `sbx-sandbox`. sbx must exit 0 and restore C. No unit test, since `retry_busy` could only be driven by a fake operation.
+- Verified locally (arm64 Mac, podman, kernel 6.12.7, which does not have d245698d727a):
+  - `make smoke`: 137 + 13 passed
+  - clippy and unit tests in `rust:1.97.0`
+  - the new suite against the pre-fix image `sbx-test:8d20afbcf5db` fails the teardown test with the issue's `rmdir …/sbx-supervisor: Resource busy`
+- Not verified here: the setup race itself (the stress rounds), which needs a kernel with d245698d727a, such as GitHub's ubuntu-24.04 runners in CI.
+- Not done: waiting for the check children to finish exiting before enabling controllers. waitpid and pidfds report the exit before the last context switch, so userspace has nothing to wait on.
