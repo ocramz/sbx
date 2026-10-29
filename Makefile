@@ -3,6 +3,7 @@
 # Variables can be overridden on the command line, e.g.
 #   make image BASE_IMAGE=python:3.13-slim-bookworm
 #   make push VERSION=0123456789ab PUSH_TAGS="main"
+#   make smoke DOCKER=docker SMOKE_CGROUP=false
 
 SHELL := bash
 .SHELLFLAGS := -euo pipefail -c
@@ -19,12 +20,18 @@ HOST_ARCH       := $(patsubst x86_64,amd64,$(patsubst aarch64,arm64,$(shell unam
 REGISTRY        ?= ghcr.io
 IMAGE_NAME      ?= ocramz/sbx
 VERSION         ?= $(shell git rev-parse --short=12 HEAD)
+# What `sbx version` and the report print: the tag on a release commit.
+SBX_VERSION     ?= $(shell git describe --tags --always --dirty --match 'v*')
 BASE_IMAGE      ?= debian:bookworm-slim
 TEST_BASE_IMAGE ?= python:3.13-slim-bookworm
 PLATFORM        ?= linux/$(HOST_ARCH)
 PUSH_TAGS       ?=
 DOCKER          ?= podman
 CARGO           ?= cargo
+# true: the test container gets a writable cgroup2 (podman --systemd=always)
+# and the suite checks cgroup.mode = "delegated"; false (e.g. with Docker):
+# it checks that sbx refuses that mode instead.
+SMOKE_CGROUP    ?= true
 
 IMAGE        := $(REGISTRY)/$(IMAGE_NAME)
 TEST_IMAGE   := $(IMAGE)-test
@@ -36,10 +43,20 @@ endif
 ifeq ($(strip $(VERSION)),)
 $(error VERSION is empty: run inside the git checkout or pass VERSION=...)
 endif
+ifeq ($(strip $(SBX_VERSION)),)
+$(error SBX_VERSION is empty: run inside the git checkout or pass SBX_VERSION=...)
+endif
+ifeq ($(filter $(SMOKE_CGROUP),true false),)
+$(error SMOKE_CGROUP must be true or false)
+endif
+# Compiled into sbx (cargo build, test, clippy).
+export SBX_VERSION
 
 DOCKER_BUILD = $(DOCKER) build --platform $(PLATFORM) \
 	--build-arg RUST_VERSION=$(RUST_VERSION) \
-	--label org.opencontainers.image.revision=$(VERSION)
+	--build-arg SBX_VERSION=$(SBX_VERSION) \
+	--label org.opencontainers.image.revision=$(VERSION) \
+	--label org.opencontainers.image.version=$(SBX_VERSION)
 
 .PHONY: help
 help: ## list the targets
@@ -77,10 +94,12 @@ test-image: ## build the test image (runtime stage on TEST_BASE_IMAGE plus the s
 .PHONY: smoke
 smoke: image test-image ## integration suite in the test image, then checks of the runtime image
 	$(DOCKER) run --rm --pull=never --platform $(PLATFORM) --cap-add SYS_PTRACE \
+		$(if $(filter true,$(SMOKE_CGROUP)),--systemd=always) \
 		--tmpfs /mnt/sbx-vol:rw,mode=0755 \
 		-e SBX=/usr/local/bin/sbx -e TEST_VOLUME=/mnt/sbx-vol -e TEST_REQUIRE_IPV6=true -e TEST_REQUIRE_LANDLOCK=true \
+		-e TEST_REQUIRE_CGROUP=$(SMOKE_CGROUP) \
 		--entrypoint python3 $(TEST_IMAGE):$(VERSION) /opt/sbx/tests/smoke.py
-	DOCKER="$(DOCKER)" PLATFORM="$(PLATFORM)" tests/image-checks.sh $(IMAGE):$(VERSION)
+	DOCKER="$(DOCKER)" PLATFORM="$(PLATFORM)" SBX_VERSION="$(SBX_VERSION)" tests/image-checks.sh $(IMAGE):$(VERSION)
 
 .PHONY: probe
 probe: ## run `sbx probe` with the default policy in the runtime image

@@ -194,6 +194,7 @@ spec:
             - {name: TEST_VOLUME, value: /mnt/sbx-vol}
             - {name: TEST_REQUIRE_IPV6, value: "true"}
             - {name: TEST_REQUIRE_LANDLOCK, value: "false"}
+            - {name: TEST_REQUIRE_CGROUP, value: "false"}
           resources:
             limits: {cpu: "1", memory: 1Gi}
           volumeMounts:
@@ -243,6 +244,7 @@ spec:
                 - {name: TEST_VOLUME, value: /mnt/sbx-vol}
                 - {name: TEST_REQUIRE_IPV6, value: "true"}
                 - {name: TEST_REQUIRE_LANDLOCK, value: "false"}
+                - {name: TEST_REQUIRE_CGROUP, value: "false"}
               resources:
                 limits: {cpu: "1", memory: 1Gi}
               volumeMounts:

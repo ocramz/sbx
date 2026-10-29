@@ -18,9 +18,9 @@
 //! Allowed destinations: CIDR rules, addresses learned from DNS answers to
 //! names matching domain rules (see dns.rs), and the DNS proxy itself.
 
-use crate::log::{self, errno, os_err};
+use crate::log::{self, errno, os_err, raise_fatal};
 use crate::net::{classify, parse_sockaddr, AddrClass, AnswerScope, ConnectTarget};
-use crate::notify::{comm_of, deny, describe, pidfd_open_thread, raise_fatal, Listener, Stats};
+use crate::notify::{comm_of, deny, describe, pidfd_open_thread, Listener, Stats};
 use crate::policy::{CompiledRule, EgressTarget, LandlockAbi, Policy, Violation};
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, SocketAddr};

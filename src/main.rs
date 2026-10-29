@@ -5,6 +5,8 @@
 //!   sbx policy [OPTIONS]                     validate and print the effective policy
 
 mod capabilities;
+mod cgroup;
+mod destination;
 mod dns;
 mod egress;
 mod landlock_layer;
@@ -12,10 +14,15 @@ mod log;
 mod net;
 mod notify;
 mod policy;
+mod report;
 mod seccomp_layer;
 mod supervisor;
 
-use policy::{LandlockAbi, NetMode, Overrides, Policy};
+use capabilities::Check;
+use cgroup::Delegation;
+use destination::Destination;
+use policy::{CgroupCfg, LandlockAbi, NetMode, Overrides, Policy};
+use report::{At, Outcome, Ran, SetupError, Stage};
 use std::collections::BTreeSet;
 use std::ffi::{CString, OsString};
 use std::os::fd::{AsRawFd, BorrowedFd};
@@ -45,10 +52,20 @@ environment variable shown):
   --env-pass NAME[:NAME] pass these variables (repeatable)    SBX_ENV_PASS
   --seccomp-action A     errno | kill                         SBX_SECCOMP_ACTION
   --quiet                only log warnings and errors         SBX_QUIET=true
+  --report FILE          write the outcome as JSON (run)      SBX_REPORT_FILE
+  --log FILE             append sbx's own lines to FILE       SBX_LOG_FILE
+                         instead of stderr
 
 Exit codes: the program's own, 124 on timeout, 125 for sbx errors,
 127 if the program cannot be executed, 128+N if killed by signal N.
 ";
+
+/// `git describe` of the commit sbx was built from; the Makefile and the
+/// image build set it.
+pub const VERSION: &str = match option_env!("SBX_VERSION") {
+    Some(v) => v,
+    None => concat!("unknown (Cargo.toml ", env!("CARGO_PKG_VERSION"), ")"),
+};
 
 fn main() {
     std::process::exit(match real_main() {
@@ -77,26 +94,27 @@ fn real_main() -> Result<i32, Vec<String>> {
             Ok(0)
         }
         "version" | "--version" => {
-            println!("sbx {}", env!("CARGO_PKG_VERSION"));
+            println!("sbx {VERSION}");
             Ok(0)
         }
         "run" | "probe" | "policy" => {
             let (flags, program) = parse_flags(rest, cmd == "run")?;
             let ov = Overrides::from_env()?.merge(flags);
             log::set_quiet(ov.quiet == Some(true));
+            let out = Outputs::open(&ov, cmd)?;
+            if cmd == "run" {
+                return Ok(run_and_report(ov, program, &out));
+            }
             let (p, warnings) = Policy::resolve(ov)?;
             for w in &warnings {
                 log::warn(w);
             }
-            match cmd {
-                "policy" => {
-                    let out = toml::to_string_pretty(&p).map_err(|e| vec![format!("serializing the policy: {e}")])?;
-                    print!("{out}");
-                    Ok(0)
-                }
-                "probe" => Ok(probe(&p)),
-                _ => run(p, program),
+            if cmd == "probe" {
+                return Ok(probe(&p, &out));
             }
+            let toml = toml::to_string_pretty(&p).map_err(|e| vec![format!("serializing the policy: {e}")])?;
+            print!("{toml}");
+            Ok(0)
         }
         other => Err(vec![format!("unknown command {other:?}\n{USAGE}")]),
     }
@@ -166,6 +184,8 @@ fn parse_flags(args: &[OsString], run: bool) -> Result<(Overrides, Vec<OsString>
             "--env-pass" => one(policy::split_names(key, &val).map(|n| o.env_pass.extend(n)))?,
             "--seccomp-action" => one(policy::parse_violation(key, &val).map(|v| o.on_violation = Some(v)))?,
             "--quiet" => o.quiet = Some(true),
+            "--report" => o.report = Some(PathBuf::from(val)),
+            "--log" => o.log = Some(PathBuf::from(val)),
             _ => return Err(usage(format!("unknown option {key}"))),
         }
     }
@@ -176,18 +196,83 @@ fn parse_flags(args: &[OsString], run: bool) -> Result<(Overrides, Vec<OsString>
     }
 }
 
-fn run(p: Policy, cmd: Vec<OsString>) -> Result<i32, Vec<String>> {
-    let one = |e: String| vec![e];
-    let envp = build_env(&p).map_err(one)?;
-    let exe = resolve_program(&cmd[0], &envp).map_err(one)?;
-    capabilities::require(&p)?;
+/// Where sbx's own output goes besides stdout: the log file (opened now, so
+/// every later line lands there) and the report.
+struct Outputs {
+    report: Option<Destination>,
+    log: Option<Destination>,
+}
+
+impl Outputs {
+    fn open(ov: &Overrides, cmd: &str) -> Result<Outputs, Vec<String>> {
+        let one = |e: String| vec![e];
+        let log = match &ov.log {
+            Some(path) => {
+                let d = Destination::open("log file", path).map_err(one)?;
+                log::set_file(d.open_append().map_err(one)?).map_err(one)?;
+                Some(d)
+            }
+            None => None,
+        };
+        // `sbx policy` has no outcome to report.
+        let report = match &ov.report {
+            Some(path) if cmd != "policy" => Some(Destination::open("report", path).map_err(one)?),
+            _ => None,
+        };
+        Ok(Outputs { report, log })
+    }
+}
+
+/// `sbx run`: every outcome after this point, setup failures included,
+/// ends up in the report.
+fn run_and_report(ov: Overrides, cmd: Vec<OsString>, out: &Outputs) -> i32 {
+    if let Some(r) = &out.report {
+        if let Err(e) = r.remove_stale() {
+            log::error(e);
+            return 125;
+        }
+    }
+    let outcome = match run(ov, cmd, out) {
+        Ok(ran) => Outcome::Ran(ran),
+        Err(e) => {
+            for m in &e.errors {
+                log::error(m);
+            }
+            Outcome::SetupFailed(e)
+        }
+    };
+    if let Some(r) = &out.report {
+        if let Err(e) = outcome.to_json(VERSION).and_then(|j| r.write_atomic(&j)) {
+            log::error(format!("writing the report: {e}"));
+            return 125;
+        }
+    }
+    outcome.exit_code()
+}
+
+fn run(ov: Overrides, cmd: Vec<OsString>, out: &Outputs) -> Result<Ran, SetupError> {
+    // Before anything changes, so a SIGTERM cannot stop sbx half-way.
+    let sig = supervisor::block_signals().at(Stage::Launch)?;
+    let (p, warnings) = Policy::resolve(ov).at(Stage::Policy)?;
+    for w in &warnings {
+        log::warn(w);
+    }
+    if let Some(r) = &out.report {
+        r.check_sandbox_access("report", &p).at(Stage::Report)?;
+    }
+    if let Some(l) = &out.log {
+        l.check_sandbox_access("log file", &p).at(Stage::Log)?;
+    }
+    let envp = build_env(&p).at(Stage::Env)?;
+    let exe = resolve_program(&cmd[0], &envp).at(Stage::Program)?;
+    capabilities::require(&p).at(Stage::Capabilities)?;
     // Held until sbx exits.
-    let _slot = supervisor::claim_sandbox_slot().map_err(one)?;
+    let _slot = supervisor::claim_sandbox_slot().at(Stage::Slot)?;
 
     // Without Landlock nothing stops an IP socket inherited on stdio from
     // connecting in mode none either.
     if p.network.mode == NetMode::Egress || (p.network.mode == NetMode::None && p.landlock.abi == LandlockAbi::Off) {
-        check_stdio().map_err(one)?;
+        check_stdio().at(Stage::Stdio)?;
     }
     let mut svc = supervisor::Services {
         egress: None,
@@ -199,33 +284,60 @@ fn run(p: Policy, cmd: Vec<OsString>) -> Result<i32, Vec<String>> {
         let egress = Arc::new(egress::Egress::new(&p));
         log::info(egress.summary());
         if let Some(d) = &p.network.dns {
-            _resolv_conf = dns::setup_resolv_conf(d).map_err(one)?;
-            let listener = dns::bind(d).map_err(one)?;
+            _resolv_conf = dns::setup_resolv_conf(d).at(Stage::Dns)?;
+            let listener = dns::bind(d).at(Stage::Dns)?;
             svc.dns = Some((listener, d.clone()));
         }
         svc.egress = Some(egress);
     }
+    // Undone when run() returns early; finish() below otherwise.
+    let cg = Delegation::setup(p.cgroup).at(Stage::Cgroup)?;
     // Everything that can fail on bad config happens here, before fork.
-    let ll = landlock_layer::prepare(&p).map_err(one)?;
-    let sc = seccomp_layer::build(&p).map_err(one)?;
+    let ll = landlock_layer::prepare(&p).at(Stage::Landlock)?;
+    let sc = seccomp_layer::build(&p).at(Stage::Seccomp)?;
     log::info(&ll.summary);
     log::info(&sc.summary);
 
-    let cstr = |b: Vec<u8>, what: &str| CString::new(b).map_err(|_| vec![format!("{what} contains a NUL byte")]);
+    let cstr = |b: Vec<u8>, what: &str| CString::new(b).map_err(|_| format!("{what} contains a NUL byte"));
     let launch = supervisor::Launch {
-        exe: cstr(exe.into_os_string().into_vec(), "program path")?,
+        exe: cstr(exe.into_os_string().into_vec(), "program path").at(Stage::Program)?,
         argv: cmd
             .into_iter()
             .map(|a| cstr(a.into_vec(), "an argument"))
-            .collect::<Result<_, _>>()?,
+            .collect::<Result<_, _>>()
+            .at(Stage::Program)?,
         envp: envp
             .into_iter()
             .map(|(k, v)| cstr(format!("{k}={v}").into_bytes(), "an environment variable"))
-            .collect::<Result<_, _>>()?,
+            .collect::<Result<_, _>>()
+            .at(Stage::Env)?,
         landlock: ll.ruleset,
         seccomp: sc,
+        cgroup_procs: cg.as_ref().map(Delegation::procs_fd),
     };
-    Ok(supervisor::run(&p, launch, svc))
+    let mut ran = supervisor::run(&p, launch, svc, &sig, cg.as_ref())?;
+    if let Some(c) = cg {
+        let (stats, errs) = c.finish();
+        for e in errs {
+            log::error(e);
+        }
+        if let Some(s) = stats.as_ref().filter(|s| s.oom_kills > 0) {
+            log::error(format!(
+                "the OOM killer killed {} process(es) in the sandbox (cgroup.memory_mb = {})",
+                s.oom_kills,
+                limit_text(s.memory_mb)
+            ));
+        }
+        ran.cgroup = stats;
+    }
+    Ok(ran)
+}
+
+fn limit_text(l: policy::Limit) -> String {
+    match l {
+        policy::Limit::Value(n) => n.to_string(),
+        policy::Limit::Unlimited => "unlimited".into(),
+    }
 }
 
 /// The sandbox environment: exactly env.set plus the env.pass variables,
@@ -333,8 +445,28 @@ fn check_stdio() -> Result<(), String> {
     Ok(())
 }
 
-fn probe(p: &Policy) -> i32 {
-    let checks = capabilities::check(p);
+fn probe(p: &Policy, out: &Outputs) -> i32 {
+    let mut checks = capabilities::check(p);
+    if p.cgroup != CgroupCfg::Off {
+        checks.push(Check {
+            name: "cgroup delegation",
+            outcome: cgroup::trial(p.cgroup),
+        });
+    }
+    if let Some(r) = &out.report {
+        checks.push(Check {
+            name: "report file",
+            outcome: r.check_sandbox_access("report", p).and_then(|_| r.trial()),
+        });
+    }
+    if let Some(l) = &out.log {
+        checks.push(Check {
+            name: "log file",
+            outcome: l
+                .check_sandbox_access("log file", p)
+                .map(|_| format!("sbx appends to {}", l.path().display())),
+        });
+    }
     let mut ok = true;
     for c in &checks {
         match &c.outcome {

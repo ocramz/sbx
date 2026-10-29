@@ -10,25 +10,13 @@
 //! notification fails with ENOSYS, so the sandbox fails closed.
 
 use crate::egress::Egress;
-use crate::log::{self, errno, os_err};
+use crate::log::{self, errno, os_err, raise_fatal};
 use crate::policy::Violation;
 use crate::seccomp_layer::{syscall_name, Reason, RuleTable};
 use std::collections::BTreeMap;
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
-
-/// Signal the dispatcher and the DNS proxy raise on the supervisor when they
-/// fail; the main loop then tears the sandbox down (exit 125).
-pub fn fatal_signal() -> libc::c_int {
-    libc::SIGRTMIN() + 1
-}
-
-pub fn raise_fatal(what: &str) {
-    log::error(format!("{what}; terminating the sandbox"));
-    // SAFETY: plain signal to our own process.
-    unsafe { libc::kill(libc::getpid(), fatal_signal()) };
-}
 
 /// SECCOMP_GET_NOTIF_SIZES: the kernel's view of the notification structs.
 pub fn notif_sizes() -> Result<libc::seccomp_notif_sizes, String> {
@@ -162,18 +150,17 @@ impl Listener {
 
 /// `comm[pid N]` (plus `tid M` for non-leader threads) for log lines.
 pub fn describe(tid: i32) -> String {
-    let comm = std::fs::read_to_string(format!("/proc/{tid}/comm"))
-        .map(|s| s.trim_end().to_string())
-        .unwrap_or_else(|_| "<exited>".into());
+    let comm = comm_of(tid);
     match tgid_of(tid) {
         Ok(tgid) if tgid != tid => format!("{comm}[pid {tgid} tid {tid}]"),
         _ => format!("{comm}[pid {tid}]"),
     }
 }
 
+/// The task's name, which the sandbox chooses (PR_SET_NAME), escaped for logs.
 pub fn comm_of(tid: i32) -> String {
     std::fs::read_to_string(format!("/proc/{tid}/comm"))
-        .map(|s| s.trim_end().to_string())
+        .map(|s| log::untrusted(s.strip_suffix('\n').unwrap_or(&s)))
         .unwrap_or_else(|_| "<exited>".into())
 }
 
@@ -240,13 +227,29 @@ fn kill_process(listener: &Listener, id: u64, tid: i32) -> Result<(), String> {
     Ok(())
 }
 
-/// Counts policy events so each distinct one is logged once, with a summary at exit.
+/// Counts policy events so each distinct one is logged once, with a summary
+/// at exit, and denied syscalls for the report.
 #[derive(Default)]
 pub struct Stats {
     events: Mutex<BTreeMap<String, u64>>,
+    denials: Mutex<BTreeMap<String, u64>>,
 }
 
 impl Stats {
+    pub fn denied(&self, syscall: String) {
+        if let Ok(mut m) = self.denials.lock() {
+            *m.entry(syscall).or_insert(0) += 1;
+        }
+    }
+
+    /// Denials per syscall, by name.
+    pub fn denials(&self) -> Vec<(String, u64)> {
+        match self.denials.lock() {
+            Ok(m) => m.iter().map(|(k, &n)| (k.clone(), n)).collect(),
+            Err(_) => vec![],
+        }
+    }
+
     /// Record an event; returns true the first time this key is seen.
     pub fn first(&self, key: String) -> bool {
         match self.events.lock() {
@@ -280,11 +283,11 @@ pub struct Dispatcher {
 }
 
 impl Dispatcher {
-    pub fn spawn(self) -> Result<(), String> {
+    /// The thread returns once no sandboxed process is left.
+    pub fn spawn(self) -> Result<std::thread::JoinHandle<()>, String> {
         std::thread::Builder::new()
             .name("sbx-notify".into())
             .spawn(move || self.run())
-            .map(|_| ())
             .map_err(|e| format!("cannot start the seccomp notification thread: {e}"))
     }
 
@@ -353,6 +356,7 @@ pub fn deny(
     err: i32,
 ) -> Result<(), String> {
     let tid = n.pid as i32;
+    stats.denied(syscall_name(n.data.nr as i64));
     let key = format!("denied {what} for {}: {reason}", comm_of(tid));
     if stats.first(key) {
         log::error(format!("seccomp: denied {what} for {}: {reason}", describe(tid)));

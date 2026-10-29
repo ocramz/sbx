@@ -13,8 +13,7 @@
 //! is answered with SERVFAIL and logged.
 
 use crate::egress::Egress;
-use crate::log;
-use crate::notify::raise_fatal;
+use crate::log::{self, raise_fatal};
 use crate::policy::{DnsCfg, ResolvConfMode, Transport, RESOLV_CONF};
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
@@ -101,11 +100,12 @@ pub struct Query {
 }
 
 impl Query {
+    /// The name for log lines: labels may hold any byte, so it is escaped.
     pub fn name(&self) -> String {
         if self.labels.is_empty() {
             ".".into()
         } else {
-            self.labels.join(".")
+            log::untrusted(&self.labels.join("."))
         }
     }
 }
