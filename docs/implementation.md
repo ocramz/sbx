@@ -16,3 +16,22 @@ Plan: [plans/v0.3-report.md](plans/v0.3-report.md).
 - Tests: property tests (proptest, dev-only) for the pure parts (usage accumulation, exit codes, wait statuses, stage round trip, the directory-chain rule, leftover counting, cgroup value formatting and parsing, log escaping, cgroup policy round trip); smoke sections "report and log" and "cgroup limits" (gated by `TEST_REQUIRE_CGROUP`; `make smoke` runs podman with `--systemd=always`, `SMOKE_CGROUP=false` otherwise); image checks for the version, the report and log as PID 1, and the refusal on a read-only cgroupfs.
 - Deviations from the plan: the destination code is its own module rather than part of `report.rs`; the cgroup trial runs only in `sbx probe` (in `sbx run` the real setup reports the same errors, at stage `cgroup`).
 - Not verified here: GitHub's ubuntu-24.04 runner with `--systemd=always` (rootless podman may get no delegated controllers), and Cloud Run (`make live`).
+
+## 2026-10-29: multi-arch images, linux/amd64 and linux/arm64
+
+Plan: [plans/multiarch-images.md](plans/multiarch-images.md).
+
+- CI: `check` and `image` run on a matrix of `ubuntu-24.04` (amd64) and `ubuntu-24.04-arm` (arm64), so lint, unit tests and `make smoke` run natively on both. On `main` and `v*` tags, each `image` job pushes its tested image as `:<sha>-<arch>`. A new `manifest` job (needs both) joins them into the index `:<sha>` plus `:main`, or `:<tag>` and `:latest`.
+- Makefile:
+  - `push` now pushes only `$(IMAGE):$(VERSION)-$(ARCH)`. It refuses an image whose architecture is not PLATFORM's.
+  - new `manifest` target (podman): an empty list plus one `manifest add docker://…` per `ARCHS`, a check that the list holds exactly `ARCHS`, `manifest push --all` to `:$(VERSION)` and each of `PUSH_TAGS`, then the local list is removed
+  - `PLATFORM` must be `linux/amd64` or `linux/arm64`
+- README (Build and test, CI paragraph) and CHANGELOG (Unreleased) updated. No Rust or Dockerfile changes.
+- Verified locally (arm64 Mac, podman 5.3, kernel 6.12):
+  - `make smoke`: 135 + 13 passed
+  - `push` and `manifest` against a local plain-HTTP registry, through a wrapper that adds `--tls-verify=false`: the per-arch tags and the index under `scratch1`, `main` and `latest`; `--platform linux/arm64` pulls the arm64 image from the index
+  - `push` refuses an amd64 image when PLATFORM is arm64
+  - a list left by a failed run makes `manifest` fail
+- Deviation from the plan: `manifest create LIST IMAGE…` ignored `--tls-verify` for its images in podman 5.3, so the target creates an empty list and adds images one at a time.
+- Found while testing: on an arm64 host, `make image PLATFORM=linux/amd64` gives an image whose config says amd64 but whose base layers are arm64. podman reuses the locally stored `debian:bookworm-slim`, as `tests/cloud-run.sh` already notes. The config then carries `variant: v8`, so an amd64 pull from an index containing it fails. `push`'s architecture check cannot see this. CI builds each architecture natively, so it does not happen there; a comment above `push` says to push natively built images only.
+- Not verified here: the arm64 runner's kernel (Landlock ABI 6, `TEST_REQUIRE_LANDLOCK=true`) and cgroup delegation under podman `--systemd=always`; `rustup` on that runner; podman 4.9 `manifest add`/`push` against ghcr.io with docker's auth file. These are checked by the first branch push and the first push to `main`.

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Images for `linux/arm64` as well as `linux/amd64`. `ghcr.io/ocramz/sbx:<tag>`, `:latest`, `:main` and `:<sha>` are multi-arch, and each architecture's image passed the integration suite on a native runner. The per-architecture images are `:<sha>-amd64` and `:<sha>-arm64`.
+
 ## v0.3
 
 **Breaking:** every policy now needs a `[cgroup]` table. To keep v0.2's behaviour, add:

@@ -1,6 +1,9 @@
 # Lint and unit-test the code, build the image, run the integration suite in
-# Docker, and push the image to ghcr.io for main and v* tags. Every step is a
-# Makefile target, so CI and local runs are the same commands.
+# a container, on an amd64 and an arm64 runner each (Landlock and seccomp do
+# not work under emulation). For main and v* tags, each pushes its image as
+# :<sha>-<arch>, and the manifest job joins the two into the multi-arch
+# :<sha>, :main, :<tag> and :latest. Every step is a Makefile target, so CI and
+# local runs are the same commands.
 name: ci
 
 on:
@@ -21,7 +24,13 @@ jobs:
     # Branches of this repository are built by the push event; pull_request
     # runs only for forks.
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
-    runs-on: ubuntu-24.04
+    name: check (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -33,7 +42,13 @@ jobs:
 
   image:
     needs: check
-    runs-on: ubuntu-24.04
+    name: image (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
@@ -53,9 +68,27 @@ jobs:
         run: echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Push the image (main)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: make push PUSH_TAGS=main
-      - name: Push the image (release tag)
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-        run: make push PUSH_TAGS="$GITHUB_REF_NAME latest"
+      - name: Push the image as :<sha>-${{ matrix.arch }}
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        run: make push
+
+  manifest:
+    # Only once both architectures have passed and pushed their image.
+    needs: image
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Log in to ghcr.io
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push the multi-arch image (main)
+        if: github.ref == 'refs/heads/main'
+        run: make manifest PUSH_TAGS=main
+      - name: Push the multi-arch image (release tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: make manifest PUSH_TAGS="$GITHUB_REF_NAME latest"
