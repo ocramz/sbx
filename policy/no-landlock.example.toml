@@ -39,6 +39,9 @@ fsize_mb = 1024
 as_mb = "unlimited"
 cpu_secs = "unlimited"
 
+[cgroup]
+mode = "off"               # or "delegated" with memory_mb and pids (README, "cgroup limits")
+
 [env]
 pass = []
 [env.set]

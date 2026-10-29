@@ -16,6 +16,11 @@ Optional:
                      ABI 6. false (Cloud Run): then check that sbx refuses
                      Landlock policies, report the Landlock-only tests as n/a
                      and run everything else with landlock.abi = "off"
+  TEST_REQUIRE_CGROUP  true (default): fail unless /sys/fs/cgroup is a
+                     writable cgroup v2 with the memory and pids controllers
+                     (podman run --systemd=always), and test
+                     cgroup.mode = "delegated" in it. false: check that sbx
+                     refuses that mode instead
 
 The suite rewrites /etc/resolv.conf for the DNS tests and starts local TCP
 servers on 127.0.0.1-3, so never run it directly on a host you care about.
@@ -86,6 +91,27 @@ if REQUIRE_IPV6 == "true" and not HAVE_IPV6:
 REQUIRE_LANDLOCK = os.environ.get("TEST_REQUIRE_LANDLOCK", "true")
 if REQUIRE_LANDLOCK not in ("true", "false"):
     die("TEST_REQUIRE_LANDLOCK must be true or false")
+REQUIRE_CGROUP = os.environ.get("TEST_REQUIRE_CGROUP", "true")
+if REQUIRE_CGROUP not in ("true", "false"):
+    die("TEST_REQUIRE_CGROUP must be true or false")
+CG = "/sys/fs/cgroup"
+if REQUIRE_CGROUP == "true":
+    # The delegated tests move every process of CG into a child cgroup:
+    # only ever do that at the root of a container's own cgroup namespace.
+    INITIAL_CGROUP_NS = "cgroup:[4026531835]"
+    with open("/proc/self/cgroup") as f:
+        if f.read().strip() != "0::/" or os.readlink("/proc/self/ns/cgroup") == INITIAL_CGROUP_NS:
+            die("TEST_REQUIRE_CGROUP=true needs the suite at the root of a cgroup namespace of its own "
+                "(a container); set TEST_REQUIRE_CGROUP=false on a host")
+    try:
+        with open(f"{CG}/cgroup.controllers") as f:
+            if not {"memory", "pids"} <= set(f.read().split()):
+                raise OSError("the memory and pids controllers are not available")
+        os.mkdir(f"{CG}/sbx-smoke-probe")
+        os.rmdir(f"{CG}/sbx-smoke-probe")
+    except OSError as e:
+        die(f"TEST_REQUIRE_CGROUP=true but {CG} cannot be delegated ({e}); run the container with "
+            "--systemd=always (podman) or set TEST_REQUIRE_CGROUP=false")
 PY = os.path.realpath(sys.executable)
 VOLUME = os.path.realpath(VOLUME)
 
@@ -156,7 +182,7 @@ def toml_value(v):
 
 def policy(mode="none", families=("unix",), egress=(), bind_tcp=(), dns=None, subprocesses=True,
            on_violation="errno", deny=(), allow=(), extra_fs=(), workdir="/tmp", timeout="none",
-           env_pass=(), drop=None, uid=65534, gid=65534, abi=ABI, fs=None):
+           env_pass=(), drop=None, uid=65534, gid=65534, abi=ABI, fs=None, cgroup=None):
     """abi="off": no scopes and, unless fs is given, no fs rules."""
     landlock = abi != "off"
     if fs is None:
@@ -166,6 +192,7 @@ def policy(mode="none", families=("unix",), egress=(), bind_tcp=(), dns=None, su
         "process": {"uid": uid, "gid": gid, "workdir": workdir, "timeout_secs": timeout, "kill_grace_secs": 2,
                     "subprocesses": subprocesses},
         "limits": {"nofile": 1024, "nproc": 512, "fsize_mb": 1024, "as_mb": "unlimited", "cpu_secs": "unlimited"},
+        "cgroup": cgroup or {"mode": "off"},
         "env": {"pass": list(env_pass)},
         "env.set": {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/tmp", "LANG": "C.UTF-8"},
         "network": {"mode": mode, "bind_tcp": list(bind_tcp), "egress": list(egress)},
@@ -198,13 +225,35 @@ for path, _ in fs_rules():
         die(f"TEST_VOLUME {VOLUME} lies under {path}, which the test policies grant; mount it elsewhere (e.g. /mnt)")
 
 
-def sbx(args, pol=BASE, env=None, cmd="run", timeout=60, wrap=()):
+# Reports and logs go to a directory only root can write, as sbx requires.
+RDIR = "/var/lib/sbx-smoke"
+os.makedirs(RDIR, mode=0o700, exist_ok=True)
+AUTO_REPORT = f"{RDIR}/auto.json"
+REPORT_MISMATCHES = []
+
+
+def sbx(args, pol=BASE, env=None, cmd="run", timeout=60, wrap=(), auto_report=True):
+    """Unless auto_report is off or sbx runs wrapped (e.g. as another uid),
+    every `sbx run` also writes a report, which must agree with the exit code."""
     e = dict(BASE_ENV)
     if pol is not None:
         e["SBX_POLICY_FILE"] = pol
     e.update(env or {})
+    auto = auto_report and cmd == "run" and not wrap
+    if auto:
+        args = ["--report", AUTO_REPORT, *args]
     p = subprocess.run([*wrap, SBX, cmd, *args], env=e, capture_output=True, text=True, timeout=timeout,
                        stdin=subprocess.DEVNULL)
+    if auto:
+        try:
+            with open(AUTO_REPORT) as f:
+                got = json.load(f)["exit_code"]
+            os.unlink(AUTO_REPORT)
+        except FileNotFoundError:
+            # Only errors in the flags and SBX_* variables come before the report.
+            got = None if p.returncode == 125 else "missing"
+        if got not in (None, p.returncode):
+            REPORT_MISMATCHES.append((args, p.returncode, got))
     return p.returncode, p.stdout, p.stderr
 
 
@@ -691,6 +740,264 @@ expect("off: fd swap: AF_UNIX <-> TCP during connect", 0, ["--quiet", *py(RACE_F
 time.sleep(0.2)
 check("off: fd swap: the denied server saw no connection", B.accepted == before, f"accepted {B.accepted - before}")
 
+# ---------------------------------------------------------------- report and log
+
+print("== report and log")
+VERSION = subprocess.run([SBX, "version"], capture_output=True, text=True).stdout.strip().removeprefix("sbx ")
+check("version: sbx version names the build", VERSION and not VERSION.startswith("unknown"), VERSION)
+REPORT = f"{RDIR}/report.json"
+
+
+def reported(args, pol=BASE, **kw):
+    """Run with --report REPORT; return rc, stdout, stderr and the report (None if there is none)."""
+    if os.path.lexists(REPORT):
+        os.unlink(REPORT)
+    rc, so, se = sbx(["--report", REPORT, *args], pol=pol, auto_report=False, **kw)
+    try:
+        with open(REPORT) as f:
+            return rc, so, se, json.load(f)
+    except FileNotFoundError:
+        return rc, so, se, None
+
+
+def check_report(name, args, cond, pol=BASE, **kw):
+    rc, so, se, r = reported(args, pol=pol, **kw)
+    check(name, r is not None and r["exit_code"] == rc and cond(r), f"rc={rc} report={r} stderr={se[-600:]!r}")
+    return r
+
+
+r = check_report("report: a normal exit", ["--", "/bin/sh", "-c", "exit 3"], lambda r: r["program"] == {"exited": 3}
+                 and not r["timed_out"] and r["setup_error"] is None and r["supervisor_error"] is None
+                 and r["killed_after_exit"] == 0 and isinstance(r["wall_ms"], int) and r["cgroup"] is None
+                 and set(r["rusage"]) == {"user_ms", "sys_ms", "max_rss_kib"} and r["rusage"]["max_rss_kib"] > 0
+                 and r["sbx_version"] == VERSION)
+check("report: every key is present", r is not None and len(r) == 11, r)
+st = os.lstat(REPORT)
+check("report: owned by root, mode 0600", st.st_uid == 0 and st.st_mode & 0o7777 == 0o600, oct(st.st_mode))
+check_report("report: killed by a signal", ["--", "/bin/sh", "-c", "kill -9 $$"],
+             lambda r: r["program"] == {"signaled": 9} and r["exit_code"] == 137)
+check_report("report: timeout", ["--timeout", "1", "--", "/bin/sleep", "5"],
+             lambda r: r["exit_code"] == 124 and r["timed_out"] and r["killed_after_exit"] is None)
+check_report("report: denials per syscall", py("import socket\nfor _ in range(3):\n try: socket.socket()\n except OSError: pass"),
+             lambda r: {"syscall": "socket", "count": 3} in r["denials"])
+check_report("report: processes left behind are counted",
+             ["--", "/bin/sh", "-c", "setsid /bin/sleep 300 >/dev/null 2>&1 & echo started"],
+             lambda r: r["killed_after_exit"] == 1)
+check_report("report: CPU time of the whole tree", py("import subprocess, sys; subprocess.run([sys.executable, '-c', "
+                                                       "'import time\\nt=time.process_time()\\nwhile time.process_time()-t<0.3: pass'])"),
+             lambda r: r["rusage"]["user_ms"] + r["rusage"]["sys_ms"] >= 250)
+check_report("report: setup error in the policy", ["--", "/bin/true"],
+             lambda r: r["setup_error"]["stage"] == "policy" and "missing field" in " ".join(r["setup_error"]["messages"])
+             and r["program"] is None and r["wall_ms"] is None, pol=policy(drop="process.kill_grace_secs"))
+check_report("report: setup error in the child (execve, exit 127)", ["--", "/nonexistent-sbx"],
+             lambda r: r["exit_code"] == 127 and r["setup_error"]["stage"] == "execve")
+check_report("report: missing capability", py(CONNECT, "127.0.0.1", A.port),
+             lambda r: r["setup_error"]["stage"] == "capabilities", pol=EGRESS,
+             wrap=(SETPRIV, "--bounding-set=-sys_ptrace", "--inh-caps=-sys_ptrace"))
+if LANDLOCK:
+    NRDIR = f"{W}/nr-reports"
+    os.mkdir(NRDIR, 0o700)
+    os.chown(NRDIR, 65534, 65534)
+    rc, so, se = sbx(["--report", f"{NRDIR}/r.json", "--", "/bin/true"], wrap=NR)
+    with open(f"{NRDIR}/r.json") as f:
+        r = json.load(f)
+    check("report: non-root sbx refuses a report directory inside an fs rule", rc == 125
+          and r["setup_error"]["stage"] == "report" and "only Landlock" in se, f"rc={rc} {r} {se[-400:]!r}")
+else:
+    print("  n/a  report: non-root sbx and fs rules (needs Landlock)")
+expect("report: a directory others can write is refused", 125, ["--report", "/tmp/sbx-report.json", "--", "/bin/true"],
+       auto_report=False, log="writable by others")
+check("report: nothing is written there", not os.path.lexists("/tmp/sbx-report.json"))
+os.symlink(RDIR, f"{RDIR}-link")
+expect("report: a symlinked directory is refused", 125, ["--report", f"{RDIR}-link/r.json", "--", "/bin/true"],
+       auto_report=False, log="not canonical")
+os.unlink(f"{RDIR}-link")
+os.unlink(REPORT)
+os.symlink("/etc/sbx-smoke-target", REPORT)
+rc, so, se = sbx(["--report", REPORT, "--", "/bin/true"], auto_report=False)
+check("report: a symlink at the path is replaced, not followed",
+      rc == 0 and not os.path.islink(REPORT) and not os.path.exists("/etc/sbx-smoke-target"), se[-400:])
+with open(REPORT, "w") as f:
+    f.write("stale")
+rc, so, se = sbx(["--report", REPORT], cmd="probe")
+check("report: probe checks the destination and leaves the file alone",
+      rc == 0 and "ok       report file" in so and open(REPORT).read() == "stale", so + se)
+run = subprocess.Popen([SBX, "run", "--report", REPORT, "--", "/bin/sleep", "60"], env=dict(BASE_ENV, SBX_POLICY_FILE=BASE),
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+for line in run.stderr:
+    if "started pid" in line:
+        break
+check("report: a stale report is removed when sbx starts", not os.path.lexists(REPORT))
+run.terminate()
+run.communicate(timeout=30)
+with open(REPORT) as f:
+    r = json.load(f)
+check("report: SIGTERM is forwarded and reported", run.returncode == 143 and r["program"] == {"signaled": 15}, r)
+
+LOG = f"{RDIR}/sbx.log"
+rc, so, se = sbx(["--log", LOG, "--", "/bin/sh", "-c", "echo out; echo err >&2"])
+with open(LOG) as f:
+    logged = f.read()
+check("log: the program's stderr has no sbx lines", rc == 0 and so == "out\n" and se == "err\n", repr(se))
+check("log: sbx's lines are in the log file", "sbx: info: started pid" in logged and "sbx: info: exit 0" in logged,
+      logged[-400:])
+st = os.lstat(LOG)
+check("log: owned by root, mode 0600", st.st_uid == 0 and st.st_mode & 0o7777 == 0o600, oct(st.st_mode))
+expect("log: the program cannot read it", 1, ["--log", LOG, "--", "/bin/cat", LOG])
+size = os.path.getsize(LOG)
+FORGE = ("import ctypes, socket; ctypes.CDLL(None).prctl(15, b'x\\nsbx: info: fake', 0, 0, 0)\n"
+         "try: socket.socket()\nexcept OSError: pass")
+expect("log: a denial is logged", 0, ["--log", LOG, *py(FORGE)])
+with open(LOG) as f:
+    f.seek(size)
+    added = f.read()
+check("log: appended, with the program's name escaped",
+      "denied socket for x\\nsbx: info: fa" in added and not any(l.startswith("sbx: info: fa") for l in added.splitlines()),
+      added[-600:])
+os.chmod(LOG, 0o644)
+expect("log: a log file others can read is refused", 125, ["--log", LOG, "--", "/bin/true"], log="mode 0600")
+os.unlink(LOG)
+
+# ---------------------------------------------------------------- cgroup
+
+print("== cgroup limits")
+
+
+def delegated(memory_mb="unlimited", pids="unlimited"):
+    return policy(cgroup={"mode": "delegated", "memory_mb": memory_mb, "pids": pids})
+
+
+if REQUIRE_CGROUP == "false":
+    rc, so, se = sbx([], pol=delegated(), cmd="probe")
+    check("cgroup: probe reports delegation as missing", rc == 1 and "MISSING  cgroup delegation" in so, so + se)
+    check_report("cgroup: delegated mode is refused here", ["--", "/bin/true"],
+                 lambda r: r["exit_code"] == 125 and r["setup_error"]["stage"] == "cgroup", pol=delegated())
+else:
+    # sbx needs a cgroup of its own: move this suite out of the namespace's
+    # root cgroup and run each delegated sbx in a fresh child of it.
+    os.mkdir(f"{CG}/harness")
+    with open(f"{CG}/cgroup.procs") as f:
+        for pid in f.read().split():
+            try:
+                with open(f"{CG}/harness/cgroup.procs", "w") as g:
+                    g.write(pid)
+            except OSError:
+                pass  # exited meanwhile
+    with open(f"{CG}/cgroup.subtree_control", "w") as f:
+        f.write("+memory +pids")
+    N = [0]
+
+    def cgroup_run(prepare=None):
+        """A fresh cgroup for one sbx, and the wrapper that starts sbx in it."""
+        N[0] += 1
+        d = f"{CG}/run-{N[0]}"
+        os.mkdir(d)
+        if prepare:
+            prepare(d)
+        return d, ("/bin/sh", "-c", 'echo 0 > "$0/cgroup.procs" && exec "$@"', d)
+
+    def restored(d):
+        """sbx put its cgroup back as it found it."""
+        with open(f"{d}/cgroup.subtree_control") as f:
+            control = f.read().strip()
+        subdirs = [e for e in os.listdir(d) if os.path.isdir(f"{d}/{e}")]
+        return control == "" and subdirs == []
+
+    def cgroup_report(name, args, cond, pol, prepare=None, **kw):
+        d, wrap = cgroup_run(prepare)
+        if os.path.lexists(REPORT):
+            os.unlink(REPORT)
+        rc, so, se = sbx(["--report", REPORT, *args], pol=pol, wrap=wrap, **kw)
+        try:
+            with open(REPORT) as f:
+                r = json.load(f)
+        except FileNotFoundError:
+            r = None
+        good = r is not None and r["exit_code"] == rc and cond(r)
+        check(name, good and restored(d), f"rc={rc} report={r} restored={restored(d)} stderr={se[-600:]!r}")
+        return d, r
+
+    d, wrap = cgroup_run()
+    rc, so, se = sbx([], pol=delegated(64, 32), cmd="probe", wrap=wrap)
+    check("cgroup: probe tries delegation and leaves no trace", rc == 0 and "ok       cgroup delegation" in so
+          and restored(d), so + se)
+    cgroup_report("cgroup: a normal run is accounted", ["--", "/bin/sh", "-c", "/bin/true; /bin/true"],
+                  lambda r: r["exit_code"] == 0 and r["cgroup"]["memory_mb"] == 64 and r["cgroup"]["pids"] == 32
+                  and r["cgroup"]["oom_kills"] == 0 and r["cgroup"]["memory_peak_kib"] > 0, pol=delegated(64, 32))
+    HOG = "x = b'x' * (256 << 20)"
+    cgroup_report("cgroup: the OOM killer kills the program, not sbx", py(HOG),
+                  lambda r: r["exit_code"] == 137 and r["program"] == {"signaled": 9} and r["cgroup"]["oom_kills"] >= 1,
+                  pol=delegated(memory_mb=64))
+    FORKS = """
+import os, sys, time
+kids = []
+try:
+    for _ in range(50):
+        pid = os.fork()
+        if pid == 0:
+            time.sleep(60)
+            os._exit(0)
+        kids.append(pid)
+except BlockingIOError:
+    sys.exit(0)
+sys.exit(1)
+"""
+    cgroup_report("cgroup: pids.max stops a fork bomb; the rest is killed", py(FORKS),
+                  lambda r: r["exit_code"] == 0 and r["cgroup"]["pids_max_hits"] >= 1 and r["killed_after_exit"] == 7,
+                  pol=delegated(pids=8))
+    ESCAPE = """
+import os, sys
+cg = "/sys/fs/cgroup" + open("/proc/self/cgroup").read().strip()[3:]
+fails = 0
+for path, value in [(cg + "/memory.max", "max"), (os.path.dirname(cg) + "/sbx-supervisor/cgroup.procs", str(os.getpid()))]:
+    try:
+        with open(path, "w") as f:
+            f.write(value)
+    except OSError:
+        fails += 1
+sys.exit(0 if fails == 2 else 1)
+"""
+    cgroup_report("cgroup: the program cannot raise its limits or leave", py(ESCAPE),
+                  lambda r: r["exit_code"] == 0, pol=delegated(memory_mb=64))
+
+    def squat(d):
+        p = subprocess.Popen(["/bin/sh", "-c", 'echo 0 > "$0/cgroup.procs" && exec /bin/sleep 60', d])
+        for _ in range(50):
+            with open(f"{d}/cgroup.procs") as f:
+                if f.read().strip():
+                    break
+            time.sleep(0.1)
+        SQUATTERS.append(p)
+
+    SQUATTERS = []
+    cgroup_report("cgroup: refused when other processes share sbx's cgroup", ["--", "/bin/true"],
+                  lambda r: r["setup_error"]["stage"] == "cgroup"
+                  and "also contains sleep" in " ".join(r["setup_error"]["messages"]),
+                  pol=delegated(), prepare=squat)
+    for p in SQUATTERS:
+        p.kill()
+        p.wait()
+
+    def limit(d):
+        with open(f"{d}/memory.max", "w") as f:
+            f.write(str(32 << 20))
+
+    cgroup_report("cgroup: refused when the limit is not below the container's", ["--", "/bin/true"],
+                  lambda r: r["setup_error"]["stage"] == "cgroup"
+                  and "not below the container's own limit" in " ".join(r["setup_error"]["messages"]),
+                  pol=delegated(memory_mb=64), prepare=limit)
+    expect("cgroup: refused for a non-root sbx", 125, ["--", "/bin/true"], pol=delegated(), wrap=NR,
+           log="needs sbx to start as root")
+    time.sleep(0.2)
+    for e in os.listdir(CG):
+        if e.startswith("run-"):
+            try:
+                os.rmdir(f"{CG}/{e}")
+            except OSError:
+                pass
+
+check("every run's report agrees with its exit code", not REPORT_MISMATCHES, REPORT_MISMATCHES[:5])
+
 # ---------------------------------------------------------------- cleanup
 
 shutil.rmtree(W, ignore_errors=True)
@@ -699,6 +1006,7 @@ with open("/etc/resolv.conf", "w") as f:
 for p in (SECRET, "/var/tmp/sbx-pwn"):
     if os.path.exists(p):
         os.unlink(p)
+shutil.rmtree(RDIR, ignore_errors=True)
 print(f"== {len(PASS)} passed, {len(FAIL)} failed")
 for name in FAIL:
     print(f"  failed: {name}")

@@ -2,6 +2,8 @@
 # Run tests/smoke.py on this Linux host, as root, inside a private mount
 # namespace: the test volume is a fresh tmpfs over /mnt and /etc/resolv.conf
 # is a throwaway copy (the DNS tests rewrite it), so the host is left untouched.
+# The delegated cgroup tests need a container (make smoke); here the suite
+# checks that sbx refuses that mode.
 #
 #   usage: tests/run-local.sh PATH-TO-SBX
 set -eu
@@ -25,5 +27,5 @@ cp /etc/resolv.conf "$work/resolv.conf"
 unshare --mount --propagation private -- sh -eu -c '
 	mount -t tmpfs -o mode=0755 sbx-test-volume /mnt
 	mount --bind "$1/resolv.conf" /etc/resolv.conf
-	env -i PATH="$PATH" SBX="$1/sbx" TEST_VOLUME=/mnt python3 "$2/smoke.py"
+	env -i PATH="$PATH" SBX="$1/sbx" TEST_VOLUME=/mnt TEST_REQUIRE_CGROUP=false python3 "$2/smoke.py"
 ' sh "$work" "$here"

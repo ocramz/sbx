@@ -3,12 +3,13 @@
 # (The full suite runs in the test image; this covers what only the real
 # image and container entrypoint can show.)
 #
-#   usage: tests/image-checks.sh IMAGE      (DOCKER, PLATFORM from the environment)
+#   usage: tests/image-checks.sh IMAGE      (DOCKER, PLATFORM, SBX_VERSION from the environment)
 set -eu
 
 image=${1:?usage: tests/image-checks.sh IMAGE}
 docker=${DOCKER:?set DOCKER}
 platform=${PLATFORM:?set PLATFORM}
+version=${SBX_VERSION:?set SBX_VERSION}
 pass=0
 fail=0
 ok() { pass=$((pass + 1)); echo "  ok   $1"; }
@@ -18,6 +19,9 @@ bad() { fail=$((fail + 1)); printf '  FAIL %s\n       %s\n' "$1" "$2"; }
 run() { "$docker" run --rm --pull=never --platform "$platform" "$@"; }
 
 echo "== runtime image $image"
+
+out=$(run --entrypoint /usr/local/bin/sbx "$image" version 2>&1) || true
+[ "$out" = "sbx $version" ] && ok "sbx version is $version" || bad "sbx version is $version" "$out"
 
 if out=$(run --entrypoint /usr/local/bin/sbx "$image" probe 2>&1); then
 	ok "probe passes with the default policy"
@@ -72,6 +76,31 @@ if [ "$rc" = 125 ] && echo "$out" | grep -q "unknown environment variable SBX_TI
 	ok "unknown SBX_* variables are refused"
 else
 	bad "unknown SBX_* variables are refused" "rc=$rc $out"
+fi
+
+# The report and the log of sbx as PID 1, on a volume, read by a second container.
+vol=sbx-image-checks-$$
+"$docker" volume create "$vol" >/dev/null
+rc=0
+out=$(run -v "$vol:/out" "$image" --report /out/report.json --log /out/sbx.log -- /bin/sh -c 'echo err >&2; exit 3' 2>&1) || rc=$?
+report=$(run -v "$vol:/out" --entrypoint /bin/cat "$image" /out/report.json 2>&1) || true
+logged=$(run -v "$vol:/out" --entrypoint /bin/cat "$image" /out/sbx.log 2>&1) || true
+"$docker" volume rm "$vol" >/dev/null
+if [ "$rc" = 3 ] && echo "$out" | grep -qx err && ! echo "$out" | grep -q "sbx:" &&
+	echo "$report" | grep -q '"exited": 3' && echo "$logged" | grep -q "sbx: info: exit 3"; then
+	ok "PID 1 writes the report and the log, and leaves stderr to the program"
+else
+	bad "report and log as PID 1" "rc=$rc stderr=$out report=$report log=$logged"
+fi
+
+rc=0
+out=$(run --entrypoint /bin/sh "$image" -c \
+	'sed "s/^mode = \"off\".*/mode = \"delegated\"\nmemory_mb = 256\npids = 128/" /etc/sbx/policy.toml >/tmp/delegated.toml &&
+	exec /usr/local/bin/sbx run --policy /tmp/delegated.toml -- /bin/true' 2>&1) || rc=$?
+if [ "$rc" = 125 ] && echo "$out" | grep -q "mounted read-only"; then
+	ok "cgroup.mode = \"delegated\" is refused on a read-only cgroupfs"
+else
+	bad "delegated cgroup on a read-only cgroupfs" "rc=$rc $out"
 fi
 
 echo "== $pass passed, $fail failed"

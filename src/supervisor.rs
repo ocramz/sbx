@@ -3,27 +3,31 @@
 //!   sbx (supervisor: PID 1 in a container, unsandboxed, never runs payload code)
 //!    ├─ threads, started after fork: seccomp notification dispatcher,
 //!    │  blocking egress connects, DNS proxy
-//!    └─ child: setsid → chdir → rlimits → drop identity and capabilities
+//!    └─ child: [join the sandbox cgroup] → setsid → chdir → rlimits → drop identity and capabilities
 //!              → PDEATHSIG → NO_NEW_PRIVS → Landlock (unless "off") → seccomp prelude
 //!              → policy filter (listener handed to the supervisor) → execve
 //!         └─ untrusted program and all its descendants (inherit every layer)
 //!
 //! One sandbox per container: `sbx run` claims a slot (an abstract UNIX
-//! socket) before it changes anything (resolv.conf, the DNS proxy) and holds
-//! it until it exits.
+//! socket) before it changes anything (resolv.conf, the DNS proxy, the
+//! cgroup) and holds it until it exits. The signals the supervisor handles
+//! are blocked before any of that, so none of them can stop sbx half-way.
 //!
 //! The supervisor is single-threaded until after fork, so the child may
 //! allocate before exec. Setup failures in the child come back over a
 //! close-on-exec pipe; the listener comes over a SOCK_SEQPACKET socketpair.
 
+use crate::cgroup::{self, Delegation};
 use crate::dns;
 use crate::egress::Egress;
 use crate::landlock_layer;
-use crate::log::{self, errno, os_err};
+use crate::log::{self, errno, fatal_signal, os_err};
 use crate::notify::{self, Dispatcher, Listener, Received, Stats};
 use crate::policy::{DnsCfg, LandlockAbi, Limit, Policy, Timeout};
+use crate::report::{self, At, Program, Ran, SetupError, Stage, Usage};
 use crate::seccomp_layer::{self, Programs};
 use landlock::RulesetCreated;
+use std::collections::BTreeSet;
 use std::ffi::CString;
 use std::io::Read;
 use std::net::TcpListener;
@@ -32,6 +36,7 @@ use std::os::linux::net::SocketAddrExt;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::{SocketAddr, UnixDatagram};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 pub struct Launch {
@@ -40,6 +45,8 @@ pub struct Launch {
     pub envp: Vec<CString>,
     pub landlock: Option<RulesetCreated>,
     pub seccomp: Programs,
+    /// sbx-sandbox/cgroup.procs (cgroup.mode = "delegated").
+    pub cgroup_procs: Option<RawFd>,
 }
 
 /// Supervisor-side services for the sandbox.
@@ -75,14 +82,9 @@ const FORWARDED: [libc::c_int; 6] = [
     libc::SIGUSR2,
 ];
 
-pub fn run(p: &Policy, l: Launch, svc: Services) -> i32 {
-    match launch(p, l, svc) {
-        Ok(code) => code,
-        Err(e) => {
-            log::error(e);
-            125
-        }
-    }
+/// Run the program and supervise it until every sandboxed process is gone.
+pub fn run(p: &Policy, l: Launch, svc: Services, sig: &Signals, cg: Option<&Delegation>) -> Result<Ran, SetupError> {
+    launch(p, l, svc, sig, cg)
 }
 
 fn pipe() -> Result<(OwnedFd, OwnedFd), String> {
@@ -113,14 +115,19 @@ fn socketpair() -> Result<(OwnedFd, OwnedFd), String> {
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
-/// Block the signals the supervisor handles with sigtimedwait. Threads
-/// started later inherit the mask, so these always reach the main loop.
-fn block_signals() -> Result<libc::sigset_t, String> {
+/// The signals the supervisor handles with sigtimedwait, blocked.
+pub struct Signals {
+    set: libc::sigset_t,
+}
+
+/// Block the signals the supervisor handles. Threads started later inherit
+/// the mask, so these always reach the main loop; until then they wait.
+pub fn block_signals() -> Result<Signals, String> {
     // SAFETY: sigset manipulation on a local set.
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut set);
-        for s in FORWARDED.iter().copied().chain([libc::SIGCHLD, notify::fatal_signal()]) {
+        for s in FORWARDED.iter().copied().chain([libc::SIGCHLD, fatal_signal()]) {
             if libc::sigaddset(&mut set, s) != 0 {
                 return Err(os_err(format!("sigaddset({s})")));
             }
@@ -128,40 +135,64 @@ fn block_signals() -> Result<libc::sigset_t, String> {
         if libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) != 0 {
             return Err(os_err("sigprocmask(SIG_BLOCK)"));
         }
-        Ok(set)
+        Ok(Signals { set })
     }
 }
 
-fn launch(p: &Policy, mut l: Launch, svc: Services) -> Result<i32, String> {
+impl Signals {
+    /// A signal that arrived during setup and means "stop": nothing is
+    /// started then.
+    fn check_pending(&self) -> Result<(), String> {
+        // SAFETY: zeroed sigset is valid output storage.
+        let mut pending: libc::sigset_t = unsafe { std::mem::zeroed() };
+        // SAFETY: pending is valid.
+        if unsafe { libc::sigpending(&mut pending) } != 0 {
+            return Err(os_err("sigpending"));
+        }
+        // SAFETY: membership test on a set the kernel filled.
+        let has = |s| unsafe { libc::sigismember(&pending, s) } == 1;
+        if has(fatal_signal()) {
+            return Err(log::fatal_message().unwrap_or_else(|| "sbx failed during setup".into()));
+        }
+        for s in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+            if has(s) {
+                return Err(format!("received signal {s} during setup; not starting the program"));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn launch(p: &Policy, mut l: Launch, svc: Services, sig: &Signals, cg: Option<&Delegation>) -> Result<Ran, SetupError> {
     // SAFETY: getpid has no preconditions.
     let am_pid1 = unsafe { libc::getpid() } == 1;
     if !am_pid1 {
         // Orphaned descendants get reparented to us so we can reap and kill them.
         // SAFETY: plain prctl.
         if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
-            return Err(os_err("prctl(PR_SET_CHILD_SUBREAPER)"));
+            return Err(os_err("prctl(PR_SET_CHILD_SUBREAPER)")).at(Stage::Launch);
         }
     }
-    let set = block_signals()?;
-    let (err_r, err_w) = pipe()?;
-    let (sock_parent, sock_child) = socketpair()?;
+    sig.check_pending().at(Stage::Launch)?;
+    let (err_r, err_w) = pipe().at(Stage::Launch)?;
+    let (sock_parent, sock_child) = socketpair().at(Stage::Launch)?;
     // SAFETY: getpid has no preconditions.
     let parent_pid = unsafe { libc::getpid() };
 
     // SAFETY: the supervisor is single-threaded at this point.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
-        return Err(os_err("fork"));
+        return Err(os_err("fork")).at(Stage::Launch);
     }
     if pid == 0 {
         drop(err_r);
         drop(sock_parent);
         let (stage, e) = child(p, &mut l, err_w.as_raw_fd(), sock_child.as_raw_fd(), parent_pid);
-        let msg = format!("{stage}: {e}");
+        let msg = format!("{}: {e}", stage.as_str());
         // SAFETY: report and exit without running destructors.
         unsafe {
             libc::write(err_w.as_raw_fd(), msg.as_ptr().cast(), msg.len());
-            libc::_exit(if stage == "execve" { 127 } else { 125 });
+            libc::_exit(stage.exit_code());
         }
     }
 
@@ -171,36 +202,45 @@ fn launch(p: &Policy, mut l: Launch, svc: Services) -> Result<i32, String> {
     drop(sock_child);
     let listener = match notify::recv_fd(sock_parent.as_raw_fd()) {
         Ok(Received::Fd(fd)) => fd,
-        Ok(Received::Eof) | Ok(Received::Text(_)) => return child_setup_failed(pid, err_r),
+        Ok(Received::Eof) | Ok(Received::Text(_)) => return Err(child_setup_failed(pid, err_r, cg)),
         Err(e) => {
             kill_and_wait(pid);
-            return Err(format!("receiving the seccomp listener from the child: {e}"));
+            return Err(format!("receiving the seccomp listener from the child: {e}")).at(Stage::Listener);
         }
     };
     drop(sock_parent);
 
     let stats = Arc::new(Stats::default());
-    if let Err(e) = start_services(p, &l, listener, svc, &stats) {
-        kill_and_wait(pid);
-        return Err(e);
-    }
+    let dispatcher = match start_services(p, &l, listener, svc, &stats) {
+        Ok(d) => d,
+        Err(e) => {
+            kill_and_wait(pid);
+            return Err(e).at(Stage::Services);
+        }
+    };
 
     // EOF on the close-on-exec pipe means execve succeeded.
     let mut msg = String::new();
     if let Err(e) = std::fs::File::from(err_r).read_to_string(&mut msg) {
         kill_and_wait(pid);
-        return Err(format!("reading the child's setup status: {e}"));
+        return Err(format!("reading the child's setup status: {e}")).at(Stage::Launch);
     }
     if !msg.is_empty() {
-        return Ok(report_child_failure(pid, &msg));
+        return Err(child_failure(pid, &msg, cg));
     }
     log::info(format!("started pid {pid}"));
-    Ok(supervise(p, pid, am_pid1, &set, &stats))
+    Ok(supervise(p, pid, am_pid1, sig, &stats, dispatcher, cg))
 }
 
-fn start_services(p: &Policy, l: &Launch, listener: OwnedFd, svc: Services, stats: &Arc<Stats>) -> Result<(), String> {
+fn start_services(
+    p: &Policy,
+    l: &Launch,
+    listener: OwnedFd,
+    svc: Services,
+    stats: &Arc<Stats>,
+) -> Result<JoinHandle<()>, String> {
     let listener = Arc::new(Listener::new(listener)?);
-    Dispatcher {
+    let dispatcher = Dispatcher {
         listener,
         table: l.seccomp.table.clone(),
         on_violation: p.seccomp.on_violation,
@@ -212,46 +252,68 @@ fn start_services(p: &Policy, l: &Launch, listener: OwnedFd, svc: Services, stat
         let egress = svc.egress.ok_or("BUG: DNS proxy without an egress filter")?;
         dns::Proxy::spawn(tcp, cfg, egress)?;
     }
-    Ok(())
+    Ok(dispatcher)
 }
 
-fn child_setup_failed(pid: libc::pid_t, err_r: OwnedFd) -> Result<i32, String> {
+fn child_setup_failed(pid: libc::pid_t, err_r: OwnedFd, cg: Option<&Delegation>) -> SetupError {
     let mut msg = String::new();
     if let Err(e) = std::fs::File::from(err_r).read_to_string(&mut msg) {
         kill_and_wait(pid);
-        return Err(format!("reading the child's setup status: {e}"));
+        return SetupError {
+            stage: Stage::Launch,
+            errors: vec![format!("reading the child's setup status: {e}")],
+        };
     }
     if msg.is_empty() {
-        msg = "the child exited without reporting an error".into();
+        msg = "launch: the child exited without reporting an error".into();
     }
-    Ok(report_child_failure(pid, &msg))
+    child_failure(pid, &msg, cg)
 }
 
-fn report_child_failure(pid: libc::pid_t, msg: &str) -> i32 {
-    log::error(format!("sandbox setup failed in the child: {msg}"));
-    if msg.starts_with("execve") && msg.contains("Permission denied") {
-        log::error("hint: the program (and its interpreter) need 'x' in an fs rule, e.g. --rx /opt/app");
+/// The child's `"stage: message"` report, once the child is reaped.
+fn child_failure(pid: libc::pid_t, msg: &str, cg: Option<&Delegation>) -> SetupError {
+    let (stage, detail) = Stage::from_prefix(msg).unwrap_or((Stage::Launch, msg));
+    let mut errors = vec![format!(
+        "sandbox setup failed in the child: {}: {detail}",
+        stage.as_str()
+    )];
+    if stage == Stage::Execve && detail.contains("Permission denied") {
+        errors.push("hint: the program (and its interpreter) need 'x' in an fs rule, e.g. --rx /opt/app".into());
     }
-    match wait_for(pid) {
-        Ok(st) if libc::WIFEXITED(st) => libc::WEXITSTATUS(st),
-        Ok(_) => 125,
-        Err(e) => {
-            log::error(e);
-            125
-        }
+    if let Err(e) = wait_for(pid, &mut Usage::default()) {
+        errors.push(e);
     }
+    if cg.is_some_and(|c| c.oom_kills() > 0) {
+        errors.push("hint: the OOM killer killed the child during setup; raise cgroup.memory_mb".into());
+    }
+    SetupError { stage, errors }
 }
 
-fn wait_for(pid: libc::pid_t) -> Result<libc::c_int, String> {
+/// waitpid that adds the reaped process's resource usage (which includes
+/// the descendants it waited for itself) to `usage`. Ok(None): WNOHANG and
+/// nothing has exited.
+fn wait(pid: libc::pid_t, flags: libc::c_int, usage: &mut Usage) -> Result<Option<(libc::pid_t, libc::c_int)>, i32> {
     let mut st = 0;
+    // SAFETY: zeroed rusage is valid output storage.
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: waiting for our own children; st and ru are valid.
+    let r = unsafe { libc::wait4(pid, &mut st, flags, &mut ru) };
+    if r < 0 {
+        return Err(errno());
+    }
+    if r == 0 {
+        return Ok(None);
+    }
+    *usage = usage.combine(Usage::from_rusage(&ru));
+    Ok(Some((r, st)))
+}
+
+fn wait_for(pid: libc::pid_t, usage: &mut Usage) -> Result<libc::c_int, String> {
     loop {
-        // SAFETY: waiting for our own child.
-        let r = unsafe { libc::waitpid(pid, &mut st, 0) };
-        if r == pid {
-            return Ok(st);
-        }
-        if errno() != libc::EINTR {
-            return Err(os_err(format!("waitpid({pid})")));
+        match wait(pid, 0, usage) {
+            Ok(Some((_, st))) => return Ok(st),
+            Err(libc::EINTR) | Ok(None) => continue,
+            Err(e) => return Err(format!("waitpid({pid}): {}", std::io::Error::from_raw_os_error(e))),
         }
     }
 }
@@ -261,43 +323,49 @@ fn kill_and_wait(pid: libc::pid_t) {
     if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 && errno() != libc::ESRCH {
         log::error(os_err(format!("kill({pid}, SIGKILL)")));
     }
-    if let Err(e) = wait_for(pid) {
+    if let Err(e) = wait_for(pid, &mut Usage::default()) {
         log::error(e);
     }
 }
 
 /// Runs in the forked child. Returns only on failure.
-fn child(p: &Policy, l: &mut Launch, err_fd: RawFd, sock_fd: RawFd, parent: libc::pid_t) -> (&'static str, String) {
+fn child(p: &Policy, l: &mut Launch, err_fd: RawFd, sock_fd: RawFd, parent: libc::pid_t) -> (Stage, String) {
+    // First, so everything the child does from here on is charged to the sandbox.
+    if let Some(fd) = l.cgroup_procs {
+        if let Err(e) = cgroup::join(fd) {
+            return (Stage::Cgroup, e);
+        }
+    }
     // SAFETY (whole function): we are the only thread of a freshly forked child.
     unsafe {
         // Own session and process group: no controlling terminal, killable as a group.
         if libc::setsid() < 0 {
-            return ("setsid", os_err("setsid"));
+            return (Stage::Setsid, os_err("setsid"));
         }
         let wd = match CString::new(p.process.workdir.as_os_str().as_bytes()) {
             Ok(c) => c,
-            Err(_) => return ("chdir", "process.workdir contains a NUL byte".into()),
+            Err(_) => return (Stage::Chdir, "process.workdir contains a NUL byte".into()),
         };
         if libc::chdir(wd.as_ptr()) != 0 {
-            return ("chdir", os_err(p.process.workdir.display()));
+            return (Stage::Chdir, os_err(p.process.workdir.display()));
         }
     }
     if let Err(e) = set_limits(p) {
-        return ("setrlimit", e);
+        return (Stage::Setrlimit, e);
     }
     if let Err(e) = drop_identity(p) {
-        return ("identity", e);
+        return (Stage::Identity, e);
     }
     unsafe {
         // Must come after the uid change, which clears it. Kills the child if sbx dies.
         if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
-            return ("pdeathsig", os_err("prctl(PR_SET_PDEATHSIG)"));
+            return (Stage::Pdeathsig, os_err("prctl(PR_SET_PDEATHSIG)"));
         }
         if libc::getppid() != parent {
-            return ("pdeathsig", "the supervisor exited during setup".into());
+            return (Stage::Pdeathsig, "the supervisor exited during setup".into());
         }
         if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-            return ("no_new_privs", os_err("prctl(PR_SET_NO_NEW_PRIVS)"));
+            return (Stage::NoNewPrivs, os_err("prctl(PR_SET_NO_NEW_PRIVS)"));
         }
     }
     // Everything the child needs after its policy filter is installed is
@@ -310,36 +378,36 @@ fn child(p: &Policy, l: &mut Launch, err_fd: RawFd, sock_fd: RawFd, parent: libc
     match (l.landlock.take(), p.landlock.abi) {
         (Some(rs), _) => {
             if let Err(e) = landlock_layer::enforce(rs) {
-                return ("landlock", e);
+                return (Stage::Landlock, e);
             }
         }
         (None, LandlockAbi::Off) => {}
-        (None, LandlockAbi::V(_)) => return ("landlock", "BUG: no Landlock ruleset".into()),
+        (None, LandlockAbi::V(_)) => return (Stage::Landlock, "BUG: no Landlock ruleset".into()),
     }
     if let Err(e) = seccomp_layer::install_prelude(&l.seccomp.prelude) {
-        return ("seccomp", e);
+        return (Stage::Seccomp, e);
     }
     let listener = match seccomp_layer::install_with_listener(&l.seccomp.main) {
         Ok(fd) => fd,
-        Err(e) => return ("seccomp", e),
+        Err(e) => return (Stage::Seccomp, e),
     };
     if let Err(e) = notify::send_fd(sock_fd, listener) {
-        return ("seccomp", format!("handing the listener to the supervisor: {e}"));
+        return (Stage::Seccomp, format!("handing the listener to the supervisor: {e}"));
     }
     unsafe {
         libc::close(listener);
         libc::close(sock_fd);
     }
     if let Err(e) = close_fds_except(err_fd) {
-        return ("close_range", e);
+        return (Stage::CloseRange, e);
     }
     if let Err(e) = reset_signals() {
-        return ("signals", e);
+        return (Stage::Signals, e);
     }
 
     // SAFETY: argv/envp are NULL-terminated arrays of live C strings.
     unsafe { libc::execve(l.exe.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
-    ("execve", os_err(l.exe.to_string_lossy()))
+    (Stage::Execve, os_err(l.exe.to_string_lossy()))
 }
 
 fn set_limits(p: &Policy) -> Result<(), String> {
@@ -526,7 +594,15 @@ fn reset_signals() -> Result<(), String> {
     Ok(())
 }
 
-fn supervise(p: &Policy, child: libc::pid_t, am_pid1: bool, set: &libc::sigset_t, stats: &Stats) -> i32 {
+fn supervise(
+    p: &Policy,
+    child: libc::pid_t,
+    am_pid1: bool,
+    sig: &Signals,
+    stats: &Stats,
+    dispatcher: JoinHandle<()>,
+    cg: Option<&Delegation>,
+) -> Ran {
     let started = Instant::now();
     let deadline = match p.process.timeout_secs {
         Timeout::Secs(n) => Some(started + Duration::from_secs(n)),
@@ -536,6 +612,13 @@ fn supervise(p: &Policy, child: libc::pid_t, am_pid1: bool, set: &libc::sigset_t
     let mut kill_at: Option<Instant> = None;
     let mut timed_out = false;
     let mut fatal = false;
+    // Whether sbx killed the tree before the program exited.
+    let mut killed = false;
+    let mut usage = Usage::default();
+    let kill = |killed: &mut bool| {
+        *killed = true;
+        kill_tree(child, am_pid1, cg);
+    };
 
     let status = loop {
         let now = Instant::now();
@@ -546,13 +629,13 @@ fn supervise(p: &Policy, child: libc::pid_t, am_pid1: bool, set: &libc::sigset_t
                     "timeout after {}s, killing the sandbox",
                     d.duration_since(started).as_secs()
                 ));
-                kill_tree(child, am_pid1);
+                kill(&mut killed);
             }
         }
         if let Some(k) = kill_at {
             if now >= k {
                 log::info("grace period over, sending SIGKILL");
-                kill_tree(child, am_pid1);
+                kill(&mut killed);
                 kill_at = None;
             }
         }
@@ -567,95 +650,189 @@ fn supervise(p: &Policy, child: libc::pid_t, am_pid1: bool, set: &libc::sigset_t
         // SAFETY: zeroed siginfo is valid output storage.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         // SAFETY: set and info are valid; ts is either null or a valid timespec.
-        let sig =
-            unsafe { libc::sigtimedwait(set, &mut info, ts.as_ref().map_or(std::ptr::null(), |t| t as *const _)) };
-        if sig < 0 {
+        let s = unsafe {
+            libc::sigtimedwait(
+                &sig.set,
+                &mut info,
+                ts.as_ref().map_or(std::ptr::null(), |t| t as *const _),
+            )
+        };
+        if s < 0 {
             match errno() {
                 libc::EAGAIN | libc::EINTR => continue,
                 _ => {
-                    log::error(os_err("sigtimedwait"));
+                    log::raise_fatal(&os_err("sigtimedwait"));
                     fatal = true;
-                    kill_tree(child, am_pid1);
-                    match wait_for(child) {
-                        Ok(st) => break st,
+                    kill(&mut killed);
+                    match wait_for(child, &mut usage) {
+                        Ok(st) => break Some(st),
                         Err(e) => {
                             log::error(e);
-                            return 125;
+                            break None;
                         }
                     }
                 }
             }
         }
-        if sig == libc::SIGCHLD {
-            if let Some(st) = reap(child) {
-                break st;
+        if s == libc::SIGCHLD {
+            if let Some(st) = reap(child, &mut usage) {
+                break Some(st);
             }
             continue;
         }
-        if sig == notify::fatal_signal() {
+        if s == fatal_signal() {
             fatal = true;
-            kill_tree(child, am_pid1);
+            kill(&mut killed);
             continue;
         }
         // Forward termination and user signals to the sandbox's process group.
         // SAFETY: signalling our child's process group.
-        if unsafe { libc::kill(-child, sig) } != 0 && errno() != libc::ESRCH {
-            log::error(os_err(format!("forwarding signal {sig} to the sandbox")));
+        if unsafe { libc::kill(-child, s) } != 0 && errno() != libc::ESRCH {
+            log::error(os_err(format!("forwarding signal {s} to the sandbox")));
         }
-        if matches!(sig, libc::SIGTERM | libc::SIGINT | libc::SIGHUP | libc::SIGQUIT) {
+        if matches!(s, libc::SIGTERM | libc::SIGINT | libc::SIGHUP | libc::SIGQUIT) {
             if kill_at.is_some() {
-                kill_tree(child, am_pid1); // second signal: don't wait
+                kill(&mut killed); // second signal: don't wait
             } else {
                 kill_at = Some(Instant::now() + grace);
             }
         }
     };
+    let wall = started.elapsed();
 
     // The main program is gone; nothing it left behind may outlive it.
-    kill_tree(child, am_pid1);
-    reap_all(am_pid1);
+    let killed_after_exit = (!killed).then(|| leftovers(am_pid1, cg));
+    if let Some(n @ 1..) = killed_after_exit {
+        log::info(format!(
+            "killing {n} process(es) still running after the program exited"
+        ));
+    }
+    kill_tree(child, am_pid1, cg);
+    reap_all(am_pid1, &mut usage);
+    // The listener reports POLLHUP once no sandboxed task is left, so the
+    // dispatcher returns and the denial counts are final.
+    let until = Instant::now() + Duration::from_secs(2);
+    while !dispatcher.is_finished() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    if dispatcher.is_finished() {
+        let _ = dispatcher.join();
+    } else {
+        log::warn("the seccomp notification thread is still running; the denial counts may be incomplete");
+    }
     for line in stats.summary() {
         log::info(format!("repeated: {line}"));
     }
 
-    let code = if fatal {
-        125
-    } else if timed_out {
-        124
-    } else if libc::WIFEXITED(status) {
-        libc::WEXITSTATUS(status)
-    } else if libc::WIFSIGNALED(status) {
-        let s = libc::WTERMSIG(status);
-        log::info(format!("program killed by signal {s}"));
-        128 + s
-    } else {
-        log::error(format!("unexpected wait status {status:#x}"));
-        125
-    };
-    log::info(format!("exit {code} after {:.1}s", started.elapsed().as_secs_f64()));
-    code
+    let program = status.and_then(Program::from_wait_status);
+    match (status, program) {
+        (_, Some(Program::Signaled(s))) => log::info(format!("program killed by signal {s}")),
+        (Some(st), None) => log::error(format!("unexpected wait status {st:#x}")),
+        _ => {}
+    }
+    let code = report::exit_code(fatal, timed_out, program);
+    log::info(format!("exit {code} after {:.1}s", wall.as_secs_f64()));
+    Ran {
+        exit_code: code,
+        program,
+        timed_out,
+        supervisor_error: if fatal { log::fatal_message() } else { None },
+        denials: stats.denials(),
+        killed_after_exit,
+        wall_ms: wall.as_millis() as u64,
+        usage,
+        cgroup: None,
+    }
 }
 
 /// Reap whatever has exited; return the main child's status once it has.
-fn reap(child: libc::pid_t) -> Option<libc::c_int> {
+fn reap(child: libc::pid_t, usage: &mut Usage) -> Option<libc::c_int> {
     let mut main = None;
     loop {
-        let mut st = 0;
-        // SAFETY: non-blocking wait for any child.
-        let r = unsafe { libc::waitpid(-1, &mut st, libc::WNOHANG) };
-        if r < 0 && errno() != libc::ECHILD {
-            log::error(os_err("waitpid(-1)"));
-        }
-        if r <= 0 {
-            return main;
-        }
-        if r == child {
-            main = Some(st);
+        match wait(-1, libc::WNOHANG, usage) {
+            Ok(Some((pid, st))) if pid == child => main = Some(st),
+            Ok(Some(_)) => {}
+            Ok(None) | Err(libc::ECHILD) => return main,
+            Err(libc::EINTR) => {}
+            Err(e) => {
+                log::error(format!("waitpid(-1): {}", std::io::Error::from_raw_os_error(e)));
+                return main;
+            }
         }
     }
 }
 
-fn kill_tree(child: libc::pid_t, am_pid1: bool) {
+/// How many sandboxed processes (not zombies) are still running.
+fn leftovers(am_pid1: bool, cg: Option<&Delegation>) -> u32 {
+    if let Some(c) = cg {
+        match c.live_processes() {
+            Ok(n) => return n,
+            Err(e) => log::error(format!("counting the processes left in the sandbox cgroup: {e}")),
+        }
+    }
+    // SAFETY: getpid has no preconditions.
+    let me = unsafe { libc::getpid() };
+    live_descendants(&proc_table(), me, am_pid1)
+}
+
+/// One /proc entry: (pid, parent pid, is a zombie).
+type ProcEntry = (libc::pid_t, libc::pid_t, bool);
+
+/// Live processes below `root`: with `everything` (sbx is PID 1 of the
+/// container), every process but `root` itself.
+fn live_descendants(procs: &[ProcEntry], root: libc::pid_t, everything: bool) -> u32 {
+    let below: BTreeSet<libc::pid_t> = if everything {
+        procs
+            .iter()
+            .map(|&(pid, _, _)| pid)
+            .filter(|&pid| pid != root)
+            .collect()
+    } else {
+        let mut below = BTreeSet::new();
+        let mut parents = vec![root];
+        while let Some(parent) = parents.pop() {
+            for &(pid, ppid, _) in procs {
+                if ppid == parent && pid != root && below.insert(pid) {
+                    parents.push(pid);
+                }
+            }
+        }
+        below
+    };
+    procs
+        .iter()
+        .filter(|&&(pid, _, zombie)| !zombie && below.contains(&pid))
+        .count() as u32
+}
+
+fn proc_table() -> Vec<ProcEntry> {
+    let dir = match std::fs::read_dir("/proc") {
+        Ok(d) => d,
+        Err(e) => {
+            log::error(format!("cannot list /proc to find leftover sandbox processes: {e}"));
+            return vec![];
+        }
+    };
+    dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<libc::pid_t>().ok())
+        .filter_map(|pid| {
+            // "pid (comm) state ppid ...": comm may contain anything, so split at its last ')'.
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let (_, rest) = stat.rsplit_once(')')?;
+            let mut f = rest.split_whitespace();
+            let state = f.next()?;
+            let ppid = f.next()?.parse().ok()?;
+            Some((pid, ppid, state == "Z"))
+        })
+        .collect()
+}
+
+fn kill_tree(child: libc::pid_t, am_pid1: bool, cg: Option<&Delegation>) {
+    // The sandbox cgroup holds every sandboxed process, whatever its session.
+    if let Some(c) = cg {
+        if let Err(e) = c.kill() {
+            log::error(e);
+        }
+    }
     // SAFETY: signalling our own descendants.
     unsafe {
         if libc::kill(-child, libc::SIGKILL) != 0 && errno() != libc::ESRCH {
@@ -680,30 +857,29 @@ fn kill_tree(child: libc::pid_t, am_pid1: bool) {
     }
 }
 
-fn reap_all(am_pid1: bool) {
+fn reap_all(am_pid1: bool, usage: &mut Usage) {
     let until = Instant::now() + Duration::from_secs(5);
     loop {
-        let mut st = 0;
-        // SAFETY: non-blocking wait for any child.
-        let r = unsafe { libc::waitpid(-1, &mut st, libc::WNOHANG) };
-        if r < 0 {
-            if errno() != libc::ECHILD {
-                log::error(os_err("waitpid(-1)"));
-            }
-            return;
-        }
-        if r == 0 {
-            if Instant::now() > until {
-                log::error("some sandboxed processes did not exit within 5s of SIGKILL");
+        match wait(-1, libc::WNOHANG, usage) {
+            Ok(Some(_)) | Err(libc::EINTR) => {}
+            Err(libc::ECHILD) => return,
+            Err(e) => {
+                log::error(format!("waitpid(-1): {}", std::io::Error::from_raw_os_error(e)));
                 return;
             }
-            if !am_pid1 {
-                for pid in own_children() {
-                    // SAFETY: signalling our own child.
-                    unsafe { libc::kill(pid, libc::SIGKILL) };
+            Ok(None) => {
+                if Instant::now() > until {
+                    log::error("some sandboxed processes did not exit within 5s of SIGKILL");
+                    return;
                 }
+                if !am_pid1 {
+                    for pid in own_children() {
+                        // SAFETY: signalling our own child.
+                        unsafe { libc::kill(pid, libc::SIGKILL) };
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
             }
-            std::thread::sleep(Duration::from_millis(10));
         }
     }
 }
@@ -711,19 +887,50 @@ fn reap_all(am_pid1: bool) {
 fn own_children() -> Vec<libc::pid_t> {
     // SAFETY: getpid has no preconditions.
     let me = unsafe { libc::getpid() };
-    let dir = match std::fs::read_dir("/proc") {
-        Ok(d) => d,
-        Err(e) => {
-            log::error(format!("cannot list /proc to find leftover sandbox processes: {e}"));
-            return vec![];
-        }
-    };
-    dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<libc::pid_t>().ok())
-        .filter(|&pid| {
-            std::fs::read_to_string(format!("/proc/{pid}/stat")).ok().and_then(|s| {
-                s.rsplit_once(')')
-                    .and_then(|(_, rest)| rest.split_whitespace().nth(1)?.parse().ok())
-            }) == Some(me)
-        })
+    proc_table()
+        .into_iter()
+        .filter(|&(_, ppid, _)| ppid == me)
+        .map(|(pid, _, _)| pid)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// A random forest of processes: entry i's parent is an earlier entry,
+    /// or a process outside the tree.
+    fn table() -> impl Strategy<Value = Vec<ProcEntry>> {
+        prop::collection::vec((any::<prop::sample::Index>(), any::<bool>(), any::<bool>()), 0..40).prop_map(|v| {
+            let mut t: Vec<ProcEntry> = vec![(1, 0, false)];
+            for (i, (parent, outside, zombie)) in v.into_iter().enumerate() {
+                let pid = 2 + i as libc::pid_t;
+                let ppid = if outside { 1000 } else { t[parent.index(t.len())].0 };
+                t.push((pid, ppid, zombie));
+            }
+            t
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn leftovers_are_the_live_descendants(t in table(), root_ix in any::<prop::sample::Index>()) {
+            let root = t[root_ix.index(t.len())].0;
+            let n = live_descendants(&t, root, false);
+            // Brute force: follow each process's parents up to the root.
+            let parent = |pid| t.iter().find(|e| e.0 == pid).map(|e| e.1);
+            let below = |mut pid| loop {
+                match parent(pid) {
+                    Some(pp) if pp == root => return true,
+                    Some(pp) => pid = pp,
+                    None => return false,
+                }
+            };
+            let want = t.iter().filter(|e| e.0 != root && !e.2 && below(e.0)).count() as u32;
+            prop_assert_eq!(n, want);
+            let all = t.iter().filter(|e| e.0 != root && !e.2).count() as u32;
+            prop_assert_eq!(live_descendants(&t, root, true), all);
+        }
+    }
 }

@@ -28,6 +28,14 @@ fsize_mb = 1024
 as_mb = "unlimited"        # an address-space cap breaks Go, the JVM and V8
 cpu_secs = "unlimited"
 
+# Limits for the whole sandbox in a cgroup of its own. "delegated" needs a
+# writable cgroup v2 that holds only sbx (see the README, "cgroup limits"),
+# which plain Docker and Kubernetes containers do not give; then also set
+#   memory_mb = 512          # memory.max (swap off); page cache and tmpfs count
+#   pids = 256               # pids.max: processes and threads
+[cgroup]
+mode = "off"               # off | delegated
+
 [env]
 pass = []                  # names copied from sbx's environment; each must be set
 [env.set]

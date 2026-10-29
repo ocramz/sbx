@@ -32,6 +32,8 @@ pub const ENV_VARS: &[&str] = &[
     "SBX_ENV_PASS",
     "SBX_SECCOMP_ACTION",
     "SBX_QUIET",
+    "SBX_REPORT_FILE",
+    "SBX_LOG_FILE",
 ];
 
 /// Highest Landlock ABI this build knows how to enforce.
@@ -45,6 +47,7 @@ pub struct Policy {
     pub landlock: LandlockCfg,
     pub process: ProcessCfg,
     pub limits: Limits,
+    pub cgroup: CgroupCfg,
     pub env: EnvCfg,
     pub network: NetworkCfg,
     pub seccomp: SeccompCfg,
@@ -90,6 +93,69 @@ pub struct Limits {
     pub fsize_mb: Limit,
     pub as_mb: Limit,
     pub cpu_secs: Limit,
+}
+
+/// cgroup v2 limits for the whole sandbox (see the README, "cgroup limits").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawCgroup", into = "RawCgroup")]
+pub enum CgroupCfg {
+    /// No cgroup of its own: the sandbox shares the container's limits.
+    Off,
+    /// The program runs in a child of sbx's own cgroup, which must be
+    /// delegated to sbx: memory.max (swap off) and pids.max.
+    Delegated { memory_mb: Limit, pids: Limit },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CgroupMode {
+    Off,
+    Delegated,
+}
+
+/// The `[cgroup]` table as written: the limits exist only with "delegated".
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCgroup {
+    mode: CgroupMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    memory_mb: Option<Limit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pids: Option<Limit>,
+}
+
+impl TryFrom<RawCgroup> for CgroupCfg {
+    type Error = String;
+    fn try_from(r: RawCgroup) -> Result<Self, String> {
+        match (r.mode, r.memory_mb, r.pids) {
+            (CgroupMode::Off, None, None) => Ok(CgroupCfg::Off),
+            (CgroupMode::Off, _, _) => {
+                Err("cgroup.memory_mb and cgroup.pids are only used with mode = \"delegated\"".into())
+            }
+            (CgroupMode::Delegated, Some(memory_mb), Some(pids)) => Ok(CgroupCfg::Delegated { memory_mb, pids }),
+            (CgroupMode::Delegated, m, _) => Err(format!(
+                "cgroup.mode = \"delegated\" needs cgroup.{} (a number or \"unlimited\")",
+                if m.is_none() { "memory_mb" } else { "pids" }
+            )),
+        }
+    }
+}
+
+impl From<CgroupCfg> for RawCgroup {
+    fn from(c: CgroupCfg) -> Self {
+        match c {
+            CgroupCfg::Off => RawCgroup {
+                mode: CgroupMode::Off,
+                memory_mb: None,
+                pids: None,
+            },
+            CgroupCfg::Delegated { memory_mb, pids } => RawCgroup {
+                mode: CgroupMode::Delegated,
+                memory_mb: Some(memory_mb),
+                pids: Some(pids),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -415,6 +481,8 @@ pub struct Overrides {
     pub env_pass: Vec<String>,
     pub on_violation: Option<Violation>,
     pub quiet: Option<bool>,
+    pub report: Option<PathBuf>,
+    pub log: Option<PathBuf>,
 }
 
 impl Overrides {
@@ -489,6 +557,12 @@ impl Overrides {
         if let Some(v) = get("SBX_QUIET", &mut e2) {
             set(parse_bool("SBX_QUIET", &v).map(|b| o.quiet = Some(b)));
         }
+        if let Some(v) = get("SBX_REPORT_FILE", &mut e2) {
+            o.report = Some(PathBuf::from(v));
+        }
+        if let Some(v) = get("SBX_LOG_FILE", &mut e2) {
+            o.log = Some(PathBuf::from(v));
+        }
         errs.extend(e2);
         if errs.is_empty() {
             Ok(o)
@@ -512,6 +586,8 @@ impl Overrides {
         self.env_pass.extend(flags.env_pass);
         self.on_violation = flags.on_violation.or(self.on_violation);
         self.quiet = flags.quiet.or(self.quiet);
+        self.report = flags.report.or(self.report);
+        self.log = flags.log.or(self.log);
         self
     }
 }
@@ -623,9 +699,27 @@ pub fn parse_egress_rule(s: &str) -> Result<EgressRule, String> {
     Ok(rule)
 }
 
+/// A limit is never 0, and `n << shift` (MiB to bytes) must fit in a u64.
+fn check_limit(name: &str, v: Limit, shift: u32, errs: &mut Vec<String>) {
+    if let Limit::Value(n) = v {
+        if n == 0 {
+            errs.push(format!("{name} = 0 is not allowed"));
+        } else if n.checked_shl(shift).filter(|s| s >> shift == n).is_none() {
+            errs.push(format!("{name} = {n} is too large"));
+        }
+    }
+}
+
 impl Policy {
     pub fn parse(src: &str, origin: &Path) -> Result<Self, String> {
-        toml::from_str(src).map_err(|e| format!("invalid policy {}: {e}", origin.display()))
+        toml::from_str(src).map_err(|e| {
+            let hint = if e.message().contains("missing field `cgroup`") {
+                "\nhint: [cgroup] is new in sbx v0.3; add it with mode = \"off\" to keep v0.2's behaviour"
+            } else {
+                ""
+            };
+            format!("invalid policy {}: {e}{hint}", origin.display())
+        })
     }
 
     /// Load the policy file named by the overrides, apply the overrides and
@@ -841,19 +935,14 @@ impl Policy {
         if l.nofile == 0 {
             errs.push("limits.nofile must be at least 1".into());
         }
-        let check = |name: &str, v: Limit, shift: u32, errs: &mut Vec<String>| {
-            if let Limit::Value(n) = v {
-                if n == 0 {
-                    errs.push(format!("limits.{name} = 0 is not allowed"));
-                } else if n.checked_shl(shift).filter(|s| s >> shift == n).is_none() {
-                    errs.push(format!("limits.{name} = {n} is too large"));
-                }
-            }
-        };
-        check("nproc", l.nproc, 0, errs);
-        check("fsize_mb", l.fsize_mb, 20, errs);
-        check("as_mb", l.as_mb, 20, errs);
-        check("cpu_secs", l.cpu_secs, 0, errs);
+        check_limit("limits.nproc", l.nproc, 0, errs);
+        check_limit("limits.fsize_mb", l.fsize_mb, 20, errs);
+        check_limit("limits.as_mb", l.as_mb, 20, errs);
+        check_limit("limits.cpu_secs", l.cpu_secs, 0, errs);
+        if let CgroupCfg::Delegated { memory_mb, pids } = self.cgroup {
+            check_limit("cgroup.memory_mb", memory_mb, 20, errs);
+            check_limit("cgroup.pids", pids, 0, errs);
+        }
     }
 
     fn validate_env(&self, errs: &mut Vec<String>) {
@@ -1080,6 +1169,9 @@ fsize_mb = 1024
 as_mb = "unlimited"
 cpu_secs = "unlimited"
 
+[cgroup]
+mode = "off"
+
 [env]
 pass = []
 [env.set]
@@ -1142,6 +1234,7 @@ access = "rw"
             "pass = []",
             "bind_tcp = []",
             "on_violation = \"errno\"",
+            "mode = \"off\"",
         ] {
             let src = MINIMAL.replacen(line, "", 1);
             let e = parse(&src).unwrap_err();
@@ -1166,6 +1259,73 @@ access = "rw"
         assert!(parse(&src).is_err());
         let src = MINIMAL.replacen("mode = \"none\"", "mode = \"restricted\"", 1);
         assert!(parse(&src).is_err());
+    }
+
+    #[test]
+    fn the_cgroup_table_is_required_with_an_upgrade_hint() {
+        let src = MINIMAL.replacen("[cgroup]\nmode = \"off\"\n", "", 1);
+        let e = parse(&src).unwrap_err();
+        assert!(
+            e.contains("missing field `cgroup`") && e.contains("new in sbx v0.3"),
+            "{e}"
+        );
+    }
+
+    fn with_cgroup(body: &str) -> String {
+        MINIMAL.replacen("[cgroup]\nmode = \"off\"", &format!("[cgroup]\n{body}"), 1)
+    }
+
+    #[test]
+    fn cgroup_limits_exist_only_when_delegated() {
+        let err = |body: &str| parse(&with_cgroup(body)).unwrap_err();
+        assert!(err("mode = \"off\"\npids = 5").contains("only used with mode"));
+        assert!(err("mode = \"delegated\"\nmemory_mb = 512").contains("needs cgroup.pids"));
+        assert!(err("mode = \"delegated\"\npids = 5").contains("needs cgroup.memory_mb"));
+        assert!(err("mode = \"delegated\"\nmemory_mb = 1\npids = 1\nswap_mb = 0").contains("unknown field"));
+        assert!(err("mode = \"on\"").contains("unknown variant"));
+        let p = parse(&with_cgroup(
+            "mode = \"delegated\"\nmemory_mb = 512\npids = \"unlimited\"",
+        ))
+        .unwrap();
+        assert_eq!(
+            p.cgroup,
+            CgroupCfg::Delegated {
+                memory_mb: Limit::Value(512),
+                pids: Limit::Unlimited
+            }
+        );
+    }
+
+    #[test]
+    fn cgroup_limits_are_checked_like_rlimits() {
+        let errs = |body: &str| parse(&with_cgroup(body)).unwrap().validate().unwrap_err();
+        let e = errs("mode = \"delegated\"\nmemory_mb = 0\npids = 1");
+        assert!(e.iter().any(|e| e.contains("cgroup.memory_mb = 0")), "{e:?}");
+        let e = errs(&format!(
+            "mode = \"delegated\"\nmemory_mb = {}\npids = 1",
+            u64::MAX >> 10
+        ));
+        assert!(
+            e.iter()
+                .any(|e| e.contains("cgroup.memory_mb") && e.contains("too large")),
+            "{e:?}"
+        );
+    }
+
+    fn limit() -> impl proptest::strategy::Strategy<Value = Limit> {
+        use proptest::prelude::*;
+        prop_oneof![Just(Limit::Unlimited), (0..i64::MAX as u64).prop_map(Limit::Value)]
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn cgroup_settings_survive_sbx_policy(memory_mb in limit(), pids in limit(), delegated: bool) {
+            let cg = if delegated { CgroupCfg::Delegated { memory_mb, pids } } else { CgroupCfg::Off };
+            let mut p = parse(MINIMAL).unwrap();
+            p.cgroup = cg;
+            let again = parse(&toml::to_string_pretty(&p).unwrap()).unwrap();
+            proptest::prop_assert_eq!(again.cgroup, cg);
+        }
     }
 
     #[test]

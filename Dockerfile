@@ -15,6 +15,10 @@ ARG BASE_IMAGE
 # so no C cross toolchain is needed.
 FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-slim-bookworm AS build
 ARG TARGETARCH
+# `git describe` of the checkout (.git is not in the build context), compiled
+# into `sbx version` and the report.
+ARG SBX_VERSION
+RUN test -n "${SBX_VERSION}" || { echo "SBX_VERSION is not set; build through the Makefile" >&2; exit 1; }
 ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
 RUN case "${TARGETARCH}" in \

@@ -173,6 +173,9 @@ print(f"  resolv.conf     {kind}: {' | '.join(read(RESOLV).splitlines())}")
 # Names listed here never reach the sbx DNS proxy: glibc reads /etc/hosts first.
 hosts = [l for l in read("/etc/hosts").splitlines() if l.strip() and not l.lstrip().startswith("#")]
 print(f"  hosts           {' | '.join(hosts)}")
+cgroup_mount = next((l.split()[3] for l in read("/proc/mounts").splitlines() if l.split()[1:2] == ["/sys/fs/cgroup"]), "?")
+print(f"  cgroup          {read('/proc/self/cgroup')}; /sys/fs/cgroup {cgroup_mount}; "
+      f"controllers: {read('/sys/fs/cgroup/cgroup.controllers')}; memory.max {read('/sys/fs/cgroup/memory.max')}")
 
 print("== probe")
 for name, pol in (("default policy", DEFAULT), ("egress example", EGRESS), ("no-Landlock example", NO_LANDLOCK)):
@@ -184,6 +187,16 @@ for name, pol in (("default policy", DEFAULT), ("egress example", EGRESS), ("no-
     else:
         check(f"probe: {name} is refused for lack of Landlock ABI 6", rc == 1 and "MISSING  landlock" in so,
               f"rc={rc}")
+
+# Whether this platform could give sbx a delegated cgroup: a fact, not a check.
+DELEGATED = "/tmp/sbx-live-delegated.toml"
+with open(NO_LANDLOCK) as f, open(DELEGATED, "w") as g:
+    g.write(f.read().replace('[cgroup]\nmode = "off"', '[cgroup]\nmode = "delegated"\nmemory_mb = 256\npids = 256 #', 1))
+rc, so, se = sbx([], DELEGATED, cmd="probe")
+for line in (so + se).splitlines():
+    if "cgroup" in line:
+        print(f"       {line}")
+os.unlink(DELEGATED)
 
 with open(live_net.__file__) as f:
     NET = f.read()

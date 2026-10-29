@@ -2,7 +2,7 @@
 
 `sbx` is a small (about 1.2 MB, static) Rust launcher that becomes the container's PID 1, builds a sandbox from an operator-supplied policy, and runs the untrusted program inside it. It uses unprivileged kernel APIs only (Landlock, seccomp-BPF with user notification, `no_new_privs`, rlimits): no `--privileged`, no `CAP_SYS_ADMIN`, no user namespaces.
 
-sbx is strict by design. Every protection the policy asks for must be enforceable on the running kernel and container, or sbx refuses to start and says why. It has no built-in defaults, no best-effort mode and no fallbacks, and every failure is logged with the operation, the object, the OS error and, where possible, a hint. Even Landlock can only be turned off explicitly, in the policy file ([Without Landlock](#without-landlock)).
+sbx is strict by design. Every protection the policy asks for must be enforceable on the running kernel and container, or sbx refuses to start and says why. It has no built-in defaults, no best-effort mode and no fallbacks, and every failure is logged with the operation, the object, the OS error and, where possible, a hint. Landlock can only be turned off explicitly, in the policy file ([Without Landlock](#without-landlock)).
 
 sbx runs one sandbox at a time, one per container.
 
@@ -18,19 +18,23 @@ sbx runs one sandbox at a time, one per container.
 | Volumes | Platform mounts happen before the entrypoint, so sbx opens the mount points and binds rules to them |
 | Configurable at start | A complete policy file, plus `SBX_*` variables and flags for per-run additions |
 | Fail loudly | Requirements are probed before anything starts; unknown or empty settings, symlinked or missing paths, and unsupported ABIs are errors |
+| Trustworthy outcome | `--report FILE`: a root-owned JSON report of how the run ended (exit code or signal, timeout, the setup stage that failed, denied syscalls, leftover processes, wall and CPU time, memory); `--log FILE` keeps sbx's own lines off the program's stderr ([Job report and log file](#job-report-and-log-file)) |
+| Memory and process limits | `[cgroup] mode = "delegated"`: the sandbox runs in a cgroup of its own with `memory.max` and `pids.max`, so an OOM kill hits the program, not sbx, and is reported ([cgroup limits](#cgroup-limits)) |
 
 ## Architecture
 
 ```
 container start
   sbx run [flags] -- PROGRAM ARGS        (PID 1, root, unsandboxed, never runs payload code)
+   │ 0. open the log file and the report's directory; block the signals sbx handles
    │ 1. resolve policy: file + SBX_* env + flags; validate everything, report every error
    │ 2. check requirements (Landlock ABI, seccomp listener round trip, close_range,
    │    identity, no other sandbox; egress: CAP_SYS_PTRACE, pidfd_getfd, DNS listener,
    │    resolv.conf), then claim the container's sandbox slot
-   │ 3. open allowed paths, build the Landlock ruleset, compile the BPF filters
+   │ 3. delegated cgroup: create the sandbox cgroup; open allowed paths, build the
+   │    Landlock ruleset, compile the BPF filters
    │ 4. fork
-   ├─ child ─ setsid → chdir → rlimits → empty capability bounding set
+   ├─ child ─ [join the sandbox cgroup] → setsid → chdir → rlimits → empty capability bounding set
    │          → setgroups/setresgid/setresuid(65534) → clear all capabilities (verified)
    │          → PDEATHSIG → NO_NEW_PRIVS → landlock_restrict_self
    │          → seccomp(prelude) → seccomp(policy, NEW_LISTENER | WAIT_KILLABLE_RECV)
@@ -40,11 +44,12 @@ container start
                DNS proxy threads (egress with domain rules)
                main loop: forward SIGTERM/INT/HUP/QUIT/USR1/USR2, enforce the timeout
                (exit 124), reap, kill everything left on exit, propagate the exit code
+               teardown: restore the cgroup and resolv.conf, write the report
 ```
 
 The sandbox slot is an abstract UNIX socket (`@sbx/sandbox`) that `sbx run` binds and holds until it exits. A second `sbx run` while one is running exits 125 ("another sbx sandbox is running"), and `sbx probe` reports it. Abstract sockets are per network namespace, so the slot covers the container on Cloud Run, the whole pod on Kubernetes, and the whole host with `docker run --network host`.
 
-Fallible work happens before `fork`, so a bad policy produces a clear error instead of a half-built sandbox. Setup failures in the child, including `execve` being denied by Landlock, are reported back over a close-on-exec pipe. If the notification thread or the DNS proxy fails, the supervisor tears the sandbox down and exits 125. If the supervisor itself dies, the listener closes and every pending or future notified syscall fails with `ENOSYS`, so the sandbox fails closed.
+Fallible work happens before `fork`, so a bad policy produces a clear error instead of a half-built sandbox. The signals sbx handles are blocked before it changes anything, so a SIGTERM during setup cannot leave resolv.conf or the cgroup half-changed: sbx notices it before `fork` and stops. Setup failures in the child, including `execve` being denied by Landlock, are reported back over a close-on-exec pipe. If the notification thread or the DNS proxy fails, the supervisor tears the sandbox down and exits 125. If the supervisor itself dies, the listener closes and every pending or future notified syscall fails with `ENOSYS`, so the sandbox fails closed.
 
 ## The layers
 
@@ -108,9 +113,71 @@ seccomp also refuses `MSG_FASTOPEN` (TCP Fast Open connects from inside `sendto`
 
 Egress mode needs `CAP_SYS_PTRACE` in the container (`docker run --cap-add=SYS_PTRACE`; Kubernetes `securityContext.capabilities.add: [SYS_PTRACE]`). Docker and containerd's default seccomp profiles allow `pidfd_getfd` only with it, and reading another uid's memory needs it. The payload never has it.
 
+## Job report and log file
+
+`--report FILE` (or `SBX_REPORT_FILE`) makes `sbx run` write how the run ended as JSON. The file is written once, after the sandbox is gone and the cgroup and `/etc/resolv.conf` are restored, by atomically replacing the path, so it is either complete or absent. Every outcome after sbx has opened the report's directory produces a report: policy errors, missing capabilities, setup failures in the child, and runs of the program. Errors before that, in the flags, the `SBX_*` variables or the report path itself, go to stderr only. When sbx starts, it removes any file at the path, so a missing report means sbx failed early or was killed with SIGKILL. Every key is always present:
+
+```json
+{
+  "sbx_version": "v0.3",
+  "exit_code": 137,
+  "program": {"signaled": 9},
+  "timed_out": false,
+  "setup_error": null,
+  "supervisor_error": null,
+  "denials": [{"syscall": "ptrace", "count": 2}],
+  "killed_after_exit": 1,
+  "wall_ms": 1520,
+  "rusage": {"user_ms": 310, "sys_ms": 42, "max_rss_kib": 51200},
+  "cgroup": {"memory_mb": 512, "pids": 256, "memory_peak_kib": 60112, "oom_kills": 1,
+             "pids_max_hits": 0, "user_ms": 318, "sys_ms": 45}
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `exit_code` | sbx's own exit code, as documented under [Configuration](#configuration) |
+| `program` | `{"exited": N}` or `{"signaled": N}` for the program's own process; `null` if it never started |
+| `timed_out` | the wall-clock limit killed the sandbox (exit 124) |
+| `setup_error` | `{"stage", "messages"}` when the program never started. Stages, in order: `policy`, `report`, `log`, `env`, `program`, `capabilities`, `slot`, `stdio`, `dns`, `cgroup`, `landlock`, `seccomp`, `launch`; then in the child `cgroup`, `setsid`, `chdir`, `setrlimit`, `identity`, `pdeathsig`, `no_new_privs`, `landlock`, `seccomp`, `close_range`, `signals`, `execve` (exit 127); then `listener` and `services` back in the supervisor |
+| `supervisor_error` | why sbx tore a running sandbox down (exit 125), e.g. a failed notification thread or log file |
+| `denials` | syscalls sbx's policy filter denied, per name (egress denials count as `connect`). Not counted: the prelude's `ENOSYS` (`clone3`, x32), Landlock's refusals, calls the container runtime's own seccomp profile refuses, and DNS names the proxy refuses |
+| `killed_after_exit` | processes still running when the program exited, which sbx then killed; `null` when sbx had already killed the tree (timeout, a second SIGTERM or the grace period, a fatal error) |
+| `wall_ms` | from `execve` until the program's process was reaped |
+| `rusage` | CPU time of every process sbx reaped, each including the descendants it waited for itself, and the largest resident set of any single process. Children of a process that ignores SIGCHLD are reaped by the kernel and not counted |
+| `cgroup` | with `mode = "delegated"`: the limits, the peak memory of the whole sandbox (page cache and tmpfs files included), OOM kills, forks refused by `pids.max`, and the cgroup's CPU time; otherwise `null` |
+
+The report is trusted because the program cannot have touched it. Every directory from `/` down to the report's own must belong to root (or sbx's uid) and be writable by nobody else. A sticky directory such as `/tmp` is allowed above it, but not as the report's own directory. The directory must be canonical. sbx opens it when it starts, creates the file through that descriptor with `O_NOFOLLOW`, and gives it mode 0600. A symlink left at the path is replaced, not followed. If sbx is not root, the program runs as sbx's own uid, so the directory must also lie outside every fs rule (and Landlock must be on). `sbx probe --report FILE` checks the destination without touching the file there.
+
+`--log FILE` (or `SBX_LOG_FILE`) sends sbx's own lines to FILE instead of stderr, so the program's stderr holds only what the program wrote. The same path rules apply. The file is appended to and created 0600 if missing; an existing one must be a regular file of sbx's uid that nobody else can access. Lines are written as they happen. Process names and DNS names in them have control characters escaped, so the sandbox cannot forge a line. If a write fails, sbx prints the line and the error on stderr and tears the sandbox down (exit 125). Errors before the file is open still go to stderr.
+
+`sbx version` prints the `git describe` of the commit sbx was built from: the tag, such as `v0.3`, for a release.
+
+## cgroup limits
+
+`[cgroup]` is required in every policy. `mode = "off"` (the shipped policies) leaves the sandbox in sbx's own cgroup, bounded only by the container's limits. `mode = "delegated"` runs it in a cgroup of its own:
+
+```toml
+[cgroup]
+mode = "delegated"
+memory_mb = 512        # memory.max, with memory.swap.max = 0 and memory.oom.group = 1
+pids = 256             # pids.max: processes and threads
+```
+
+Both limits are required with `"delegated"` (a number or `"unlimited"`) and refused with `"off"`. sbx's cgroup C (from `/proc/self/cgroup`) must be delegated to it: cgroup v2 at `/sys/fs/cgroup`, writable, with the `memory` and `pids` controllers available, and no other process in C. cgroup v2 keeps processes out of cgroups whose controllers are enabled for their children, so sbx moves itself into `C/sbx-supervisor`, enables the controllers for C's children, and creates `C/sbx-sandbox` with the limits. The child joins `C/sbx-sandbox` before it drops its privileges, so the program and everything it starts are charged there. An OOM kill then hits the whole sandbox (`memory.oom.group`), never the supervisor, and the report records it. On exit, sbx kills what is left with `cgroup.kill`, reads the counters and puts C back as it was. `memory_mb` must be below C's own `memory.max`, or the container's OOM killer would act first and might pick sbx. sbx refuses `"delegated"` unless it starts as root, and refuses to start if any of this is not the case, naming the reason. `sbx probe` creates and removes a trial sandbox cgroup.
+
+`memory_mb` counts everything the sandbox charges, including the page cache and files it writes to tmpfs, such as a Cloud Run in-memory volume. Such files stay charged after the processes exit, until they are removed. While sbx runs, no process can join C (`docker exec` and `kubectl exec` may fail or land in `C/sbx-supervisor`, depending on the runtime).
+
+Where a delegated cgroup comes from:
+
+* **podman**: `podman run --systemd=always` mounts a writable cgroup2 in the container's own cgroup namespace. `make smoke` runs the suite that way.
+* **Docker and Kubernetes** mount `/sys/fs/cgroup` read-only unless the container is privileged, which the sandbox does not need otherwise. sbx then says `/sys/fs/cgroup is mounted read-only`.
+* **A server that spawns sbx** (the Cloud Run service pattern) shares the container's cgroup with it, so C is never sbx's alone. The server must give each sbx a cgroup of its own, e.g. `mkdir /sys/fs/cgroup/job-42` and start sbx with a `preexec_fn` that writes `0` to its `cgroup.procs`, with the controllers enabled in the parent and the server itself moved out of the root cgroup.
+* **Cloud Run**: `make live` prints what the platform provides ([Live tests on Cloud Run](#live-tests-on-cloud-run)).
+
 ## Configuration
 
-The policy file is required (`--policy` or `SBX_POLICY_FILE`; the image sets `SBX_POLICY_FILE=/etc/sbx/policy.toml`). Every field must be present and unknown fields are rejected. [`policy/default.toml`](policy/default.toml) is the shipped policy (no network). [`policy/egress.example.toml`](policy/egress.example.toml) shows egress rules and the DNS proxy, and [`policy/no-landlock.example.toml`](policy/no-landlock.example.toml) is the same for kernels without Landlock. All three are validated against the image during the build. Environment variables and flags then extend the policy (path grants and egress rules are added) or replace a few scalars (flags win over the environment):
+The policy file is required (`--policy` or `SBX_POLICY_FILE`; the image sets `SBX_POLICY_FILE=/etc/sbx/policy.toml`). Every field must be present and unknown fields are rejected. **Upgrading from v0.2:** add `[cgroup]` with `mode = "off"` to keep v0.2's behaviour; sbx v0.3 refuses a policy without it and says so. [`policy/default.toml`](policy/default.toml) is the shipped policy (no network). [`policy/egress.example.toml`](policy/egress.example.toml) shows egress rules and the DNS proxy, and [`policy/no-landlock.example.toml`](policy/no-landlock.example.toml) is the same for kernels without Landlock. All three are validated against the image during the build. Environment variables and flags then extend the policy (path grants and egress rules are added) or replace a few scalars (flags win over the environment):
 
 | Flag | Env var | Meaning |
 |---|---|---|
@@ -124,6 +191,8 @@ The policy file is required (`--policy` or `SBX_POLICY_FILE`; the image sets `SB
 | `--env-pass NAMES` | `SBX_ENV_PASS` | pass these variables through (each must be set) |
 | `--seccomp-action A` | `SBX_SECCOMP_ACTION` | `errno` or `kill` |
 | `--quiet` | `SBX_QUIET=true` | hide info lines (warnings and errors are always printed) |
+| `--report FILE` | `SBX_REPORT_FILE` | write the outcome as JSON ([Job report and log file](#job-report-and-log-file)) |
+| `--log FILE` | `SBX_LOG_FILE` | append sbx's own lines to FILE instead of stderr |
 
 Booleans are `true`/`false`. An empty `SBX_*` value, a flag given twice, a missing `--` before the program, and **any `SBX_*` variable sbx does not know** are errors, so a typo cannot silently leave a setting at its file value. Keep other software's variables out of the `SBX_` prefix in sbx's environment.
 
@@ -137,13 +206,14 @@ Exit codes: the program's own, 124 on timeout, 125 for sbx errors (bad policy, m
 * seccomp user notification with `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` (Linux 5.19), and no other seccomp listener already installed in the container (`sbx probe` runs a full round trip), plus `close_range` (5.9) and `pidfd_open`/`pidfd_getfd` (5.6).
 * Root with `CAP_SETPCAP` (for the bounding set) and `CAP_SETUID`/`CAP_SETGID`, which Docker grants by default. A non-root sbx runs the program at its own uid, which must equal the policy's, with no supplementary groups; the sandbox is then separated from the supervisor by Landlock scoping only, so use ABI 6+. With `landlock.abi = "off"`, non-root is refused ([Without Landlock](#without-landlock)).
 * Egress: Linux 6.9+ (`PIDFD_THREAD`), `CAP_SYS_PTRACE`, Yama `ptrace_scope` < 3, and port 53 on the loopback listen address.
+* `cgroup.mode = "delegated"`: Linux 5.19+ (`memory.peak`, `cgroup.kill`), root, and a delegated cgroup v2 ([cgroup limits](#cgroup-limits)).
 
 ## Build and test
 
 ```sh
 make lint test        # rustfmt, clippy (warnings are errors), unit tests
 make image            # ghcr.io/ocramz/sbx:<git sha> on BASE_IMAGE (debian:bookworm-slim)
-make smoke            # build images; integration suite in Docker; checks of the runtime image
+make smoke            # build images; integration suite in a container; checks of the runtime image
 make smoke-local      # integration suite on this host (root, private mount namespace)
 make probe            # sbx probe in the runtime image
 make push PUSH_TAGS="main"
@@ -151,7 +221,7 @@ make live             # live tests on a Cloud Run service and jobs (see below)
 make help             # everything else
 ```
 
-The Rust version comes from `rust-toolchain.toml`. Images are built for the host's architecture (`linux/amd64` or `linux/arm64`); pass `PLATFORM=` to override, though the integration suite cannot run under emulation. The build stage runs on the build machine's own architecture and cross-compiles a static musl binary on `rust:<version>-slim-bookworm`, linked with `rust-lld`, so an amd64 image can be built on an arm64 Mac (x86_64 rustc crashes under QEMU); the build fails if the binary is not static. The integration suite ([`tests/smoke.py`](tests/smoke.py)) runs in a test image (the runtime stage on `python:3.13-slim-bookworm`) with `--cap-add SYS_PTRACE`. It covers escape attempts that only Landlock or seccomp can stop, strictness errors, egress allow/deny decisions, DNS learning and refusals, one sandbox per container, the Landlock-off mode, and two race tests: one flips the sockaddr from another thread during `connect`, the other swaps an AF_UNIX and a TCP socket under the same fd number. Both assert that the denied server never sees a connection. [`tests/image-checks.sh`](tests/image-checks.sh) then exercises the runtime image as shipped (PID 1, signal forwarding, cleanup of leftover processes).
+The Rust version comes from `rust-toolchain.toml`. `sbx version` comes from `SBX_VERSION`, which the Makefile sets to `git describe --tags --always --dirty` and passes to cargo and to the image build (a build without it reports `unknown`). Images are built for the host's architecture (`linux/amd64` or `linux/arm64`); pass `PLATFORM=` to override, though the integration suite cannot run under emulation. The build stage runs on the build machine's own architecture and cross-compiles a static musl binary on `rust:<version>-slim-bookworm`, linked with `rust-lld`, so an amd64 image can be built on an arm64 Mac (x86_64 rustc crashes under QEMU); the build fails if the binary is not static. The integration suite ([`tests/smoke.py`](tests/smoke.py)) runs in a test image (the runtime stage on `python:3.13-slim-bookworm`) with `--cap-add SYS_PTRACE`. It covers escape attempts that only Landlock or seccomp can stop, strictness errors, egress allow/deny decisions, DNS learning and refusals, one sandbox per container, the Landlock-off mode, and two race tests: one flips the sockaddr from another thread during `connect`, the other swaps an AF_UNIX and a TCP socket under the same fd number. Both assert that the denied server never sees a connection. The suite also checks the report and the log file, and, in a container with a writable cgroup2 (`--systemd=always`, `TEST_REQUIRE_CGROUP=true`), the delegated cgroup: OOM kills, `pids.max`, refusals, and that sbx leaves its cgroup as it found it. With Docker, run `make smoke DOCKER=docker SMOKE_CGROUP=false`; the suite then checks that sbx refuses the delegated mode, as it does under `make smoke-local`. [`tests/image-checks.sh`](tests/image-checks.sh) then exercises the runtime image as shipped (PID 1, signal forwarding, cleanup of leftover processes, the version, the report and log as PID 1, and the refusal of the delegated mode on a read-only cgroupfs).
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `make lint`, `make test` and `make smoke` on every push and pull request. Pushes to `main` publish `ghcr.io/ocramz/sbx:<sha>` and `:main`; tags `v*` publish `:<tag>` and `:latest`.
 
@@ -207,7 +277,7 @@ The suites:
 * [`tests/live.py`](tests/live.py) prints the platform facts (kernel, Landlock ABI, the container's capabilities and seccomp state, Yama, `/etc/resolv.conf`, `/etc/hosts`, the active LSMs, Landlock symbols in `/proc/kallsyms`, whether newer syscalls reach the kernel, and `sbx probe` for the three shipped policies). It then checks the sandbox, and egress filtering on the real network with names resolved through the metadata server's DNS. The egress cases are those of [`tests/live_net.py`](tests/live_net.py), each in its own sbx run, with the example policy's rules (`api.github.com:443`, `*.githubusercontent.com:443`) plus `1.1.1.1/32:443`, `www.github.com:443` and `metadata.google.internal:80` in `SBX_EGRESS`. Allowed: a name, a verified TLS session with an HTTP reply, a name below the wildcard, a name answered with a CNAME, the CIDR address, and a non-blocking connect to it. Denied, each with the line sbx logs: an allowed name and the CIDR address on another port, the address next to the CIDR block, a public resolver over TCP, the metadata server by address and by an allowed name (which on Cloud Run comes from `/etc/hosts`), a link-local DNS answer for that name asked of the proxy directly (never learned), and, with NXDOMAIN, the wildcard's bare domain and an unlisted name. The cases need github.com, Cloudflare (1.1.1.1, 1.0.0.1), Google DNS (8.8.8.8) and the metadata DNS to answer from Cloud Run. live.py runs these checks with the Landlock policies if the kernel has Landlock ABI 6, and always with the no-Landlock example, which adds the checks that AF_UNIX connects and binds are refused.
 * [`tests/smoke.py`](tests/smoke.py), the integration suite.
 
-The service and the suites job set `TEST_REQUIRE_LANDLOCK=false` (`make smoke` sets it to `true`, the default). On a kernel without Landlock ABI 6, both suites then check that sbx refuses the Landlock policies, report the Landlock-only tests as n/a, and run everything else with `landlock.abi = "off"`. So `make live` passes on Cloud Run when everything that can run there works. A failure can be a finding about the platform rather than a bug in sbx: for example, without `CAP_SYS_PTRACE` the egress mode cannot run at all.
+The service and the suites job set `TEST_REQUIRE_LANDLOCK=false` and `TEST_REQUIRE_CGROUP=false` (`make smoke` sets both to `true`, the default). live.py also prints the platform's cgroup setup and what `sbx probe` says about a delegated cgroup there. On a kernel without Landlock ABI 6, both suites then check that sbx refuses the Landlock policies, report the Landlock-only tests as n/a, and run everything else with `landlock.abi = "off"`. So `make live` passes on Cloud Run when everything that can run there works. A failure can be a finding about the platform rather than a bug in sbx: for example, without `CAP_SYS_PTRACE` the egress mode cannot run at all.
 
 ```sh
 make live                               # tests/cloud-run.sh all: up, deploy, test, logs
@@ -257,7 +327,7 @@ The sandbox assumes a hostile payload and a correct kernel. It narrows what the 
 * **One sandbox per container.** A second `sbx run` in the same network namespace exits 125 ([Architecture](#architecture)). The DNS proxy also binds `network.dns.listen` exclusively, and `/etc/resolv.conf` is shared by the container: while an egress sandbox runs, the rest of the container also resolves names through the sbx proxy. sbx restores the file when it exits, unless someone else changed it meanwhile (sbx then warns and leaves it), or sbx is killed with SIGKILL.
 * **UNIX sockets.** Below Landlock ABI 9, connecting to pathname UNIX sockets is restricted only by file permissions. A service outside the sandbox that listens on one could hand the sandbox an unfiltered socket, so do not expose such sockets to the sandbox's uid.
 * **`x` is hygiene.** Landlock's `x` controls `execve`, not code loading: the payload can still run code through an allowed interpreter or by invoking `ld.so` on a file it wrote. To stop fileless execution, add `seccomp.deny = ["memfd_create", "execveat"]`.
-* **Memory** is bounded only by the container limit; a payload that exhausts it takes down the instance, supervisor included. Keep service concurrency at 1 for untrusted work. `limits.as_mb` is available but breaks Go, the JVM and V8.
+* **Memory** is bounded only by the container limit unless the platform delegates a cgroup ([cgroup limits](#cgroup-limits)); without one, a payload that exhausts it takes down the instance, supervisor included, and no report is written. Keep service concurrency at 1 for untrusted work. `limits.as_mb` is available but breaks Go, the JVM and V8.
 
 Cloud Run also has a native **sandboxes** feature (public preview since July 2026) that runs code in a separate isolated environment inside a service instance, without access to the service's environment variables or the metadata server. If you only target Cloud Run, consider it as the outer layer with sbx inside, or instead of sbx.
 
@@ -270,8 +340,11 @@ rust-toolchain.toml              the Rust version, for cargo, CI and the image b
 policy/default.toml              shipped policy (no network)
 policy/egress.example.toml       egress rules + DNS proxy example
 policy/no-landlock.example.toml  the egress example with landlock.abi = "off"
-src/main.rs                      CLI: run / probe / policy, environment, program lookup
+src/main.rs                      CLI: run / probe / policy / version, environment, program lookup, report
 src/policy.rs                    policy model, overrides, validation
+src/report.rs                    setup stages, the run's outcome, the JSON report
+src/destination.rs               safe paths for the report and the log file, atomic writes
+src/cgroup.rs                    delegated cgroup: setup, limits, counters, teardown
 src/landlock_layer.rs            Landlock probe, ruleset, enforcement
 src/seccomp_layer.rs             rule table, BPF prelude and policy filter, evaluator
 src/notify.rs                    seccomp user notification: listener, dispatcher, denials
@@ -280,7 +353,7 @@ src/dns.rs                       DNS proxy, wire format, resolv.conf
 src/net.rs                       CIDR, domain patterns, address classes, sockaddr parsing
 src/capabilities.rs              requirement checks (probe, run)
 src/supervisor.rs                fork/exec, identity and capability drop, signals, timeout, cleanup
-src/log.rs                       stderr logging
+src/log.rs                       logging to stderr or the log file, escaping, fatal errors
 tests/smoke.py                   integration suite (run as root in a disposable environment)
 tests/run-local.sh               runs the suite on a host inside a private mount namespace
 tests/image-checks.sh            checks of the runtime image as shipped
