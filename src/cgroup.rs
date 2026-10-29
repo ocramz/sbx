@@ -20,9 +20,9 @@ use crate::log::{self, os_err};
 use crate::policy::{CgroupCfg, Limit};
 use serde::Serialize;
 use std::ffi::CString;
+use std::fmt::Display;
 use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -30,6 +30,9 @@ const MOUNT: &str = "/sys/fs/cgroup";
 const SUPERVISOR: &str = "sbx-supervisor";
 const SANDBOX: &str = "sbx-sandbox";
 const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
+/// How long a cgroup change that fails with EBUSY is retried, and how often.
+const BUSY_RETRY: Duration = Duration::from_secs(2);
+const BUSY_STEP: Duration = Duration::from_millis(10);
 /// Files sbx reads or writes in the sandbox cgroup besides the limits.
 const NEEDED: [&str; 6] = [
     "cgroup.kill",
@@ -109,11 +112,52 @@ fn read(path: &Path) -> Result<String, String> {
 }
 
 fn write(path: &Path, value: &str) -> Result<(), String> {
+    write_io(path, value).map_err(|e| format!("write {value:?} to {}: {e}", path.display()))
+}
+
+fn write_io(path: &Path, value: &str) -> std::io::Result<()> {
     std::fs::OpenOptions::new()
         .write(true)
         .open(path)
         .and_then(|mut f| f.write_all(value.as_bytes()))
-        .map_err(|e| format!("write {value:?} to {}: {e}", path.display()))
+}
+
+/// Enable or disable controllers for the children of `base`.
+fn subtree_control(base: &Path, value: &str) -> Result<(), String> {
+    let path = base.join("cgroup.subtree_control");
+    let what = format!("write {value:?} to {}", path.display());
+    retry_busy(what, || write_io(&path, value))
+}
+
+fn rmdir(p: &Path) -> Result<(), String> {
+    retry_busy(format!("rmdir {}", p.display()), || std::fs::remove_dir(p))
+}
+
+/// Run `op` again while it fails with EBUSY, for up to [`BUSY_RETRY`].
+///
+/// Since kernel commit d245698d727a an exiting task leaves its cgroup only
+/// after its final context switch, which can come after its parent reaped
+/// it or a thread joined it. Until then cgroup.procs no longer lists it, but
+/// the cgroup still counts it: enabling controllers in C fails just after
+/// the capability checks' children exit, and removing sbx-supervisor fails
+/// while one of sbx's threads is still exiting (moving sbx back to C leaves
+/// such a thread behind). Where sbx retries, only its own exiting tasks can
+/// keep the cgroup busy: setup checked that C holds nothing but sbx, and
+/// [`Delegation::finish`] waited for sbx-sandbox to empty.
+fn retry_busy(what: impl Display, mut op: impl FnMut() -> std::io::Result<()>) -> Result<(), String> {
+    let until = Instant::now() + BUSY_RETRY;
+    loop {
+        match op() {
+            Ok(()) => return Ok(()),
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
+                if Instant::now() >= until {
+                    return Err(format!("{what}: {e}, still after {}s", BUSY_RETRY.as_secs()));
+                }
+                std::thread::sleep(BUSY_STEP);
+            }
+            Err(e) => return Err(format!("{what}: {e}")),
+        }
+    }
 }
 
 /// The steps setup took, undone in reverse order.
@@ -154,7 +198,7 @@ impl Changes {
         while let Some(step) = self.done.pop() {
             let r = match step {
                 Step::MadeSandbox => rmdir(&self.sandbox()),
-                Step::EnabledControllers => write(&self.base.join("cgroup.subtree_control"), "-memory -pids"),
+                Step::EnabledControllers => subtree_control(&self.base, "-memory -pids"),
                 Step::MovedSelf => write(&self.base.join("cgroup.procs"), &std::process::id().to_string()),
                 Step::MadeSupervisor => rmdir(&self.base.join(SUPERVISOR)),
             };
@@ -257,7 +301,7 @@ impl Delegation {
         c.done.push(Step::MadeSupervisor);
         write(&c.base.join(SUPERVISOR).join("cgroup.procs"), &me.to_string())?;
         c.done.push(Step::MovedSelf);
-        write(&c.base.join("cgroup.subtree_control"), "+memory +pids")?;
+        subtree_control(&c.base, "+memory +pids")?;
         c.done.push(Step::EnabledControllers);
         c.mkdir(SANDBOX)?;
         c.done.push(Step::MadeSandbox);
@@ -413,15 +457,6 @@ fn configure_sandbox(s: &Path, memory_mb: Limit, pids: Limit) -> Result<(), Stri
                 s.display()
             ));
         }
-    }
-    Ok(())
-}
-
-fn rmdir(p: &Path) -> Result<(), String> {
-    let c = CString::new(p.as_os_str().as_bytes()).map_err(|_| format!("{}: NUL byte", p.display()))?;
-    // SAFETY: rmdir of a NUL-terminated path.
-    if unsafe { libc::rmdir(c.as_ptr()) } != 0 {
-        return Err(os_err(format!("rmdir {}", p.display())));
     }
     Ok(())
 }

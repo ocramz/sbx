@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.3.1
+
+### Added
+
+- Images for `linux/arm64` as well as `linux/amd64`. `ghcr.io/ocramz/sbx:<tag>`, `:latest`, `:main` and `:<sha>` are multi-arch, and each architecture's image passed the integration suite on a native runner. The per-architecture images are `:<sha>-amd64` and `:<sha>-arm64`.
+
+### Fixed
+
+- `[cgroup] mode = "delegated"` no longer fails at stage `cgroup` with EBUSY, and no longer leaves `C/sbx-supervisor` behind, on kernels where an exiting task stays in its cgroup until its last context switch. sbx now retries enabling and disabling the controllers and removing its cgroups for up to 2 s while they are busy (#8).
+
 ## v0.3
 
 **Breaking:** every policy now needs a `[cgroup]` table. To keep v0.2's behaviour, add:

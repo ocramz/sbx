@@ -2,7 +2,8 @@
 #
 # Variables can be overridden on the command line, e.g.
 #   make image BASE_IMAGE=python:3.13-slim-bookworm
-#   make push VERSION=0123456789ab PUSH_TAGS="main"
+#   make push VERSION=0123456789ab            (on each of ARCHS' machines)
+#   make manifest VERSION=0123456789ab PUSH_TAGS="main"
 #   make smoke DOCKER=docker SMOKE_CGROUP=false
 
 SHELL := bash
@@ -25,6 +26,8 @@ SBX_VERSION     ?= $(shell git describe --tags --always --dirty --match 'v*')
 BASE_IMAGE      ?= debian:bookworm-slim
 TEST_BASE_IMAGE ?= python:3.13-slim-bookworm
 PLATFORM        ?= linux/$(HOST_ARCH)
+# The architectures `manifest` joins into one image index.
+ARCHS           ?= amd64 arm64
 PUSH_TAGS       ?=
 DOCKER          ?= podman
 CARGO           ?= cargo
@@ -35,6 +38,10 @@ SMOKE_CGROUP    ?= true
 
 IMAGE        := $(REGISTRY)/$(IMAGE_NAME)
 TEST_IMAGE   := $(IMAGE)-test
+ARCH         := $(PLATFORM:linux/%=%)
+# Local name of the image index `manifest` builds; not $(IMAGE):$(VERSION),
+# which may be this machine's single-architecture image.
+MANIFEST     := localhost/sbx-index:$(VERSION)
 RUST_VERSION := $(shell sed -n 's/^channel = "\(.*\)"$$/\1/p' rust-toolchain.toml)
 
 ifeq ($(strip $(RUST_VERSION)),)
@@ -48,6 +55,9 @@ $(error SBX_VERSION is empty: run inside the git checkout or pass SBX_VERSION=..
 endif
 ifeq ($(filter $(SMOKE_CGROUP),true false),)
 $(error SMOKE_CGROUP must be true or false)
+endif
+ifeq ($(filter $(PLATFORM),linux/amd64 linux/arm64),)
+$(error PLATFORM must be linux/amd64 or linux/arm64)
 endif
 # Compiled into sbx (cargo build, test, clippy).
 export SBX_VERSION
@@ -105,13 +115,30 @@ smoke: image test-image ## integration suite in the test image, then checks of t
 probe: ## run `sbx probe` with the default policy in the runtime image
 	$(DOCKER) run --rm --pull=never --platform $(PLATFORM) --entrypoint /usr/local/bin/sbx $(IMAGE):$(VERSION) probe
 
+# Push images built natively, as CI does: on an arm64 host, podman takes
+# BASE_IMAGE's locally stored arm64 image for PLATFORM=linux/amd64 too
+# (tests/cloud-run.sh), and the image config does not show it.
 .PHONY: push
-push: ## push $(IMAGE):$(VERSION), then tag and push each of PUSH_TAGS
-	$(DOCKER) push $(IMAGE):$(VERSION)
-	for tag in $(PUSH_TAGS); do \
-		$(DOCKER) tag $(IMAGE):$(VERSION) $(IMAGE):$$tag; \
-		$(DOCKER) push $(IMAGE):$$tag; \
+push: ## push $(IMAGE):$(VERSION) as $(IMAGE):$(VERSION)-<PLATFORM's architecture>
+	arch=$$($(DOCKER) image inspect --format '{{.Architecture}}' $(IMAGE):$(VERSION)); \
+	[ "$$arch" = $(ARCH) ] || { echo "$(IMAGE):$(VERSION) is $$arch, not $(ARCH) (PLATFORM=$(PLATFORM))" >&2; exit 1; }
+	$(DOCKER) tag $(IMAGE):$(VERSION) $(IMAGE):$(VERSION)-$(ARCH)
+	$(DOCKER) push $(IMAGE):$(VERSION)-$(ARCH)
+
+# podman only: docker's `manifest` subcommand takes other arguments.
+.PHONY: manifest
+manifest: ## push an index of ARCHS' pushed images as $(IMAGE):$(VERSION) and each of PUSH_TAGS
+	$(DOCKER) manifest create $(MANIFEST)
+	for arch in $(ARCHS); do \
+		$(DOCKER) manifest add $(MANIFEST) docker://$(IMAGE):$(VERSION)-$$arch; \
 	done
+	archs=$$($(DOCKER) manifest inspect $(MANIFEST) | jq -r '[.manifests[].platform.architecture] | sort | join(" ")'); \
+	[ "$$archs" = "$(sort $(ARCHS))" ] || { echo "$(MANIFEST) holds $$archs, not $(sort $(ARCHS))" >&2; exit 1; }
+	$(DOCKER) manifest push --all $(MANIFEST) docker://$(IMAGE):$(VERSION)
+	for tag in $(PUSH_TAGS); do \
+		$(DOCKER) manifest push --all $(MANIFEST) docker://$(IMAGE):$$tag; \
+	done
+	$(DOCKER) manifest rm $(MANIFEST)
 
 .PHONY: live
 live: ## live tests on a Cloud Run service and jobs: build, push, deploy, run the tests, logs (README)
