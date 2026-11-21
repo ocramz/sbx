@@ -34,11 +34,12 @@ const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
 const BUSY_RETRY: Duration = Duration::from_secs(2);
 const BUSY_STEP: Duration = Duration::from_millis(10);
 /// Files sbx reads or writes in the sandbox cgroup besides the limits.
-const NEEDED: [&str; 6] = [
+const NEEDED: [&str; 7] = [
     "cgroup.kill",
     "cgroup.events",
     "memory.events",
     "memory.peak",
+    "memory.stat",
     "pids.events",
     "cpu.stat",
 ];
@@ -337,6 +338,11 @@ impl Delegation {
     /// Processes (not threads, not zombies) in the sandbox cgroup.
     pub fn live_processes(&self) -> Result<u32, String> {
         Ok(read(&self.sandbox().join("cgroup.procs"))?.lines().count() as u32)
+    }
+
+    /// The sandbox cgroup's memory.stat, for memory sampling.
+    pub fn memory_stat(&self) -> Result<String, String> {
+        read(&self.sandbox().join("memory.stat"))
     }
 
     pub fn oom_kills(&self) -> u64 {

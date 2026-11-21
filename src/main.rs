@@ -11,6 +11,7 @@ mod dns;
 mod egress;
 mod landlock_layer;
 mod log;
+mod memory;
 mod net;
 mod notify;
 mod policy;
@@ -233,7 +234,7 @@ fn run_and_report(ov: Overrides, cmd: Vec<OsString>, out: &Outputs) -> i32 {
         }
     }
     let outcome = match run(ov, cmd, out) {
-        Ok(ran) => Outcome::Ran(ran),
+        Ok(ran) => Outcome::Ran(Box::new(ran)),
         Err(e) => {
             for m in &e.errors {
                 log::error(m);
@@ -315,7 +316,9 @@ fn run(ov: Overrides, cmd: Vec<OsString>, out: &Outputs) -> Result<Ran, SetupErr
         seccomp: sc,
         cgroup_procs: cg.as_ref().map(Delegation::procs_fd),
     };
-    let mut ran = supervisor::run(&p, launch, svc, &sig, cg.as_ref())?;
+    // The tmpfs mounts' baselines, before the program can write to them.
+    let sampler = memory::Sampler::new(&p.measure, p.process.uid).at(Stage::Launch)?;
+    let mut ran = supervisor::run(&p, launch, svc, &sig, cg.as_ref(), sampler)?;
     if let Some(c) = cg {
         let (stats, errs) = c.finish();
         for e in errs {

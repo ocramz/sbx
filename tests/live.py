@@ -22,7 +22,9 @@ Optional:
 
 import ctypes
 import errno
+import json
 import os
+import re
 import subprocess
 import sys
 
@@ -176,6 +178,9 @@ print(f"  hosts           {' | '.join(hosts)}")
 cgroup_mount = next((l.split()[3] for l in read("/proc/mounts").splitlines() if l.split()[1:2] == ["/sys/fs/cgroup"]), "?")
 print(f"  cgroup          {read('/proc/self/cgroup')}; /sys/fs/cgroup {cgroup_mount}; "
       f"controllers: {read('/sys/fs/cgroup/cgroup.controllers')}; memory.max {read('/sys/fs/cgroup/memory.max')}")
+SHM = "/dev/shm"
+SHM_TYPE = next((l.split()[2] for l in read("/proc/mounts").splitlines() if l.split()[1:2] == [SHM]), "not a mount")
+print(f"  /dev/shm        {SHM_TYPE}; /proc/sysvipc/shm {'present' if os.path.exists('/proc/sysvipc/shm') else 'absent'}")
 
 print("== probe")
 for name, pol in (("default policy", DEFAULT), ("egress example", EGRESS), ("no-Landlock example", NO_LANDLOCK)):
@@ -254,6 +259,49 @@ expect(N + "AF_UNIX connect is denied", 13, ["--", PY, "-c", UNIX_CONNECT, "/non
        log="non-IP sockets is denied")
 expect(N + "bind is denied", 1, ["--", PY, "-c", "import socket; socket.socket().bind(('127.0.0.1', 0))"],
        pol=NO_LANDLOCK, log="denied bind")
+
+# Memory by kind: on Cloud Run no cgroup is delegated, so only the /proc path measures.
+MEASURED = "/tmp/sbx-live-measured.toml"
+with open(NO_LANDLOCK) as f:
+    measured, n = re.subn(r"\[measure\]\nmemory_sample_ms = 0[^\n]*\ntmpfs = \[\][^\n]*",
+                          "[measure]\nmemory_sample_ms = 20\ntmpfs = " + json.dumps([SHM] if SHM_TYPE == "tmpfs" else []),
+                          f.read())
+if n != 1:
+    die(f"{NO_LANDLOCK} has no [measure] table with sampling off")
+with open(MEASURED, "w") as g:
+    g.write(measured)
+MEMPROG = """
+import os, sys, time
+MiB = 1 << 20
+heap = bytearray(32 * MiB)
+for i in range(0, len(heap), 4096):
+    heap[i] = 1
+fd = os.memfd_create("live")
+for _ in range(16):
+    os.write(fd, b"x" * MiB)
+if sys.argv[1] != "-":
+    with open(sys.argv[1], "wb") as f:
+        f.write(b"x" * 4 * MiB)
+time.sleep(0.5)
+if sys.argv[1] != "-":
+    os.unlink(sys.argv[1])
+"""
+RDIR = "/var/lib/sbx-live"
+os.makedirs(RDIR, mode=0o700, exist_ok=True)
+REPORT = f"{RDIR}/memory.json"
+shm_file = f"{SHM}/sbx-live-mem" if SHM_TYPE == "tmpfs" else "-"
+rc, so, se = sbx(["--report", REPORT, "--", PY, "-c", MEMPROG, shm_file], MEASURED)
+try:
+    with open(REPORT) as f:
+        mem = json.load(f)["memory"]
+    os.unlink(REPORT)
+except (OSError, ValueError, KeyError):
+    mem = None
+print(f"       memory: {json.dumps(mem)}")
+check(N + "memory by kind through /proc", rc == 0 and mem is not None and mem["cgroup"] is None
+      and mem["memfd_peak_kib"] >= 16 * 1024 and mem["max_anon_kib"] >= 32 * 1024
+      and (SHM_TYPE != "tmpfs" or mem["tmpfs_peak_kib"][SHM] >= 4 * 1024), f"rc={rc} stderr={se[-600:]!r}")
+os.unlink(MEASURED)
 
 check("resolv.conf is restored after the egress runs", read(RESOLV) == RESOLV_BEFORE,
       f"{read(RESOLV)!r} vs {RESOLV_BEFORE!r}")

@@ -22,6 +22,9 @@ Optional:
                      cgroup.mode = "delegated" in it. false: check that sbx
                      refuses that mode instead
 
+/dev/shm must be a tmpfs mount that every uid can write (the memory tests
+measure it).
+
 The suite rewrites /etc/resolv.conf for the DNS tests and starts local TCP
 servers on 127.0.0.1-3, so never run it directly on a host you care about.
 Every prerequisite is checked up front; nothing is skipped silently.
@@ -78,6 +81,12 @@ if not os.path.isfile("/etc/resolv.conf") or os.path.islink("/etc/resolv.conf"):
 with open("/etc/resolv.conf") as f:
     ORIGINAL_RESOLV_CONF = f.read()
 SETPRIV = shutil.which("setpriv") or die("setpriv (util-linux) is required")
+SHM = "/dev/shm"
+with open("/proc/self/mountinfo") as f:
+    # "... mount-point options [optional fields] - fstype source super-options"
+    shm_is_tmpfs = any(l.split()[4] == SHM and l.split(" - ")[1].split()[0] == "tmpfs" for l in f)
+if not shm_is_tmpfs or os.stat(SHM).st_mode & 0o1777 != 0o1777:
+    die(f"{SHM} must be a tmpfs mount with mode 1777 (the memory tests measure it)")
 REQUIRE_IPV6 = os.environ.get("TEST_REQUIRE_IPV6", "false")
 if REQUIRE_IPV6 not in ("true", "false"):
     die("TEST_REQUIRE_IPV6 must be true or false")
@@ -182,7 +191,7 @@ def toml_value(v):
 
 def policy(mode="none", families=("unix",), egress=(), bind_tcp=(), dns=None, subprocesses=True,
            on_violation="errno", deny=(), allow=(), extra_fs=(), workdir="/tmp", timeout="none",
-           env_pass=(), drop=None, uid=65534, gid=65534, abi=ABI, fs=None, cgroup=None):
+           env_pass=(), drop=None, uid=65534, gid=65534, abi=ABI, fs=None, cgroup=None, measure=None):
     """abi="off": no scopes and, unless fs is given, no fs rules."""
     landlock = abi != "off"
     if fs is None:
@@ -193,6 +202,7 @@ def policy(mode="none", families=("unix",), egress=(), bind_tcp=(), dns=None, su
                     "subprocesses": subprocesses},
         "limits": {"nofile": 1024, "nproc": 512, "fsize_mb": 1024, "as_mb": "unlimited", "cpu_secs": "unlimited"},
         "cgroup": cgroup or {"mode": "off"},
+        "measure": measure or {"memory_sample_ms": 0, "tmpfs": []},
         "env": {"pass": list(env_pass)},
         "env.set": {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/tmp", "LANG": "C.UTF-8"},
         "network": {"mode": mode, "bind_tcp": list(bind_tcp), "egress": list(egress)},
@@ -769,9 +779,10 @@ def check_report(name, args, cond, pol=BASE, **kw):
 r = check_report("report: a normal exit", ["--", "/bin/sh", "-c", "exit 3"], lambda r: r["program"] == {"exited": 3}
                  and not r["timed_out"] and r["setup_error"] is None and r["supervisor_error"] is None
                  and r["killed_after_exit"] == 0 and isinstance(r["wall_ms"], int) and r["cgroup"] is None
+                 and r["memory"] is None
                  and set(r["rusage"]) == {"user_ms", "sys_ms", "max_rss_kib"} and r["rusage"]["max_rss_kib"] > 0
                  and r["sbx_version"] == VERSION)
-check("report: every key is present", r is not None and len(r) == 11, r)
+check("report: every key is present", r is not None and len(r) == 12, r)
 st = os.lstat(REPORT)
 check("report: owned by root, mode 0600", st.st_uid == 0 and st.st_mode & 0o7777 == 0o600, oct(st.st_mode))
 check_report("report: killed by a signal", ["--", "/bin/sh", "-c", "kill -9 $$"],
@@ -858,6 +869,108 @@ os.chmod(LOG, 0o644)
 expect("log: a log file others can read is refused", 125, ["--log", LOG, "--", "/bin/true"], log="mode 0600")
 os.unlink(LOG)
 
+# ---------------------------------------------------------------- memory by kind
+
+print("== memory by kind")
+MiB = 1 << 20
+# Holds, for argv[1] seconds: a 64 MiB heap, a 16 MiB memfd it maps, a 32 MiB
+# memfd it only writes, an 8 MiB /dev/shm file and a 4 MiB SysV segment it
+# has detached. Then removes the file and the segment.
+MEMPROG = f"""
+import ctypes, mmap, os, sys, time
+MiB = 1 << 20
+heap = bytearray(64 * MiB)
+for i in range(0, len(heap), 4096):
+    heap[i] = 1
+a = os.memfd_create("mapped")
+os.ftruncate(a, 16 * MiB)
+m = mmap.mmap(a, 16 * MiB)
+for i in range(0, 16 * MiB, 4096):
+    m[i] = 1
+b = os.memfd_create("unmapped")
+for _ in range(32):
+    os.write(b, b"x" * MiB)
+with open("{SHM}/sbx-smoke-mem", "wb") as f:
+    for _ in range(8):
+        f.write(b"x" * MiB)
+libc = ctypes.CDLL(None, use_errno=True)
+libc.shmat.restype = ctypes.c_void_p
+libc.shmat.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+libc.shmdt.argtypes = [ctypes.c_void_p]
+libc.shmctl.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+seg = libc.shmget(0, 4 * MiB, 0o1600)  # IPC_PRIVATE, IPC_CREAT | 0600
+if seg < 0:
+    sys.exit(f"shmget: {{os.strerror(ctypes.get_errno())}}")
+p = libc.shmat(seg, None, 0)
+if p in (None, ctypes.c_void_p(-1).value):
+    sys.exit(f"shmat: {{os.strerror(ctypes.get_errno())}}")
+ctypes.memset(p, 1, 4 * MiB)
+libc.shmdt(p)
+time.sleep(float(sys.argv[1]))
+libc.shmctl(seg, 0, None)  # IPC_RMID
+os.unlink("{SHM}/sbx-smoke-mem")
+"""
+
+
+def sampled(ms, tmpfs=(SHM,), **kw):
+    return policy(extra_fs=[(SHM, "rw")], measure={"memory_sample_ms": ms, "tmpfs": list(tmpfs)}, **kw)
+
+
+SAMPLED = sampled(20)
+
+
+def near(got, want_mib, slack_mib=1):
+    """Within one sample's slack: no less than was held, and little more."""
+    return want_mib * 1024 <= got <= (want_mib + slack_mib) * 1024
+
+
+rc, so, se = sbx([], pol=SAMPLED, cmd="probe")
+check("memory: probe reads a non-dumpable process of the sandbox uid",
+      rc == 0 and "ok       sandbox /proc access" in so and "ok       CAP_SYS_PTRACE" in so, so + se)
+r = check_report("memory: every kind is reported", py(MEMPROG, 0.5), lambda r: r["exit_code"] == 0
+                 and r["memory"]["interval_ms"] == 20 and r["memory"]["samples"] >= 10
+                 and near(r["memory"]["memfd_peak_kib"], 48)
+                 and near(r["memory"]["tmpfs_peak_kib"][SHM], 8)
+                 and near(r["memory"]["sysv_shm_peak_kib"], 4)
+                 and 64 * 1024 <= r["memory"]["max_anon_kib"] <= 128 * 1024
+                 and r["memory"]["tree_peak_anon_kib"] >= r["memory"]["max_anon_kib"]
+                 and r["memory"]["max_shmem_kib"] >= 16 * 1024
+                 and r["memory"]["max_file_kib"] > 0
+                 and r["memory"]["cgroup"] is None and r["memory"]["unsampled_processes"] == 0
+                 and r["rusage"]["max_rss_kib"] >= 64 * 1024, pol=SAMPLED)
+if r is not None:
+    print(f"  info memory: {r['memory']}; rusage: {r['rusage']}", flush=True)
+check("memory: the program cleaned up", not os.path.exists(f"{SHM}/sbx-smoke-mem"))
+check_report("memory: with sampling off only rusage is reported", py(MEMPROG, 0.1),
+             lambda r: r["exit_code"] == 0 and r["memory"] is None and r["rusage"]["max_rss_kib"] >= 64 * 1024,
+             pol=policy(extra_fs=[(SHM, "rw")]))
+check_report("memory: a program that exits before the first sample is unsampled", ["--", "/bin/true"],
+             lambda r: r["memory"]["samples"] == 1 and r["memory"]["unsampled_processes"] == 1, pol=sampled(1000))
+check_report("memory: tmpfs files left behind are measured at exit",
+             ["--", "/bin/sh", "-c", f"head -c {2 * MiB} /dev/zero > {SHM}/sbx-smoke-left"],
+             lambda r: near(r["memory"]["tmpfs_peak_kib"][SHM], 2), pol=sampled(1000))
+os.unlink(f"{SHM}/sbx-smoke-left")
+check_report("memory: a path that is not a tmpfs mount is refused", ["--", "/bin/true"],
+             lambda r: r["setup_error"]["stage"] == "policy"
+             and "measure.tmpfs /usr: is not a tmpfs" in " ".join(r["setup_error"]["messages"]), pol=sampled(20, ["/usr"]))
+check_report("memory: tmpfs without sampling is refused", ["--", "/bin/true"],
+             lambda r: r["setup_error"]["stage"] == "policy"
+             and "only used when" in " ".join(r["setup_error"]["messages"]), pol=sampled(0))
+check_report("memory: sampling needs CAP_SYS_PTRACE", ["--", "/bin/true"],
+             lambda r: r["setup_error"]["stage"] == "capabilities"
+             and "memory sampling" in " ".join(r["setup_error"]["messages"]), pol=SAMPLED,
+             wrap=(SETPRIV, "--bounding-set=-sys_ptrace", "--inh-caps=-sys_ptrace"))
+SPIN = py("for _ in range(15_000_000): pass")
+walls = {}
+for ms in (0, 10, 20, 50):
+    pol = policy(measure={"memory_sample_ms": ms, "tmpfs": []})
+    # The fastest of three runs, to keep other load out of the figure.
+    walls[ms] = min((reported(SPIN, pol=pol)[3] or {}).get("wall_ms") or 10 ** 9 for _ in range(3))
+print("  info memory sampling overhead, wall time of a CPU-bound program: "
+      + ", ".join(f"{'off' if ms == 0 else f'{ms} ms'} {w} ms" for ms, w in walls.items()), flush=True)
+check("memory: sampling costs a CPU-bound program little",
+      all(walls[ms] <= 1.5 * walls[0] + 100 for ms in (10, 20, 50)), walls)
+
 # ---------------------------------------------------------------- cgroup
 
 print("== cgroup limits")
@@ -924,6 +1037,11 @@ else:
     cgroup_report("cgroup: a normal run is accounted", ["--", "/bin/sh", "-c", "/bin/true; /bin/true"],
                   lambda r: r["exit_code"] == 0 and r["cgroup"]["memory_mb"] == 64 and r["cgroup"]["pids"] == 32
                   and r["cgroup"]["oom_kills"] == 0 and r["cgroup"]["memory_peak_kib"] > 0, pol=delegated(64, 32))
+    cgroup_report("cgroup: memory by kind from memory.stat", py(MEMPROG, 0.5),
+                  lambda r: r["exit_code"] == 0 and r["memory"]["cgroup"]["peak_anon_kib"] >= 64 * 1024
+                  and r["memory"]["cgroup"]["peak_shmem_kib"] >= (48 + 8 + 4) * 1024
+                  and near(r["memory"]["memfd_peak_kib"], 48),
+                  pol=sampled(20, cgroup={"mode": "delegated", "memory_mb": "unlimited", "pids": "unlimited"}))
     # Since kernel commit d245698d727a a task that was reaped or joined still
     # counts in its cgroup until its last context switch, so sbx's own check
     # children and threads can briefly keep C or sbx-supervisor busy (issue

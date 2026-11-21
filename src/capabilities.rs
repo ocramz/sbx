@@ -7,8 +7,9 @@
 
 use crate::landlock_layer::{self, abi_kernel, Probe};
 use crate::log::{errno, os_err};
+use crate::memory;
 use crate::notify::{self, Listener, Received};
-use crate::policy::{LandlockAbi, NetMode, Policy, ResolvConfMode, RESOLV_CONF};
+use crate::policy::{LandlockAbi, MeasureCfg, NetMode, Policy, ResolvConfMode, RESOLV_CONF};
 use crate::seccomp_layer::{self, AUDIT_ARCH};
 use crate::supervisor;
 use seccompiler::sock_filter;
@@ -62,11 +63,30 @@ pub fn check(p: &Policy) -> Vec<Check> {
             outcome: subreaper(),
         });
     }
-    if p.network.mode == NetMode::Egress {
+    let egress = p.network.mode == NetMode::Egress;
+    let sampling = p.measure != MeasureCfg::Off;
+    let ptrace_for: Vec<&str> = [
+        egress.then_some(
+            "network.mode = \"egress\" (to read connect() arguments and the socket from the sandboxed process)",
+        ),
+        sampling.then_some("[measure] memory sampling (to read the sandbox's descriptors in /proc/<pid>/fd)"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !ptrace_for.is_empty() {
         v.push(Check {
             name: "CAP_SYS_PTRACE",
-            outcome: cap_sys_ptrace(),
+            outcome: cap_sys_ptrace(&ptrace_for),
         });
+    }
+    if sampling {
+        v.push(Check {
+            name: "sandbox /proc access",
+            outcome: proc_access(p),
+        });
+    }
+    if egress {
         v.push(Check {
             name: "pidfd_getfd + process_vm_readv",
             outcome: ptrace_access(p),
@@ -396,7 +416,7 @@ fn seccomp_roundtrip() -> Result<String, String> {
     Ok("listener with WAIT_KILLABLE_RECV, fd passing and replies work".into())
 }
 
-fn cap_sys_ptrace() -> Result<String, String> {
+fn cap_sys_ptrace(needed_by: &[&str]) -> Result<String, String> {
     let status = std::fs::read_to_string("/proc/self/status").map_err(|e| format!("read /proc/self/status: {e}"))?;
     let eff = status
         .lines()
@@ -404,14 +424,93 @@ fn cap_sys_ptrace() -> Result<String, String> {
         .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
         .ok_or("/proc/self/status has no CapEff line")?;
     if eff & (1 << CAP_SYS_PTRACE) == 0 {
-        return Err(
-            "network.mode = \"egress\" needs CAP_SYS_PTRACE in sbx's effective set to read connect() arguments \
-             and the socket from the sandboxed process (docker run --cap-add=SYS_PTRACE; Kubernetes: \
-             securityContext.capabilities.add: [SYS_PTRACE])"
-                .into(),
-        );
+        return Err(format!(
+            "{} need{} CAP_SYS_PTRACE in sbx's effective set (docker run --cap-add=SYS_PTRACE; Kubernetes: \
+             securityContext.capabilities.add: [SYS_PTRACE])",
+            needed_by.join(" and "),
+            if needed_by.len() == 1 { "s" } else { "" }
+        ));
     }
     Ok("present".into())
+}
+
+/// Read what memory sampling reads from a child that runs as the sandbox
+/// identity, holds a memfd and has made itself non-dumpable, as a
+/// sandboxed program may to hide its descriptors.
+fn proc_access(p: &Policy) -> Result<String, String> {
+    let (ready_r, ready_w) = pipe()?;
+    let (hold_r, hold_w) = pipe()?;
+    let (uid, gid) = (p.process.uid, p.process.gid);
+    // SAFETY: single-threaded; the child switches identity and blocks.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(os_err("fork"));
+    }
+    if pid == 0 {
+        drop(ready_r);
+        drop(hold_w);
+        // SAFETY: identity switch, prctl, memfd_create and pipe IO in the child only.
+        unsafe {
+            if libc::geteuid() == 0
+                && (libc::setgroups(0, std::ptr::null()) != 0
+                    || libc::setresgid(gid, gid, gid) != 0
+                    || libc::setresuid(uid, uid, uid) != 0)
+            {
+                libc::_exit(3);
+            }
+            if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
+                libc::_exit(4);
+            }
+            if libc::memfd_create(c"sbx-probe".as_ptr(), libc::MFD_CLOEXEC) < 0 {
+                libc::_exit(5);
+            }
+            let b = 1u8;
+            libc::write(ready_w.as_raw_fd(), (&b as *const u8).cast(), 1);
+            let mut b = 0u8;
+            libc::read(hold_r.as_raw_fd(), (&mut b as *mut u8).cast(), 1);
+            libc::_exit(0);
+        }
+    }
+    drop(ready_w);
+    drop(hold_r);
+    let result = (|| {
+        let mut b = 0u8;
+        // SAFETY: reading one byte into b; EOF means the child failed its setup.
+        if unsafe { libc::read(ready_r.as_raw_fd(), (&mut b as *mut u8).cast(), 1) } != 1 {
+            return Err(None);
+        }
+        memory::proc_mem(pid).map_err(|e| Some(e.to_string()))?;
+        let fds = memory::memfds(pid).map_err(|e| {
+            Some(format!(
+                "{e} (reading the descriptors of a non-dumpable process of another uid needs CAP_SYS_PTRACE)"
+            ))
+        })?;
+        if fds.is_empty() {
+            return Err(Some(format!("/proc/{pid}/fd shows no memfd")));
+        }
+        memory::sysv_segments().map_err(Some)?;
+        Ok(())
+    })();
+    drop(hold_w);
+    // SAFETY: killing our own test child (it may be blocked or already gone).
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    let st = wait_child(pid)?;
+    let setup = |code| {
+        let what = match code {
+            3 => format!("switch to {uid}:{gid}"),
+            4 => "make itself non-dumpable".to_string(),
+            5 => "create a memfd".to_string(),
+            _ => format!("start (wait status {st:#x})"),
+        };
+        format!("the test child could not {what}")
+    };
+    match result {
+        Ok(_) => Ok(format!(
+            "reads the memory, memfds and SysV segments of a non-dumpable process running as {uid}:{gid}"
+        )),
+        Err(Some(e)) => Err(e),
+        Err(None) => Err(setup(if libc::WIFEXITED(st) { libc::WEXITSTATUS(st) } else { -1 })),
+    }
 }
 
 static MARKER: [u8; 8] = *b"sbx-mark";
