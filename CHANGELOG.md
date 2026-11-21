@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.4
+
+**Breaking:** every policy now needs a `[measure]` table. To keep v0.3's behaviour, add:
+
+```toml
+[measure]
+memory_sample_ms = 0
+tmpfs = []
+```
+
+sbx refuses a policy without it and says what to add. The shipped policies already have it.
+
+### Added
+
+- Memory by kind (#10). With `[measure] memory_sample_ms` above 0, sbx samples the sandbox's memory while the program runs and the report gets a `memory` key (`null` with sampling off): the largest process's anonymous, file-backed and shared resident memory, the tree's anonymous total, memfds (mapped or not), SysV segments (attached or not), the use of the tmpfs mounts listed in `[measure] tmpfs`, and, with a delegated cgroup, its `memory.stat` `anon` and `shmem`, plus how many processes exited before any sample saw them. Sampled peaks are lower bounds; `rusage.max_rss_kib` stays the exact single-process peak. Sampling needs `CAP_SYS_PTRACE`, which `sbx probe` and `sbx run` check. See the README, [Memory by kind](README.md#memory-by-kind).
+
 ## v0.3.1
 
 ### Added

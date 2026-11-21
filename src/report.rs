@@ -3,6 +3,7 @@
 //! down, by the supervisor; see [`crate::destination`] for where it may go.
 
 use crate::cgroup::CgroupStats;
+use crate::memory::MemoryReport;
 use serde::Serialize;
 
 /// Where `sbx run` failed before the program started: a step of the
@@ -214,12 +215,14 @@ pub struct Ran {
     pub wall_ms: u64,
     pub usage: Usage,
     pub cgroup: Option<CgroupStats>,
+    /// Memory by kind, with `[measure]` sampling on.
+    pub memory: Option<MemoryReport>,
 }
 
 #[derive(Debug)]
 pub enum Outcome {
     SetupFailed(SetupError),
-    Ran(Ran),
+    Ran(Box<Ran>),
 }
 
 impl Outcome {
@@ -244,6 +247,7 @@ impl Outcome {
             wall_ms: None,
             rusage: None,
             cgroup: None,
+            memory: None,
         };
         match self {
             Outcome::SetupFailed(e) => {
@@ -269,6 +273,7 @@ impl Outcome {
                     max_rss_kib: ran.usage.max_rss_kib,
                 });
                 r.cgroup = ran.cgroup.as_ref();
+                r.memory = ran.memory.as_ref();
             }
         }
         let mut out = serde_json::to_vec_pretty(&r).map_err(|e| format!("serializing the report: {e}"))?;
@@ -290,6 +295,7 @@ struct Json<'a> {
     wall_ms: Option<u64>,
     rusage: Option<JsonUsage>,
     cgroup: Option<&'a CgroupStats>,
+    memory: Option<&'a MemoryReport>,
 }
 
 #[derive(Serialize)]
@@ -394,9 +400,9 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&failed.to_json("v0.3").unwrap()).unwrap();
         assert_eq!(v["exit_code"], 127);
         assert_eq!(v["setup_error"]["stage"], "execve");
-        assert!(v["program"].is_null() && v["wall_ms"].is_null() && v["cgroup"].is_null());
+        assert!(v["program"].is_null() && v["wall_ms"].is_null() && v["cgroup"].is_null() && v["memory"].is_null());
 
-        let ran = Outcome::Ran(Ran {
+        let ran = Outcome::Ran(Box::new(Ran {
             exit_code: 137,
             program: Some(Program::Signaled(9)),
             timed_out: false,
@@ -410,13 +416,14 @@ mod tests {
                 max_rss_kib: 7,
             },
             cgroup: None,
-        });
-        let v: serde_json::Value = serde_json::from_slice(&ran.to_json("v0.3").unwrap()).unwrap();
+            memory: None,
+        }));
+        let v: serde_json::Value = serde_json::from_slice(&ran.to_json("v0.4").unwrap()).unwrap();
         assert_eq!(v["program"]["signaled"], 9);
         assert_eq!(v["denials"][0]["syscall"], "ptrace");
         assert_eq!(v["rusage"]["user_ms"], 2);
         assert!(v["setup_error"].is_null());
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys.len(), 11, "{keys:?}");
+        assert_eq!(keys.len(), 12, "{keys:?}");
     }
 }

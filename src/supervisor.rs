@@ -22,6 +22,7 @@ use crate::dns;
 use crate::egress::Egress;
 use crate::landlock_layer;
 use crate::log::{self, errno, fatal_signal, os_err};
+use crate::memory::{Pid, Sampler};
 use crate::notify::{self, Dispatcher, Listener, Received, Stats};
 use crate::policy::{DnsCfg, LandlockAbi, Limit, Policy, Timeout};
 use crate::report::{self, At, Program, Ran, SetupError, Stage, Usage};
@@ -83,8 +84,15 @@ const FORWARDED: [libc::c_int; 6] = [
 ];
 
 /// Run the program and supervise it until every sandboxed process is gone.
-pub fn run(p: &Policy, l: Launch, svc: Services, sig: &Signals, cg: Option<&Delegation>) -> Result<Ran, SetupError> {
-    launch(p, l, svc, sig, cg)
+pub fn run(
+    p: &Policy,
+    l: Launch,
+    svc: Services,
+    sig: &Signals,
+    cg: Option<&Delegation>,
+    memory: Option<Sampler>,
+) -> Result<Ran, SetupError> {
+    launch(p, l, svc, sig, cg, memory)
 }
 
 fn pipe() -> Result<(OwnedFd, OwnedFd), String> {
@@ -163,7 +171,14 @@ impl Signals {
     }
 }
 
-fn launch(p: &Policy, mut l: Launch, svc: Services, sig: &Signals, cg: Option<&Delegation>) -> Result<Ran, SetupError> {
+fn launch(
+    p: &Policy,
+    mut l: Launch,
+    svc: Services,
+    sig: &Signals,
+    cg: Option<&Delegation>,
+    memory: Option<Sampler>,
+) -> Result<Ran, SetupError> {
     // SAFETY: getpid has no preconditions.
     let am_pid1 = unsafe { libc::getpid() } == 1;
     if !am_pid1 {
@@ -229,7 +244,11 @@ fn launch(p: &Policy, mut l: Launch, svc: Services, sig: &Signals, cg: Option<&D
         return Err(child_failure(pid, &msg, cg));
     }
     log::info(format!("started pid {pid}"));
-    Ok(supervise(p, pid, am_pid1, sig, &stats, dispatcher, cg))
+    let acct = Accounts {
+        usage: Usage::default(),
+        memory,
+    };
+    Ok(supervise(p, pid, am_pid1, sig, &stats, dispatcher, cg, acct))
 }
 
 fn start_services(
@@ -280,7 +299,7 @@ fn child_failure(pid: libc::pid_t, msg: &str, cg: Option<&Delegation>) -> SetupE
     if stage == Stage::Execve && detail.contains("Permission denied") {
         errors.push("hint: the program (and its interpreter) need 'x' in an fs rule, e.g. --rx /opt/app".into());
     }
-    if let Err(e) = wait_for(pid, &mut Usage::default()) {
+    if let Err(e) = wait_for(pid, &mut Accounts::default()) {
         errors.push(e);
     }
     if cg.is_some_and(|c| c.oom_kills() > 0) {
@@ -289,10 +308,17 @@ fn child_failure(pid: libc::pid_t, msg: &str, cg: Option<&Delegation>) -> SetupE
     SetupError { stage, errors }
 }
 
+/// What the supervisor learns from the processes it reaps.
+#[derive(Default)]
+struct Accounts {
+    usage: Usage,
+    memory: Option<Sampler>,
+}
+
 /// waitpid that adds the reaped process's resource usage (which includes
-/// the descendants it waited for itself) to `usage`. Ok(None): WNOHANG and
-/// nothing has exited.
-fn wait(pid: libc::pid_t, flags: libc::c_int, usage: &mut Usage) -> Result<Option<(libc::pid_t, libc::c_int)>, i32> {
+/// the descendants it waited for itself) to `acct`, and tells the memory
+/// sampler. Ok(None): WNOHANG and nothing has exited.
+fn wait(pid: libc::pid_t, flags: libc::c_int, acct: &mut Accounts) -> Result<Option<(libc::pid_t, libc::c_int)>, i32> {
     let mut st = 0;
     // SAFETY: zeroed rusage is valid output storage.
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
@@ -304,13 +330,16 @@ fn wait(pid: libc::pid_t, flags: libc::c_int, usage: &mut Usage) -> Result<Optio
     if r == 0 {
         return Ok(None);
     }
-    *usage = usage.combine(Usage::from_rusage(&ru));
+    acct.usage = acct.usage.combine(Usage::from_rusage(&ru));
+    if let Some(m) = &mut acct.memory {
+        m.reaped(r);
+    }
     Ok(Some((r, st)))
 }
 
-fn wait_for(pid: libc::pid_t, usage: &mut Usage) -> Result<libc::c_int, String> {
+fn wait_for(pid: libc::pid_t, acct: &mut Accounts) -> Result<libc::c_int, String> {
     loop {
-        match wait(pid, 0, usage) {
+        match wait(pid, 0, acct) {
             Ok(Some((_, st))) => return Ok(st),
             Err(libc::EINTR) | Ok(None) => continue,
             Err(e) => return Err(format!("waitpid({pid}): {}", std::io::Error::from_raw_os_error(e))),
@@ -323,7 +352,7 @@ fn kill_and_wait(pid: libc::pid_t) {
     if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 && errno() != libc::ESRCH {
         log::error(os_err(format!("kill({pid}, SIGKILL)")));
     }
-    if let Err(e) = wait_for(pid, &mut Usage::default()) {
+    if let Err(e) = wait_for(pid, &mut Accounts::default()) {
         log::error(e);
     }
 }
@@ -594,6 +623,7 @@ fn reset_signals() -> Result<(), String> {
     Ok(())
 }
 
+#[expect(clippy::too_many_arguments, reason = "the supervisor's whole state, passed once")]
 fn supervise(
     p: &Policy,
     child: libc::pid_t,
@@ -602,6 +632,7 @@ fn supervise(
     stats: &Stats,
     dispatcher: JoinHandle<()>,
     cg: Option<&Delegation>,
+    mut acct: Accounts,
 ) -> Ran {
     let started = Instant::now();
     let deadline = match p.process.timeout_secs {
@@ -614,7 +645,7 @@ fn supervise(
     let mut fatal = false;
     // Whether sbx killed the tree before the program exited.
     let mut killed = false;
-    let mut usage = Usage::default();
+    let mut next_sample = acct.memory.as_ref().map(|m| started + m.interval());
     let kill = |killed: &mut bool| {
         *killed = true;
         kill_tree(child, am_pid1, cg);
@@ -639,7 +670,16 @@ fn supervise(
                 kill_at = None;
             }
         }
-        let next = [deadline.filter(|_| !timed_out), kill_at].into_iter().flatten().min();
+        if let (Some(m), Some(at)) = (&mut acct.memory, next_sample) {
+            if now >= at {
+                sample_memory(m, am_pid1, cg);
+                next_sample = Some(Instant::now() + m.interval());
+            }
+        }
+        let next = [deadline.filter(|_| !timed_out), kill_at, next_sample]
+            .into_iter()
+            .flatten()
+            .min();
         let ts = next.map(|n| {
             let d = n.saturating_duration_since(Instant::now());
             libc::timespec {
@@ -664,7 +704,7 @@ fn supervise(
                     log::raise_fatal(&os_err("sigtimedwait"));
                     fatal = true;
                     kill(&mut killed);
-                    match wait_for(child, &mut usage) {
+                    match wait_for(child, &mut acct) {
                         Ok(st) => break Some(st),
                         Err(e) => {
                             log::error(e);
@@ -675,7 +715,7 @@ fn supervise(
             }
         }
         if s == libc::SIGCHLD {
-            if let Some(st) = reap(child, &mut usage) {
+            if let Some(st) = reap(child, &mut acct) {
                 break Some(st);
             }
             continue;
@@ -699,6 +739,10 @@ fn supervise(
         }
     };
     let wall = started.elapsed();
+    // What the program left running, in tmpfs or in SysV segments counts too.
+    if let Some(m) = &mut acct.memory {
+        sample_memory(m, am_pid1, cg);
+    }
 
     // The main program is gone; nothing it left behind may outlive it.
     let killed_after_exit = (!killed).then(|| leftovers(am_pid1, cg));
@@ -708,7 +752,7 @@ fn supervise(
         ));
     }
     kill_tree(child, am_pid1, cg);
-    reap_all(am_pid1, &mut usage);
+    reap_all(am_pid1, &mut acct);
     // The listener reports POLLHUP once no sandboxed task is left, so the
     // dispatcher returns and the denial counts are final.
     let until = Instant::now() + Duration::from_secs(2);
@@ -740,16 +784,17 @@ fn supervise(
         denials: stats.denials(),
         killed_after_exit,
         wall_ms: wall.as_millis() as u64,
-        usage,
+        usage: acct.usage,
         cgroup: None,
+        memory: acct.memory.map(Sampler::finish),
     }
 }
 
 /// Reap whatever has exited; return the main child's status once it has.
-fn reap(child: libc::pid_t, usage: &mut Usage) -> Option<libc::c_int> {
+fn reap(child: libc::pid_t, acct: &mut Accounts) -> Option<libc::c_int> {
     let mut main = None;
     loop {
-        match wait(-1, libc::WNOHANG, usage) {
+        match wait(-1, libc::WNOHANG, acct) {
             Ok(Some((pid, st))) if pid == child => main = Some(st),
             Ok(Some(_)) => {}
             Ok(None) | Err(libc::ECHILD) => return main,
@@ -772,7 +817,17 @@ fn leftovers(am_pid1: bool, cg: Option<&Delegation>) -> u32 {
     }
     // SAFETY: getpid has no preconditions.
     let me = unsafe { libc::getpid() };
-    live_descendants(&proc_table(), me, am_pid1)
+    live_descendants(&proc_table(), me, am_pid1).len() as u32
+}
+
+/// One memory sample of the sandbox's live processes.
+fn sample_memory(m: &mut Sampler, am_pid1: bool, cg: Option<&Delegation>) {
+    let procs = proc_table();
+    // SAFETY: getpid has no preconditions.
+    let me = unsafe { libc::getpid() };
+    let live = live_descendants(&procs, me, am_pid1);
+    let present: BTreeSet<Pid> = procs.iter().map(|&(pid, _, _)| pid).collect();
+    m.sample(&live, &present, cg);
 }
 
 /// One /proc entry: (pid, parent pid, is a zombie).
@@ -780,7 +835,7 @@ type ProcEntry = (libc::pid_t, libc::pid_t, bool);
 
 /// Live processes below `root`: with `everything` (sbx is PID 1 of the
 /// container), every process but `root` itself.
-fn live_descendants(procs: &[ProcEntry], root: libc::pid_t, everything: bool) -> u32 {
+fn live_descendants(procs: &[ProcEntry], root: libc::pid_t, everything: bool) -> BTreeSet<libc::pid_t> {
     let below: BTreeSet<libc::pid_t> = if everything {
         procs
             .iter()
@@ -802,7 +857,8 @@ fn live_descendants(procs: &[ProcEntry], root: libc::pid_t, everything: bool) ->
     procs
         .iter()
         .filter(|&&(pid, _, zombie)| !zombie && below.contains(&pid))
-        .count() as u32
+        .map(|&(pid, _, _)| pid)
+        .collect()
 }
 
 fn proc_table() -> Vec<ProcEntry> {
@@ -857,10 +913,10 @@ fn kill_tree(child: libc::pid_t, am_pid1: bool, cg: Option<&Delegation>) {
     }
 }
 
-fn reap_all(am_pid1: bool, usage: &mut Usage) {
+fn reap_all(am_pid1: bool, acct: &mut Accounts) {
     let until = Instant::now() + Duration::from_secs(5);
     loop {
-        match wait(-1, libc::WNOHANG, usage) {
+        match wait(-1, libc::WNOHANG, acct) {
             Ok(Some(_)) | Err(libc::EINTR) => {}
             Err(libc::ECHILD) => return,
             Err(e) => {
@@ -917,7 +973,7 @@ mod tests {
         #[test]
         fn leftovers_are_the_live_descendants(t in table(), root_ix in any::<prop::sample::Index>()) {
             let root = t[root_ix.index(t.len())].0;
-            let n = live_descendants(&t, root, false);
+            let got = live_descendants(&t, root, false);
             // Brute force: follow each process's parents up to the root.
             let parent = |pid| t.iter().find(|e| e.0 == pid).map(|e| e.1);
             let below = |mut pid| loop {
@@ -927,9 +983,9 @@ mod tests {
                     None => return false,
                 }
             };
-            let want = t.iter().filter(|e| e.0 != root && !e.2 && below(e.0)).count() as u32;
-            prop_assert_eq!(n, want);
-            let all = t.iter().filter(|e| e.0 != root && !e.2).count() as u32;
+            let want: BTreeSet<libc::pid_t> = t.iter().filter(|e| e.0 != root && !e.2 && below(e.0)).map(|e| e.0).collect();
+            prop_assert_eq!(got, want);
+            let all: BTreeSet<libc::pid_t> = t.iter().filter(|e| e.0 != root && !e.2).map(|e| e.0).collect();
             prop_assert_eq!(live_descendants(&t, root, true), all);
         }
     }

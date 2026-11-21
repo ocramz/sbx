@@ -19,6 +19,7 @@ sbx runs one sandbox at a time, one per container.
 | Configurable at start | A complete policy file, plus `SBX_*` variables and flags for per-run additions |
 | Fail loudly | Requirements are probed before anything starts; unknown or empty settings, symlinked or missing paths, and unsupported ABIs are errors |
 | Trustworthy outcome | `--report FILE`: a root-owned JSON report of how the run ended (exit code or signal, timeout, the setup stage that failed, denied syscalls, leftover processes, wall and CPU time, memory); `--log FILE` keeps sbx's own lines off the program's stderr ([Job report and log file](#job-report-and-log-file)) |
+| Memory by kind | `[measure] memory_sample_ms`: sbx samples the sandbox's anonymous, file-backed and shared memory per process, its memfds, SysV segments and tmpfs files, and reports the peaks, since `ru_maxrss` counts library pages and misses memory no process maps ([Memory by kind](#memory-by-kind)) |
 | Memory and process limits | `[cgroup] mode = "delegated"`: the sandbox runs in a cgroup of its own with `memory.max` and `pids.max`, so an OOM kill hits the program, not sbx, and is reported ([cgroup limits](#cgroup-limits)) |
 
 ## Architecture
@@ -30,7 +31,8 @@ container start
    │ 1. resolve policy: file + SBX_* env + flags; validate everything, report every error
    │ 2. check requirements (Landlock ABI, seccomp listener round trip, close_range,
    │    identity, no other sandbox; egress: CAP_SYS_PTRACE, pidfd_getfd, DNS listener,
-   │    resolv.conf), then claim the container's sandbox slot
+   │    resolv.conf; memory sampling: CAP_SYS_PTRACE, /proc access), then claim the
+   │    container's sandbox slot
    │ 3. delegated cgroup: create the sandbox cgroup; open allowed paths, build the
    │    Landlock ruleset, compile the BPF filters
    │ 4. fork
@@ -43,7 +45,8 @@ container start
    └─ parent ─ notification thread: log/deny policy matches, decide connect() (egress)
                DNS proxy threads (egress with domain rules)
                main loop: forward SIGTERM/INT/HUP/QUIT/USR1/USR2, enforce the timeout
-               (exit 124), reap, kill everything left on exit, propagate the exit code
+               (exit 124), sample memory by kind, reap, kill everything left on exit,
+               propagate the exit code
                teardown: restore the cgroup and resolv.conf, write the report
 ```
 
@@ -119,7 +122,7 @@ Egress mode needs `CAP_SYS_PTRACE` in the container (`docker run --cap-add=SYS_P
 
 ```json
 {
-  "sbx_version": "v0.3",
+  "sbx_version": "v0.4",
   "exit_code": 137,
   "program": {"signaled": 9},
   "timed_out": false,
@@ -130,7 +133,11 @@ Egress mode needs `CAP_SYS_PTRACE` in the container (`docker run --cap-add=SYS_P
   "wall_ms": 1520,
   "rusage": {"user_ms": 310, "sys_ms": 42, "max_rss_kib": 51200},
   "cgroup": {"memory_mb": 512, "pids": 256, "memory_peak_kib": 60112, "oom_kills": 1,
-             "pids_max_hits": 0, "user_ms": 318, "sys_ms": 45}
+             "pids_max_hits": 0, "user_ms": 318, "sys_ms": 45},
+  "memory": {"interval_ms": 20, "samples": 74, "max_anon_kib": 40960, "max_file_kib": 9216,
+             "max_shmem_kib": 16384, "tree_peak_anon_kib": 45056, "memfd_peak_kib": 49152,
+             "sysv_shm_peak_kib": 4096, "tmpfs_peak_kib": {"/dev/shm": 8192},
+             "cgroup": {"peak_anon_kib": 44100, "peak_shmem_kib": 61440}, "unsampled_processes": 0}
 }
 ```
 
@@ -146,12 +153,46 @@ Egress mode needs `CAP_SYS_PTRACE` in the container (`docker run --cap-add=SYS_P
 | `wall_ms` | from `execve` until the program's process was reaped |
 | `rusage` | CPU time of every process sbx reaped, each including the descendants it waited for itself, and the largest resident set of any single process. Children of a process that ignores SIGCHLD are reaped by the kernel and not counted |
 | `cgroup` | with `mode = "delegated"`: the limits, the peak memory of the whole sandbox (page cache and tmpfs files included), OOM kills, forks refused by `pids.max`, and the cgroup's CPU time; otherwise `null` |
+| `memory` | with `[measure]` sampling on: the sandbox's memory by kind, sampled ([Memory by kind](#memory-by-kind)); otherwise, and when the program never started, `null` |
 
 The report is trusted because the program cannot have touched it. Every directory from `/` down to the report's own must belong to root (or sbx's uid) and be writable by nobody else. A sticky directory such as `/tmp` is allowed above it, but not as the report's own directory. The directory must be canonical. sbx opens it when it starts, creates the file through that descriptor with `O_NOFOLLOW`, and gives it mode 0600. A symlink left at the path is replaced, not followed. If sbx is not root, the program runs as sbx's own uid, so the directory must also lie outside every fs rule (and Landlock must be on). `sbx probe --report FILE` checks the destination without touching the file there.
 
 `--log FILE` (or `SBX_LOG_FILE`) sends sbx's own lines to FILE instead of stderr, so the program's stderr holds only what the program wrote. The same path rules apply. The file is appended to and created 0600 if missing; an existing one must be a regular file of sbx's uid that nobody else can access. Lines are written as they happen. Process names and DNS names in them have control characters escaped, so the sandbox cannot forge a line. If a write fails, sbx prints the line and the error on stderr and tears the sandbox down (exit 125). Errors before the file is open still go to stderr.
 
-`sbx version` prints the `git describe` of the commit sbx was built from: the tag, such as `v0.3`, for a release.
+`sbx version` prints the `git describe` of the commit sbx was built from: the tag, such as `v0.4`, for a release.
+
+## Memory by kind
+
+`rusage.max_rss_kib` (`ru_maxrss`) is the exact peak resident set of the largest process, but as a measure of what a program costs it is off both ways: it counts the file pages of the binary and its libraries, and misses memory that no process maps, such as an unmapped memfd, a tmpfs or `/dev/shm` file, or a detached SysV segment. `[measure]`, required in every policy, makes sbx sample the sandbox's memory by kind while the program runs:
+
+```toml
+[measure]
+memory_sample_ms = 20      # 0 = off (the shipped policies); at most 60000
+tmpfs = ["/dev/shm"]       # tmpfs mount points to measure; only with sampling on
+```
+
+Every `memory_sample_ms`, and once more right after the program's process exits (so what it leaves behind counts), the supervisor reads:
+
+* for each live sandbox process (the descendants of sbx, or every other process when sbx is PID 1): `RssAnon`, `RssFile` and `RssShmem` from `/proc/<pid>/status`, and the memfds among its descriptors in `/proc/<pid>/fd`, sized by their allocated blocks, each counted once however many descriptors and processes hold it;
+* the SysV shared memory segments of the sandbox (owned or created by its uid, or created by one of its processes) from `/proc/sysvipc/shm`, by their resident size, attached or not;
+* for each `tmpfs` mount, its use (`statvfs`) above the level it had when sbx started;
+* with `[cgroup] mode = "delegated"`, the sandbox cgroup's `memory.stat` `anon` and `shmem` (which counts memfd, tmpfs and SysV pages by itself).
+
+The report's `memory` holds `interval_ms`, `samples` and the peaks over all samples, in KiB:
+
+| Key | Peak of |
+|---|---|
+| `max_anon_kib`, `max_file_kib`, `max_shmem_kib` | the largest single process, per kind, as `max_rss_kib` is |
+| `tree_peak_anon_kib` | the sum of `RssAnon` over the sandbox's processes in one sample; copy-on-write pages shared after `fork` count once in each process |
+| `memfd_peak_kib` | the memfds open in the sandbox |
+| `sysv_shm_peak_kib` | the sandbox's SysV segments |
+| `tmpfs_peak_kib` | per listed mount, its use above the level at start |
+| `cgroup` | `{"peak_anon_kib", "peak_shmem_kib"}` from `memory.stat` with a delegated cgroup; otherwise `null` |
+| `unsampled_processes` | processes sbx reaped (the program and orphans reparented to sbx) that no sample saw. A process reaped by its own parent is never seen by sbx and not counted here; its peak is still in `rusage.max_rss_kib` |
+
+Sampled peaks are lower bounds: what rises and falls between two samples is missed, so a shorter interval catches more at the cost of supervisor time. `rusage.max_rss_kib` stays the exact single-process total. A failed read (other than of a process that exited meanwhile) is logged once per kind and sampling goes on.
+
+Sampling needs `CAP_SYS_PTRACE`: listing the descriptors of a process of another uid needs it, and without it the sandbox could hide its memfds with `prctl(PR_SET_DUMPABLE, 0)`. sbx refuses to start without it, and `sbx probe` checks that it can read the status and descriptors of a non-dumpable child running as the sandbox uid. On Cloud Run, where no cgroup is delegated, the `/proc` figures are the whole measurement.
 
 ## cgroup limits
 
@@ -177,7 +218,7 @@ Where a delegated cgroup comes from:
 
 ## Configuration
 
-The policy file is required (`--policy` or `SBX_POLICY_FILE`; the image sets `SBX_POLICY_FILE=/etc/sbx/policy.toml`). Every field must be present and unknown fields are rejected. **Upgrading from v0.2:** add `[cgroup]` with `mode = "off"` to keep v0.2's behaviour; sbx v0.3 refuses a policy without it and says so. [`policy/default.toml`](policy/default.toml) is the shipped policy (no network). [`policy/egress.example.toml`](policy/egress.example.toml) shows egress rules and the DNS proxy, and [`policy/no-landlock.example.toml`](policy/no-landlock.example.toml) is the same for kernels without Landlock. All three are validated against the image during the build. Environment variables and flags then extend the policy (path grants and egress rules are added) or replace a few scalars (flags win over the environment):
+The policy file is required (`--policy` or `SBX_POLICY_FILE`; the image sets `SBX_POLICY_FILE=/etc/sbx/policy.toml`). Every field must be present and unknown fields are rejected. **Upgrading from v0.3:** add `[measure]` with `memory_sample_ms = 0` and `tmpfs = []` to keep v0.3's behaviour; sbx v0.4 refuses a policy without it and says so. **From v0.2,** also add `[cgroup]` with `mode = "off"`. [`policy/default.toml`](policy/default.toml) is the shipped policy (no network). [`policy/egress.example.toml`](policy/egress.example.toml) shows egress rules and the DNS proxy, and [`policy/no-landlock.example.toml`](policy/no-landlock.example.toml) is the same for kernels without Landlock. All three are validated against the image during the build. Environment variables and flags then extend the policy (path grants and egress rules are added) or replace a few scalars (flags win over the environment):
 
 | Flag | Env var | Meaning |
 |---|---|---|
@@ -207,6 +248,7 @@ Exit codes: the program's own, 124 on timeout, 125 for sbx errors (bad policy, m
 * Root with `CAP_SETPCAP` (for the bounding set) and `CAP_SETUID`/`CAP_SETGID`, which Docker grants by default. A non-root sbx runs the program at its own uid, which must equal the policy's, with no supplementary groups; the sandbox is then separated from the supervisor by Landlock scoping only, so use ABI 6+. With `landlock.abi = "off"`, non-root is refused ([Without Landlock](#without-landlock)).
 * Egress: Linux 6.9+ (`PIDFD_THREAD`), `CAP_SYS_PTRACE`, Yama `ptrace_scope` < 3, and port 53 on the loopback listen address.
 * `cgroup.mode = "delegated"`: Linux 5.19+ (`memory.peak`, `cgroup.kill`), root, and a delegated cgroup v2 ([cgroup limits](#cgroup-limits)).
+* `[measure]` sampling: Linux 4.5+ (`RssAnon` in `/proc/<pid>/status`), `CAP_SYS_PTRACE`, and `/proc/sysvipc/shm` ([Memory by kind](#memory-by-kind)).
 
 ## Build and test
 
@@ -328,7 +370,7 @@ The sandbox assumes a hostile payload and a correct kernel. It narrows what the 
 * **One sandbox per container.** A second `sbx run` in the same network namespace exits 125 ([Architecture](#architecture)). The DNS proxy also binds `network.dns.listen` exclusively, and `/etc/resolv.conf` is shared by the container: while an egress sandbox runs, the rest of the container also resolves names through the sbx proxy. sbx restores the file when it exits, unless someone else changed it meanwhile (sbx then warns and leaves it), or sbx is killed with SIGKILL.
 * **UNIX sockets.** Below Landlock ABI 9, connecting to pathname UNIX sockets is restricted only by file permissions. A service outside the sandbox that listens on one could hand the sandbox an unfiltered socket, so do not expose such sockets to the sandbox's uid.
 * **`x` is hygiene.** Landlock's `x` controls `execve`, not code loading: the payload can still run code through an allowed interpreter or by invoking `ld.so` on a file it wrote. To stop fileless execution, add `seccomp.deny = ["memfd_create", "execveat"]`.
-* **Memory** is bounded only by the container limit unless the platform delegates a cgroup ([cgroup limits](#cgroup-limits)); without one, a payload that exhausts it takes down the instance, supervisor included, and no report is written. Keep service concurrency at 1 for untrusted work. `limits.as_mb` is available but breaks Go, the JVM and V8.
+* **Memory** is bounded only by the container limit unless the platform delegates a cgroup ([cgroup limits](#cgroup-limits)); without one, a payload that exhausts it takes down the instance, supervisor included, and no report is written. Keep service concurrency at 1 for untrusted work. `limits.as_mb` is available but breaks Go, the JVM and V8. Memory sampling ([Memory by kind](#memory-by-kind)) measures; it does not limit.
 
 Cloud Run also has a native **sandboxes** feature (public preview since July 2026) that runs code in a separate isolated environment inside a service instance, without access to the service's environment variables or the metadata server. If you only target Cloud Run, consider it as the outer layer with sbx inside, or instead of sbx.
 
@@ -344,6 +386,7 @@ policy/no-landlock.example.toml  the egress example with landlock.abi = "off"
 src/main.rs                      CLI: run / probe / policy / version, environment, program lookup, report
 src/policy.rs                    policy model, overrides, validation
 src/report.rs                    setup stages, the run's outcome, the JSON report
+src/memory.rs                    memory by kind: /proc, SysV, tmpfs and memory.stat sampling, peaks
 src/destination.rs               safe paths for the report and the log file, atomic writes
 src/cgroup.rs                    delegated cgroup: setup, limits, counters, teardown
 src/landlock_layer.rs            Landlock probe, ruleset, enforcement

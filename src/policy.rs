@@ -15,6 +15,7 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
 /// Every SBX_* variable sbx understands. Any other SBX_* variable is an error,
@@ -41,6 +42,9 @@ pub const MAX_LANDLOCK_ABI: u8 = 9;
 
 pub const RESOLV_CONF: &str = "/etc/resolv.conf";
 
+/// Longest interval between two memory samples.
+pub const MAX_SAMPLE_MS: u64 = 60_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
@@ -48,6 +52,7 @@ pub struct Policy {
     pub process: ProcessCfg,
     pub limits: Limits,
     pub cgroup: CgroupCfg,
+    pub measure: MeasureCfg,
     pub env: EnvCfg,
     pub network: NetworkCfg,
     pub seccomp: SeccompCfg,
@@ -153,6 +158,55 @@ impl From<CgroupCfg> for RawCgroup {
                 mode: CgroupMode::Delegated,
                 memory_mb: Some(memory_mb),
                 pids: Some(pids),
+            },
+        }
+    }
+}
+
+/// What sbx measures while the program runs, besides rusage (see the
+/// README, "Job report and log file").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawMeasure", into = "RawMeasure")]
+pub enum MeasureCfg {
+    /// No sampling: the report's `memory` is null.
+    Off,
+    /// Sample the sandbox's memory by kind every `interval_ms`, and the use
+    /// of each tmpfs mount in `tmpfs` above its level when sbx started.
+    Sampled {
+        interval_ms: NonZeroU64,
+        tmpfs: Vec<PathBuf>,
+    },
+}
+
+/// The `[measure]` table as written: tmpfs mounts only with sampling on.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMeasure {
+    memory_sample_ms: u64,
+    tmpfs: Vec<PathBuf>,
+}
+
+impl TryFrom<RawMeasure> for MeasureCfg {
+    type Error = String;
+    fn try_from(r: RawMeasure) -> Result<Self, String> {
+        match (NonZeroU64::new(r.memory_sample_ms), r.tmpfs) {
+            (None, tmpfs) if tmpfs.is_empty() => Ok(MeasureCfg::Off),
+            (None, _) => Err("measure.tmpfs is only used when measure.memory_sample_ms is above 0".into()),
+            (Some(interval_ms), tmpfs) => Ok(MeasureCfg::Sampled { interval_ms, tmpfs }),
+        }
+    }
+}
+
+impl From<MeasureCfg> for RawMeasure {
+    fn from(m: MeasureCfg) -> Self {
+        match m {
+            MeasureCfg::Off => RawMeasure {
+                memory_sample_ms: 0,
+                tmpfs: vec![],
+            },
+            MeasureCfg::Sampled { interval_ms, tmpfs } => RawMeasure {
+                memory_sample_ms: interval_ms.get(),
+                tmpfs,
             },
         }
     }
@@ -715,6 +769,9 @@ impl Policy {
         toml::from_str(src).map_err(|e| {
             let hint = if e.message().contains("missing field `cgroup`") {
                 "\nhint: [cgroup] is new in sbx v0.3; add it with mode = \"off\" to keep v0.2's behaviour"
+            } else if e.message().contains("missing field `measure`") {
+                "\nhint: [measure] is new in sbx v0.4; add it with memory_sample_ms = 0 and tmpfs = [] to keep \
+                 v0.3's behaviour"
             } else {
                 ""
             };
@@ -779,6 +836,7 @@ impl Policy {
         self.validate_fs(&mut errs, &mut warn);
         self.validate_process(&mut errs);
         self.validate_limits(&mut errs);
+        self.validate_measure(&mut errs);
         self.validate_env(&mut errs);
         self.validate_network(&mut errs, &mut warn);
         self.validate_seccomp(&mut errs, &mut warn);
@@ -942,6 +1000,48 @@ impl Policy {
         if let CgroupCfg::Delegated { memory_mb, pids } = self.cgroup {
             check_limit("cgroup.memory_mb", memory_mb, 20, errs);
             check_limit("cgroup.pids", pids, 0, errs);
+        }
+    }
+
+    fn validate_measure(&self, errs: &mut Vec<String>) {
+        let MeasureCfg::Sampled { interval_ms, tmpfs } = &self.measure else {
+            return;
+        };
+        if interval_ms.get() > MAX_SAMPLE_MS {
+            errs.push(format!(
+                "measure.memory_sample_ms must be at most {MAX_SAMPLE_MS}, got {interval_ms}"
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        let mut filesystems: BTreeMap<u64, &Path> = BTreeMap::new();
+        for t in tmpfs {
+            let p = t.display();
+            if !t.is_absolute() {
+                errs.push(format!("measure.tmpfs {p}: path must be absolute"));
+                continue;
+            }
+            if !seen.insert(t) {
+                errs.push(format!("measure.tmpfs lists {p} more than once"));
+                continue;
+            }
+            match std::fs::canonicalize(t) {
+                Err(e) => errs.push(format!("measure.tmpfs {p}: {e}")),
+                Ok(c) if &c != t => errs.push(format!(
+                    "measure.tmpfs {p} is not canonical: it resolves to {}; write the resolved path",
+                    c.display()
+                )),
+                Ok(_) => match crate::memory::tmpfs_mount(t) {
+                    Err(e) => errs.push(format!("measure.tmpfs {p}: {e}")),
+                    Ok(dev) => {
+                        if let Some(other) = filesystems.insert(dev, t) {
+                            errs.push(format!(
+                                "measure.tmpfs {p} and {} are the same filesystem; list it once",
+                                other.display()
+                            ));
+                        }
+                    }
+                },
+            }
         }
     }
 
@@ -1172,6 +1272,10 @@ cpu_secs = "unlimited"
 [cgroup]
 mode = "off"
 
+[measure]
+memory_sample_ms = 0
+tmpfs = []
+
 [env]
 pass = []
 [env.set]
@@ -1235,6 +1339,8 @@ access = "rw"
             "bind_tcp = []",
             "on_violation = \"errno\"",
             "mode = \"off\"",
+            "memory_sample_ms = 0",
+            "tmpfs = []",
         ] {
             let src = MINIMAL.replacen(line, "", 1);
             let e = parse(&src).unwrap_err();
@@ -1325,6 +1431,88 @@ access = "rw"
             p.cgroup = cg;
             let again = parse(&toml::to_string_pretty(&p).unwrap()).unwrap();
             proptest::prop_assert_eq!(again.cgroup, cg);
+        }
+    }
+
+    #[test]
+    fn the_measure_table_is_required_with_an_upgrade_hint() {
+        let src = MINIMAL.replacen("[measure]\nmemory_sample_ms = 0\ntmpfs = []\n", "", 1);
+        let e = parse(&src).unwrap_err();
+        assert!(
+            e.contains("missing field `measure`") && e.contains("new in sbx v0.4"),
+            "{e}"
+        );
+    }
+
+    fn with_measure(body: &str) -> String {
+        MINIMAL.replacen(
+            "[measure]\nmemory_sample_ms = 0\ntmpfs = []",
+            &format!("[measure]\n{body}"),
+            1,
+        )
+    }
+
+    #[test]
+    fn tmpfs_mounts_are_measured_only_with_sampling_on() {
+        let e = parse(&with_measure("memory_sample_ms = 0\ntmpfs = [\"/dev/shm\"]")).unwrap_err();
+        assert!(e.contains("only used when measure.memory_sample_ms"), "{e}");
+        let e = parse(&with_measure("memory_sample_ms = 20\ntmpfs = []\nevery = 1")).unwrap_err();
+        assert!(e.contains("unknown field"), "{e}");
+        let p = parse(&with_measure("memory_sample_ms = 20\ntmpfs = []")).unwrap();
+        assert_eq!(
+            p.measure,
+            MeasureCfg::Sampled {
+                interval_ms: NonZeroU64::new(20).unwrap(),
+                tmpfs: vec![]
+            }
+        );
+        assert_eq!(parse(MINIMAL).unwrap().measure, MeasureCfg::Off);
+    }
+
+    #[test]
+    fn measured_tmpfs_paths_must_be_distinct_tmpfs_mounts() {
+        let t = tmpdir();
+        let errs = |body: &str| parse(&with_measure(body)).unwrap().validate().unwrap_err();
+        let e = errs(&format!(
+            "memory_sample_ms = 20\ntmpfs = [\"rel\", \"/proc\", \"/proc\", \"{}\", \"{}/missing\"]",
+            t.0.display(),
+            t.0.display()
+        ));
+        let has = |s: &str| e.iter().any(|e| e.contains(s));
+        assert!(has("rel: path must be absolute"), "{e:?}");
+        assert!(has("/proc: is not a tmpfs"), "{e:?}");
+        assert!(has("lists /proc more than once"), "{e:?}");
+        // A directory, not a mount: either on another filesystem or inside a tmpfs.
+        assert!(
+            e.iter().any(|e| e.contains(&t.0.display().to_string())
+                && (e.contains("is not a tmpfs") || e.contains("not a mount point"))),
+            "{e:?}"
+        );
+        assert!(has("missing: No such file"), "{e:?}");
+        let e = errs(&format!("memory_sample_ms = {}\ntmpfs = []", MAX_SAMPLE_MS + 1));
+        assert!(e.iter().any(|e| e.contains("at most 60000")), "{e:?}");
+    }
+
+    fn measure() -> impl proptest::strategy::Strategy<Value = MeasureCfg> {
+        use proptest::prelude::*;
+        prop_oneof![
+            Just(MeasureCfg::Off),
+            (1..=i64::MAX as u64, prop::collection::vec("/[a-z]{1,8}", 0..4)).prop_map(|(ms, tmpfs)| {
+                MeasureCfg::Sampled {
+                    interval_ms: NonZeroU64::new(ms).unwrap(),
+                    tmpfs: tmpfs.into_iter().map(PathBuf::from).collect(),
+                }
+            }),
+        ]
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn measure_settings_survive_sbx_policy(m in measure()) {
+            let mut p = parse(MINIMAL).unwrap();
+            p.measure = m.clone();
+            let again = parse(&toml::to_string_pretty(&p).unwrap()).unwrap();
+            proptest::prop_assert_eq!(again.measure, m);
         }
     }
 

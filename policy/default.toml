@@ -36,6 +36,12 @@ cpu_secs = "unlimited"
 [cgroup]
 mode = "off"               # off | delegated
 
+# Memory by kind in the report (anon, file, shmem, memfd, SysV, tmpfs),
+# sampled every memory_sample_ms; 0 = off. Sampling needs CAP_SYS_PTRACE.
+[measure]
+memory_sample_ms = 0
+tmpfs = []                 # tmpfs mount points to measure, e.g. ["/dev/shm"]
+
 [env]
 pass = []                  # names copied from sbx's environment; each must be set
 [env.set]
