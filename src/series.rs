@@ -8,12 +8,18 @@
 //! `others` add up to the sample's. A process is its pid and start time; the
 //! process table holds each listed process once, with its latest name.
 //!
+//! Every figure is held as a varint of its delta from the row before
+//! ([`codec`]), and decoded only while the file is written.
+//!
 //! Pure: [`crate::memory::Tally`] feeds it, `main` writes it.
+
+mod codec;
 
 use crate::log;
 use crate::memory::{kib, Peaks, ProcKey, ProcMem, ProcRead, Sample};
-use crate::policy::{MeasureCfg, SeriesCfg};
+use crate::policy::{MeasureCfg, SeriesCfg, SeriesCompression};
 use crate::procfs::Comm;
+use codec::{room_for, Column, OptColumn, RankColumn, Room};
 use serde::ser::{SerializeStruct, Serializer};
 use serde::Serialize;
 use std::cmp::{Ordering, Reverse};
@@ -63,7 +69,7 @@ pub enum When {
     Final,
 }
 
-/// What a series records.
+/// What a series records, and how its file is written.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SeriesSpec {
     pub interval_ms: u64,
@@ -73,6 +79,8 @@ pub struct SeriesSpec {
     pub tmpfs: Vec<PathBuf>,
     pub cgroup: CgroupColumns,
     pub processes: ProcessColumns,
+    /// The file only: the series in memory is the same either way.
+    pub compression: SeriesCompression,
 }
 
 impl SeriesSpec {
@@ -81,10 +89,12 @@ impl SeriesSpec {
         let MeasureCfg::Sampled {
             interval_ms,
             tmpfs,
-            series: SeriesCfg::On {
-                max_samples,
-                max_processes,
-            },
+            series:
+                SeriesCfg::On {
+                    max_samples,
+                    max_processes,
+                    compression,
+                },
         } = cfg
         else {
             return None;
@@ -97,6 +107,7 @@ impl SeriesSpec {
             tmpfs,
             cgroup,
             processes: ProcessColumns::new(*max_processes),
+            compression: *compression,
         })
     }
 }
@@ -161,7 +172,8 @@ pub fn rank(procs: &[ProcRead], n: usize) -> (Vec<&ProcRead>, Others) {
 }
 
 impl Row {
-    /// The row, and the processes it lists in rank order.
+    /// The row, and the processes it lists in rank order: the first
+    /// `min(max_processes, live_processes)`.
     pub fn of<'s>(spec: &SeriesSpec, t_us: u64, s: &'s Sample) -> (Row, Vec<&'s ProcRead>) {
         // The same figures the report's peaks are taken over.
         let p = Peaks::of(s);
@@ -197,7 +209,8 @@ impl Row {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Slot(pub u32);
 
-/// One listed process of one row.
+/// One listed process of one row, as the tests decode it.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcessRow {
     /// Its index in the rows.
@@ -226,7 +239,7 @@ impl ProcessTable {
             }
             btree_map::Entry::Vacant(e) => {
                 let slot = Slot(u32::try_from(self.procs.len()).unwrap_or(u32::MAX));
-                room_for_one(&mut self.procs, cap);
+                room_for(&mut self.procs, 1, cap);
                 self.procs.push((p.key, p.name));
                 *e.insert(slot)
             }
@@ -234,34 +247,218 @@ impl ProcessTable {
     }
 }
 
+/// One column per figure of [`Row`], each value the delta from the row
+/// before.
+#[derive(Debug)]
+struct RowColumns {
+    t_us: Column<u64>,
+    live_processes: Column<u32>,
+    max_anon_kib: Column<u64>,
+    max_file_kib: Column<u64>,
+    max_shmem_kib: Column<u64>,
+    tree_anon_kib: Column<u64>,
+    memfd_kib: Column<u64>,
+    sysv_shm_kib: OptColumn,
+    /// One per [`SeriesSpec::tmpfs`] mount.
+    tmpfs_kib: Box<[OptColumn]>,
+    cgroup: CgroupStore,
+    /// Kept under [`ProcessColumns::Absent`] too, where they sum every
+    /// process, so that each [`Row`] comes back whole.
+    others_processes: Column<u32>,
+    others_anon_kib: Column<u64>,
+    others_file_kib: Column<u64>,
+    others_shmem_kib: Column<u64>,
+}
+
+#[derive(Debug)]
+enum CgroupStore {
+    /// [`CgroupColumns::Absent`]: every row's is `None`.
+    Absent,
+    /// `shmem` holds a value only for the rows whose read of memory.stat
+    /// succeeded, the rows where `anon` is not `null`.
+    Present { anon: OptColumn, shmem: Column<u64> },
+}
+
+impl RowColumns {
+    /// Columns for at most `rows` rows.
+    fn new(spec: &SeriesSpec, rows: usize) -> RowColumns {
+        RowColumns {
+            t_us: Column::new(rows),
+            live_processes: Column::new(rows),
+            max_anon_kib: Column::new(rows),
+            max_file_kib: Column::new(rows),
+            max_shmem_kib: Column::new(rows),
+            tree_anon_kib: Column::new(rows),
+            memfd_kib: Column::new(rows),
+            sysv_shm_kib: OptColumn::new(rows),
+            tmpfs_kib: spec.tmpfs.iter().map(|_| OptColumn::new(rows)).collect(),
+            cgroup: match spec.cgroup {
+                CgroupColumns::Absent => CgroupStore::Absent,
+                CgroupColumns::Present => CgroupStore::Present {
+                    anon: OptColumn::new(rows),
+                    shmem: Column::new(rows),
+                },
+            },
+            others_processes: Column::new(rows),
+            others_anon_kib: Column::new(rows),
+            others_file_kib: Column::new(rows),
+            others_shmem_kib: Column::new(rows),
+        }
+    }
+
+    fn push(&mut self, r: &Row) {
+        self.t_us.push(r.t_us);
+        self.live_processes.push(r.live_processes);
+        self.max_anon_kib.push(r.max_anon_kib);
+        self.max_file_kib.push(r.max_file_kib);
+        self.max_shmem_kib.push(r.max_shmem_kib);
+        self.tree_anon_kib.push(r.tree_anon_kib);
+        self.memfd_kib.push(r.memfd_kib);
+        self.sysv_shm_kib.push(r.sysv_shm_kib);
+        for (c, v) in self.tmpfs_kib.iter_mut().zip(&r.tmpfs_kib) {
+            c.push(*v);
+        }
+        if let CgroupStore::Present { anon, shmem } = &mut self.cgroup {
+            anon.push(r.cgroup.map(|c| c.anon_kib));
+            if let Some(c) = r.cgroup {
+                shmem.push(c.shmem_kib);
+            }
+        }
+        self.others_processes.push(r.others.processes);
+        self.others_anon_kib.push(r.others.mem.anon_kib);
+        self.others_file_kib.push(r.others.mem.file_kib);
+        self.others_shmem_kib.push(r.others.mem.shmem_kib);
+    }
+
+    /// Each row's cgroup figures under [`CgroupStore::Present`]; nothing
+    /// under `Absent`.
+    fn cgroup(&self) -> impl Iterator<Item = Option<CgroupKib>> + '_ {
+        let (anon, mut shmem) = match &self.cgroup {
+            CgroupStore::Absent => (None, None),
+            CgroupStore::Present { anon, shmem } => (Some(anon.values()), Some(shmem.values())),
+        };
+        anon.into_iter().flatten().map(move |a| {
+            a.and_then(|anon_kib| {
+                Some(CgroupKib {
+                    anon_kib,
+                    shmem_kib: shmem.as_mut()?.next()?,
+                })
+            })
+        })
+    }
+
+    fn blocks(&self, out: &mut Vec<Block>) {
+        let rooms = [
+            self.t_us.room(),
+            self.live_processes.room(),
+            self.max_anon_kib.room(),
+            self.max_file_kib.room(),
+            self.max_shmem_kib.room(),
+            self.tree_anon_kib.room(),
+            self.memfd_kib.room(),
+            self.sysv_shm_kib.room(),
+            self.others_processes.room(),
+            self.others_anon_kib.room(),
+            self.others_file_kib.room(),
+            self.others_shmem_kib.room(),
+        ];
+        out.extend(rooms.into_iter().map(Block::of::<u8>));
+        out.extend(self.tmpfs_kib.iter().map(|c| Block::of::<u8>(c.room())));
+        out.push(Block::fixed::<OptColumn>(self.tmpfs_kib.len()));
+        if let CgroupStore::Present { anon, shmem } = &self.cgroup {
+            out.extend([Block::of::<u8>(anon.room()), Block::of::<u8>(shmem.room())]);
+        }
+    }
+}
+
+/// The processes each row lists, in rank order. Row i lists the first
+/// `min(max_processes, live_processes)` of its sample, so neither a count
+/// nor a row index is stored.
+#[derive(Debug)]
+struct Listed {
+    slot: RankColumn<u32>,
+    anon_kib: RankColumn<u64>,
+    file_kib: RankColumn<u64>,
+    shmem_kib: RankColumn<u64>,
+    table: ProcessTable,
+    /// The most processes listed in all, over every row.
+    cap: usize,
+}
+
+impl Listed {
+    /// For at most `rows` rows of at most `n` processes.
+    fn new(n: NonZeroU32, rows: usize) -> Listed {
+        let ranks = n.get() as usize;
+        let cap = rows.saturating_mul(ranks);
+        Listed {
+            slot: RankColumn::new(ranks, cap),
+            anon_kib: RankColumn::new(ranks, cap),
+            file_kib: RankColumn::new(ranks, cap),
+            shmem_kib: RankColumn::new(ranks, cap),
+            table: ProcessTable::default(),
+            cap,
+        }
+    }
+
+    /// A row's processes, in rank order.
+    fn push(&mut self, top: &[&ProcRead]) {
+        let (table, cap) = (&mut self.table, self.cap);
+        self.slot.push_row(top.iter().map(|p| table.slot(p, cap).0));
+        self.anon_kib.push_row(top.iter().map(|p| p.mem.anon_kib));
+        self.file_kib.push_row(top.iter().map(|p| p.mem.file_kib));
+        self.shmem_kib.push_row(top.iter().map(|p| p.mem.shmem_kib));
+    }
+
+    /// With its own box.
+    fn blocks(&self, out: &mut Vec<Block>) {
+        out.push(Block::fixed::<Listed>(1));
+        for (bytes, state) in [
+            (self.slot.room(), self.slot.state_room()),
+            (self.anon_kib.room(), self.anon_kib.state_room()),
+            (self.file_kib.room(), self.file_kib.state_room()),
+            (self.shmem_kib.room(), self.shmem_kib.state_room()),
+        ] {
+            out.extend([Block::of::<u8>(bytes), Block::of::<u64>(state)]);
+        }
+        out.push(Block::of::<(ProcKey, Comm)>(Room {
+            capacity: self.table.procs.capacity(),
+            cap: self.cap,
+        }));
+        out.push(Block {
+            now: map_cost(self.table.slots.len() as u64),
+            most: map_cost(self.cap as u64),
+        });
+        // Writing the file decodes one of these columns at a time, with a
+        // row of state of its own.
+        out.push(Block {
+            now: 0,
+            most: vec_cost::<u64>(self.slot.ranks() as u64),
+        });
+    }
+}
+
+#[derive(Debug)]
+enum ProcessStore {
+    /// [`ProcessColumns::Absent`].
+    Absent,
+    /// Boxed: a series without processes does not carry the room.
+    Top(Box<Listed>),
+}
+
 /// The samples of one run, as [`SeriesSpec`] says to keep them.
 #[derive(Debug)]
 pub struct MemorySeries {
     spec: SeriesSpec,
-    rows: Vec<Row>,
-    /// The listed processes of every row, by row, then in rank order.
-    entries: Vec<ProcessRow>,
-    table: ProcessTable,
-    /// Every sample taken: `rows.len() + dropped`.
+    columns: RowColumns,
+    processes: ProcessStore,
+    /// Every sample taken: the rows kept and the `dropped`.
     samples: u64,
     /// Running samples taken once `max_samples` were kept.
     dropped: u64,
 }
 
-/// Elements reserved at the first push.
-const FIRST_RESERVE: usize = 64;
-
 /// What the allocator adds to each allocation, rounded up.
 const ALLOC_OVERHEAD: u64 = 16;
-
-/// Make room for one more element: by doubling, but never beyond `cap` in
-/// all, so that the footprint stays within the bound.
-fn room_for_one<T>(v: &mut Vec<T>, cap: usize) {
-    if v.len() == v.capacity() {
-        let room = cap.saturating_sub(v.len());
-        v.reserve_exact(v.capacity().max(FIRST_RESERVE).min(room).max(1));
-    }
-}
 
 /// The heap bytes of a vector of `cap` elements of `T`.
 fn vec_cost<T>(cap: u64) -> u64 {
@@ -269,11 +466,6 @@ fn vec_cost<T>(cap: u64) -> u64 {
         0 => 0,
         n => n.saturating_mul(size_of::<T>() as u64).saturating_add(ALLOC_OVERHEAD),
     }
-}
-
-/// The heap bytes of one row's tmpfs entries.
-fn tmpfs_cost(n_tmpfs: usize) -> u64 {
-    vec_cost::<Option<u64>>(n_tmpfs as u64)
 }
 
 /// The least entries in a node of std's B-tree but the root, as long as
@@ -297,66 +489,83 @@ fn map_cost(n: u64) -> u64 {
     }
 }
 
-/// The most heap memory a series of this spec can take, as
-/// [`MemorySeries::footprint`] counts it: `max_samples` running rows and
-/// the final one, each listing `max_processes` processes never listed
-/// before.
+/// One heap block of a series: the bytes it takes now, and the most it can
+/// take. [`MemorySeries::footprint`] and [`bound`] sum them.
+#[derive(Clone, Copy, Debug)]
+struct Block {
+    now: u64,
+    most: u64,
+}
+
+impl Block {
+    /// A vector of `T` with `room`.
+    fn of<T>(room: Room) -> Block {
+        Block {
+            now: vec_cost::<T>(room.capacity as u64),
+            most: vec_cost::<T>(room.cap as u64),
+        }
+    }
+
+    /// A block that never grows: `n` elements of `T`.
+    fn fixed<T>(n: usize) -> Block {
+        let cost = vec_cost::<T>(n as u64);
+        Block { now: cost, most: cost }
+    }
+}
+
+/// The most heap memory a series of this spec can take, with the cgroup
+/// columns: `max_samples` running rows and the final one, each listing
+/// `max_processes` processes never listed before, and every varint as long
+/// as its type allows. That is [`MemorySeries::footprint`] at its most,
+/// plus the state writing the file decodes with. An empty series allocates
+/// nothing that grows with the spec, so it is built to count.
 pub fn bound(max_samples: NonZeroU32, n_tmpfs: usize, max_processes: u32) -> u64 {
-    let rows = u64::from(max_samples.get()) + 1;
-    let listed = rows.saturating_mul(u64::from(max_processes));
-    vec_cost::<Row>(rows)
-        .saturating_add(rows.saturating_mul(tmpfs_cost(n_tmpfs)))
-        .saturating_add(vec_cost::<ProcessRow>(listed))
-        .saturating_add(vec_cost::<(ProcKey, Comm)>(listed))
-        .saturating_add(map_cost(listed))
+    MemorySeries::new(SeriesSpec {
+        interval_ms: 1,
+        max_samples,
+        tmpfs: vec![PathBuf::new(); n_tmpfs],
+        cgroup: CgroupColumns::Present,
+        processes: ProcessColumns::new(max_processes),
+        compression: SeriesCompression::None,
+    })
+    .bound()
 }
 
 impl MemorySeries {
     pub fn new(spec: SeriesSpec) -> MemorySeries {
+        let rows = (spec.max_samples.get() as usize).saturating_add(1);
         MemorySeries {
+            columns: RowColumns::new(&spec, rows),
+            processes: match spec.processes {
+                ProcessColumns::Absent => ProcessStore::Absent,
+                ProcessColumns::Top(n) => ProcessStore::Top(Box::new(Listed::new(n, rows))),
+            },
             spec,
-            rows: Vec::new(),
-            entries: Vec::new(),
-            table: ProcessTable::default(),
             samples: 0,
             dropped: 0,
         }
     }
 
-    /// The most rows, and the most processes listed in all.
-    fn caps(&self) -> (usize, usize) {
-        let rows = self.spec.max_samples.get() as usize + 1;
-        (rows, rows.saturating_mul(self.spec.processes.max() as usize))
-    }
-
     pub fn push(&mut self, t_us: u64, s: &Sample, when: When) {
-        self.samples += 1;
         let keep = match when {
-            When::Running => self.rows.len() < self.spec.max_samples.get() as usize,
+            When::Running => self.kept() < u64::from(self.spec.max_samples.get()),
             When::Final => true,
         };
+        self.samples += 1;
         if !keep {
             self.dropped += 1;
             return;
         }
-        let (rows_cap, listed_cap) = self.caps();
-        let index = u32::try_from(self.rows.len()).unwrap_or(u32::MAX);
         let (row, top) = Row::of(&self.spec, t_us, s);
-        room_for_one(&mut self.rows, rows_cap);
-        self.rows.push(row);
-        for p in top {
-            let process = self.table.slot(p, listed_cap);
-            room_for_one(&mut self.entries, listed_cap);
-            self.entries.push(ProcessRow {
-                row: index,
-                process,
-                mem: p.mem,
-            });
+        self.columns.push(&row);
+        if let ProcessStore::Top(l) = &mut self.processes {
+            l.push(&top);
         }
     }
 
-    pub fn rows(&self) -> &[Row] {
-        &self.rows
+    /// The rows kept.
+    pub fn kept(&self) -> u64 {
+        self.samples - self.dropped
     }
 
     pub fn dropped(&self) -> u64 {
@@ -365,34 +574,65 @@ impl MemorySeries {
 
     /// The processes in the process table.
     pub fn listed(&self) -> usize {
-        self.table.procs.len()
+        match &self.processes {
+            ProcessStore::Absent => 0,
+            ProcessStore::Top(l) => l.table.procs.len(),
+        }
+    }
+
+    pub fn compression(&self) -> SeriesCompression {
+        self.spec.compression
+    }
+
+    /// How many processes each row lists, row after row.
+    fn lengths(&self) -> impl Iterator<Item = usize> + '_ {
+        let n = self.spec.processes.max() as usize;
+        self.columns.live_processes.values().map(move |l| (l as usize).min(n))
+    }
+
+    fn blocks(&self) -> Vec<Block> {
+        let mut out = Vec::new();
+        self.columns.blocks(&mut out);
+        if let ProcessStore::Top(l) = &self.processes {
+            l.blocks(&mut out);
+        }
+        out
     }
 
     /// The heap bytes the series holds, modelled as [`bound`] models them.
     pub fn footprint(&self) -> u64 {
-        let tmpfs = self
-            .rows
-            .iter()
-            .fold(0, |b: u64, r| b.saturating_add(tmpfs_cost(r.tmpfs_kib.len())));
-        vec_cost::<Row>(self.rows.capacity() as u64)
-            .saturating_add(tmpfs)
-            .saturating_add(vec_cost::<ProcessRow>(self.entries.capacity() as u64))
-            .saturating_add(vec_cost::<(ProcKey, Comm)>(self.table.procs.capacity() as u64))
-            .saturating_add(map_cost(self.table.slots.len() as u64))
+        self.blocks().iter().fold(0, |b, x| b.saturating_add(x.now))
     }
 
-    /// [`bound`] of this series' spec.
+    /// [`bound`] of this series' spec, with its own cgroup columns.
     pub fn bound(&self) -> u64 {
-        bound(self.spec.max_samples, self.spec.tmpfs.len(), self.spec.processes.max())
+        self.blocks().iter().fold(0, |b, x| b.saturating_add(x.most))
+    }
+}
+
+/// A column, decoded as it is written: `F` gives a fresh iterator.
+struct Seq<F>(F);
+
+impl<F, I> Serialize for Seq<F>
+where
+    F: Fn() -> I,
+    I: IntoIterator,
+    I::Item: Serialize,
+{
+    fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.collect_seq((self.0)())
     }
 }
 
 /// `{"interval_ms", "max_samples", "max_processes", "samples", "dropped",
 /// "rows", "processes", "process_rows"}`, each table one array per column,
-/// streamed from the rows, the process table and the entries.
+/// decoded from the columns while streaming.
 impl Serialize for MemorySeries {
     fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        let listed = self.spec.processes != ProcessColumns::Absent;
+        let listed = match &self.processes {
+            ProcessStore::Absent => None,
+            ProcessStore::Top(l) => Some(l),
+        };
         let mut m = ser.serialize_struct("MemorySeries", 8)?;
         m.serialize_field("interval_ms", &self.spec.interval_ms)?;
         m.serialize_field("max_samples", &self.spec.max_samples)?;
@@ -400,8 +640,8 @@ impl Serialize for MemorySeries {
         m.serialize_field("samples", &self.samples)?;
         m.serialize_field("dropped", &self.dropped)?;
         m.serialize_field("rows", &Columns(self))?;
-        m.serialize_field("processes", &listed.then_some(Processes(&self.table.procs)))?;
-        m.serialize_field("process_rows", &listed.then_some(ProcessRows(&self.entries)))?;
+        m.serialize_field("processes", &listed.map(|l| Processes(&l.table.procs)))?;
+        m.serialize_field("process_rows", &listed.map(|l| ProcessRows(self, l)))?;
         m.end()
     }
 }
@@ -410,33 +650,36 @@ struct Columns<'a>(&'a MemorySeries);
 
 impl Serialize for Columns<'_> {
     fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        let rows = &self.0.rows[..];
-        let present = self.0.spec.cgroup == CgroupColumns::Present;
-        let listed = self.0.spec.processes != ProcessColumns::Absent;
+        let c = &self.0.columns;
+        let present = matches!(c.cgroup, CgroupStore::Present { .. });
+        let listed = matches!(self.0.processes, ProcessStore::Top(_));
         let mut m = ser.serialize_struct("Rows", 15)?;
-        m.serialize_field("t_us", &col(rows, |r| r.t_us))?;
-        m.serialize_field("live_processes", &col(rows, |r| r.live_processes))?;
-        m.serialize_field("max_anon_kib", &col(rows, |r| r.max_anon_kib))?;
-        m.serialize_field("max_file_kib", &col(rows, |r| r.max_file_kib))?;
-        m.serialize_field("max_shmem_kib", &col(rows, |r| r.max_shmem_kib))?;
-        m.serialize_field("tree_anon_kib", &col(rows, |r| r.tree_anon_kib))?;
-        m.serialize_field("memfd_kib", &col(rows, |r| r.memfd_kib))?;
-        m.serialize_field("sysv_shm_kib", &col(rows, |r| r.sysv_shm_kib))?;
+        m.serialize_field("t_us", &Seq(|| c.t_us.values()))?;
+        m.serialize_field("live_processes", &Seq(|| c.live_processes.values()))?;
+        m.serialize_field("max_anon_kib", &Seq(|| c.max_anon_kib.values()))?;
+        m.serialize_field("max_file_kib", &Seq(|| c.max_file_kib.values()))?;
+        m.serialize_field("max_shmem_kib", &Seq(|| c.max_shmem_kib.values()))?;
+        m.serialize_field("tree_anon_kib", &Seq(|| c.tree_anon_kib.values()))?;
+        m.serialize_field("memfd_kib", &Seq(|| c.memfd_kib.values()))?;
+        m.serialize_field("sysv_shm_kib", &Seq(|| c.sysv_shm_kib.values()))?;
         m.serialize_field("tmpfs_kib", &Tmpfs(self.0))?;
         m.serialize_field(
             "cgroup_anon_kib",
-            &present.then(|| col(rows, |r| r.cgroup.map(|c| c.anon_kib))),
+            &present.then_some(Seq(|| c.cgroup().map(|x| x.map(|x| x.anon_kib)))),
         )?;
         m.serialize_field(
             "cgroup_shmem_kib",
-            &present.then(|| col(rows, |r| r.cgroup.map(|c| c.shmem_kib))),
+            &present.then_some(Seq(|| c.cgroup().map(|x| x.map(|x| x.shmem_kib)))),
         )?;
-        m.serialize_field("others_processes", &listed.then(|| col(rows, |r| r.others.processes)))?;
-        m.serialize_field("others_anon_kib", &listed.then(|| col(rows, |r| r.others.mem.anon_kib)))?;
-        m.serialize_field("others_file_kib", &listed.then(|| col(rows, |r| r.others.mem.file_kib)))?;
+        m.serialize_field(
+            "others_processes",
+            &listed.then_some(Seq(|| c.others_processes.values())),
+        )?;
+        m.serialize_field("others_anon_kib", &listed.then_some(Seq(|| c.others_anon_kib.values())))?;
+        m.serialize_field("others_file_kib", &listed.then_some(Seq(|| c.others_file_kib.values())))?;
         m.serialize_field(
             "others_shmem_kib",
-            &listed.then(|| col(rows, |r| r.others.mem.shmem_kib)),
+            &listed.then_some(Seq(|| c.others_shmem_kib.values())),
         )?;
         m.end()
     }
@@ -449,43 +692,31 @@ impl Serialize for Processes<'_> {
     fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
         let p = self.0;
         let mut m = ser.serialize_struct("Processes", 3)?;
-        m.serialize_field("pid", &col(p, |e| e.0.pid))?;
-        m.serialize_field("start_ticks", &col(p, |e| e.0.start.0))?;
+        m.serialize_field("pid", &Seq(|| p.iter().map(|e| e.0.pid)))?;
+        m.serialize_field("start_ticks", &Seq(|| p.iter().map(|e| e.0.start.0)))?;
         // The sandbox picks its names: escaped as the log escapes them.
-        m.serialize_field("name", &col(p, |e| log::untrusted_bytes(e.1.as_bytes())))?;
+        m.serialize_field("name", &Seq(|| p.iter().map(|e| log::untrusted_bytes(e.1.as_bytes()))))?;
         m.end()
     }
 }
 
-/// `{"row", "process", "anon_kib", "file_kib", "shmem_kib"}`.
-struct ProcessRows<'a>(&'a [ProcessRow]);
+/// `{"row", "process", "anon_kib", "file_kib", "shmem_kib"}`, by row, then
+/// in rank order.
+struct ProcessRows<'a>(&'a MemorySeries, &'a Listed);
 
 impl Serialize for ProcessRows<'_> {
     fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        let e = self.0;
+        let (s, l) = (self.0, self.1);
         let mut m = ser.serialize_struct("ProcessRows", 5)?;
-        m.serialize_field("row", &col(e, |e| e.row))?;
-        m.serialize_field("process", &col(e, |e| e.process.0))?;
-        m.serialize_field("anon_kib", &col(e, |e| e.mem.anon_kib))?;
-        m.serialize_field("file_kib", &col(e, |e| e.mem.file_kib))?;
-        m.serialize_field("shmem_kib", &col(e, |e| e.mem.shmem_kib))?;
+        m.serialize_field(
+            "row",
+            &Seq(|| s.lengths().enumerate().flat_map(|(i, n)| std::iter::repeat_n(i, n))),
+        )?;
+        m.serialize_field("process", &Seq(|| l.slot.values(s.lengths())))?;
+        m.serialize_field("anon_kib", &Seq(|| l.anon_kib.values(s.lengths())))?;
+        m.serialize_field("file_kib", &Seq(|| l.file_kib.values(s.lengths())))?;
+        m.serialize_field("shmem_kib", &Seq(|| l.shmem_kib.values(s.lengths())))?;
         m.end()
-    }
-}
-
-/// One figure of every element.
-struct Column<'a, R, T> {
-    items: &'a [R],
-    f: fn(&R) -> T,
-}
-
-fn col<R, T>(items: &[R], f: fn(&R) -> T) -> Column<'_, R, T> {
-    Column { items, f }
-}
-
-impl<R, T: Serialize> Serialize for Column<'_, R, T> {
-    fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        ser.collect_seq(self.items.iter().map(self.f))
     }
 }
 
@@ -494,26 +725,103 @@ struct Tmpfs<'a>(&'a MemorySeries);
 
 impl Serialize for Tmpfs<'_> {
     fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        let rows = &self.0.rows[..];
+        let s = self.0;
         ser.collect_map(
-            self.0
-                .spec
+            s.spec
                 .tmpfs
                 .iter()
-                .enumerate()
-                .map(|(i, path)| (path.display().to_string(), TmpfsColumn { rows, i })),
+                .zip(&s.columns.tmpfs_kib)
+                .map(|(path, c)| (path.display().to_string(), Seq(|| c.values()))),
         )
     }
 }
 
-struct TmpfsColumn<'a> {
-    rows: &'a [Row],
-    i: usize,
-}
+/// The rows and the listed processes, decoded as the file is.
+#[cfg(test)]
+impl MemorySeries {
+    pub fn rows(&self) -> Vec<Row> {
+        let c = &self.columns;
+        let (mut t_us, mut live, mut max_anon, mut max_file, mut max_shmem, mut tree_anon, mut memfd) = (
+            c.t_us.values(),
+            c.live_processes.values(),
+            c.max_anon_kib.values(),
+            c.max_file_kib.values(),
+            c.max_shmem_kib.values(),
+            c.tree_anon_kib.values(),
+            c.memfd_kib.values(),
+        );
+        let mut sysv = c.sysv_shm_kib.values();
+        let mut tmpfs: Vec<_> = c.tmpfs_kib.iter().map(OptColumn::values).collect();
+        let mut cgroup = c.cgroup();
+        let (mut op, mut oa, mut of, mut os) = (
+            c.others_processes.values(),
+            c.others_anon_kib.values(),
+            c.others_file_kib.values(),
+            c.others_shmem_kib.values(),
+        );
+        std::iter::from_fn(|| {
+            Some(Row {
+                t_us: t_us.next()?,
+                live_processes: live.next()?,
+                max_anon_kib: max_anon.next()?,
+                max_file_kib: max_file.next()?,
+                max_shmem_kib: max_shmem.next()?,
+                tree_anon_kib: tree_anon.next()?,
+                memfd_kib: memfd.next()?,
+                sysv_shm_kib: sysv.next()?,
+                tmpfs_kib: tmpfs.iter_mut().map(Iterator::next).collect::<Option<_>>()?,
+                cgroup: cgroup.next().flatten(),
+                others: Others {
+                    processes: op.next()?,
+                    mem: ProcMem {
+                        anon_kib: oa.next()?,
+                        file_kib: of.next()?,
+                        shmem_kib: os.next()?,
+                    },
+                },
+            })
+        })
+        .collect()
+    }
 
-impl Serialize for TmpfsColumn<'_> {
-    fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        ser.collect_seq(self.rows.iter().map(|r| r.tmpfs_kib.get(self.i).copied().flatten()))
+    pub fn entries(&self) -> Vec<ProcessRow> {
+        let ProcessStore::Top(l) = &self.processes else {
+            return vec![];
+        };
+        let rows = self
+            .lengths()
+            .enumerate()
+            .flat_map(|(i, n)| std::iter::repeat_n(i as u32, n));
+        rows.zip(l.slot.values(self.lengths()))
+            .zip(l.anon_kib.values(self.lengths()))
+            .zip(l.file_kib.values(self.lengths()))
+            .zip(l.shmem_kib.values(self.lengths()))
+            .map(|((((row, slot), anon_kib), file_kib), shmem_kib)| ProcessRow {
+                row,
+                process: Slot(slot),
+                mem: ProcMem {
+                    anon_kib,
+                    file_kib,
+                    shmem_kib,
+                },
+            })
+            .collect()
+    }
+
+    /// The process table: slot i is entry i.
+    pub fn procs(&self) -> &[(ProcKey, Comm)] {
+        match &self.processes {
+            ProcessStore::Absent => &[],
+            ProcessStore::Top(l) => &l.table.procs,
+        }
+    }
+
+    /// The processes in the slot map.
+    fn slots(&self) -> usize {
+        match &self.processes {
+            ProcessStore::Absent => 0,
+            ProcessStore::Top(l) => l.table.slots.len(),
+        }
     }
 }
 
@@ -521,10 +829,12 @@ impl Serialize for TmpfsColumn<'_> {
 mod tests {
     use super::*;
     use crate::memory::tests::{comm, sample_of, TMPFS};
-    use crate::memory::{Pid, Tally};
+    use crate::memory::{CgroupMem, Pid, Tally};
     use crate::procfs::StartTicks;
+    use crate::report::{series_file, series_json};
     use proptest::prelude::*;
     use std::collections::BTreeSet;
+    use std::io::Read;
     use std::time::Duration;
 
     const STEP_US: u64 = 20_000;
@@ -540,6 +850,7 @@ mod tests {
                 CgroupColumns::Absent
             },
             processes: ProcessColumns::new(max_processes),
+            compression: SeriesCompression::None,
         }
     }
 
@@ -583,41 +894,95 @@ mod tests {
 
     /// Row i's listed processes, through the process table.
     fn listed_in(s: &MemorySeries, i: usize) -> Vec<(ProcKey, ProcMem)> {
-        s.entries
+        s.entries()
             .iter()
             .filter(|e| e.row as usize == i)
-            .map(|e| (s.table.procs[e.process.0 as usize].0, e.mem))
+            .map(|e| (s.procs()[e.process.0 as usize].0, e.mem))
             .collect()
     }
 
-    fn json(s: &MemorySeries) -> serde_json::Value {
+    /// The file as `main` writes it.
+    fn file(s: &MemorySeries) -> Vec<u8> {
         let mut out = vec![];
-        crate::report::series_json(&mut out, "v0.5", s).unwrap();
-        serde_json::from_slice(&out).unwrap()
+        series_file(&mut out, "v0.5", s).unwrap();
+        out
+    }
+
+    fn json(s: &MemorySeries) -> serde_json::Value {
+        serde_json::from_slice(&file(s)).unwrap()
     }
 
     fn numbers(v: &serde_json::Value) -> Vec<u64> {
         v.as_array().unwrap().iter().map(|x| x.as_u64().unwrap()).collect()
     }
 
-    /// Sample `i` with `k` processes no other sample has.
-    fn fresh(i: usize, k: usize) -> Sample {
+    /// Whose processes a sample lists.
+    #[derive(Clone, Copy, Debug)]
+    enum Procs {
+        /// Processes no other sample has: the process table's worst case.
+        New,
+        /// The same as every other sample: the table stays small, so what
+        /// each rank costs shows.
+        Same,
+    }
+
+    /// Sample `i` at its worst for the series' memory: `k` processes,
+    /// figures far from the last sample's (half the range for the cgroup,
+    /// memfd, SysV and tmpfs bytes; a delta of 2^56 KiB per process, so
+    /// that the sums of up to 128 stay in range), and a failed read every third sample.
+    fn worst(i: usize, k: usize, n_tmpfs: usize, procs: Procs) -> Sample {
+        let far = |x: u64| if i.is_multiple_of(2) { 0 } else { x };
+        let read = |x: u64| (i % 3 != 2).then(|| far(x));
+        let id = match procs {
+            Procs::New => i,
+            Procs::Same => 0,
+        };
         Sample {
             procs: (0..k)
                 .map(|j| ProcRead {
                     key: ProcKey {
-                        pid: (i * 64 + j) as Pid + 1,
-                        start: StartTicks(i as u64),
+                        pid: (id * 128 + j) as Pid + 1,
+                        start: StartTicks(id as u64),
                     },
-                    name: Comm::new(b"fresh"),
+                    name: Comm::new(b"worst"),
                     mem: ProcMem {
-                        anon_kib: j as u64,
-                        ..ProcMem::default()
+                        anon_kib: far(1 << 56) + j as u64,
+                        file_kib: far(1 << 56),
+                        shmem_kib: far(1 << 56),
                     },
                 })
                 .collect(),
-            ..Sample::default()
+            memfd_bytes: far(1 << 63),
+            sysv_bytes: read(1 << 63),
+            tmpfs_bytes: TMPFS[..n_tmpfs]
+                .iter()
+                .map(|m| (PathBuf::from(m), read(1 << 63)))
+                .collect(),
+            cgroup: read(1 << 63).map(|b| CgroupMem {
+                anon_bytes: b,
+                shmem_bytes: b,
+            }),
         }
+    }
+
+    /// A time half the range away from the last one's.
+    fn worst_t(i: usize) -> u64 {
+        if i.is_multiple_of(2) {
+            0
+        } else {
+            1 << 63
+        }
+    }
+
+    /// A series of `pushes` running samples and the final one, at their worst.
+    fn worst_series(spec: SeriesSpec, k: usize, pushes: usize, procs: Procs) -> MemorySeries {
+        let n = spec.tmpfs.len();
+        let mut s = MemorySeries::new(spec);
+        for i in 0..pushes {
+            s.push(worst_t(i), &worst(i, k, n, procs), When::Running);
+        }
+        s.push(worst_t(pushes), &worst(pushes, k, n, procs), When::Final);
+        s
     }
 
     proptest! {
@@ -631,10 +996,11 @@ mod tests {
                 .map(|(i, x)| Row::of(&spec, i as u64 * STEP_US, x).0)
                 .collect();
             want.push(Row::of(&spec, running.len() as u64 * STEP_US, &last).0);
-            prop_assert_eq!(s.rows(), &want[..]);
+            prop_assert_eq!(s.rows(), want);
             prop_assert_eq!(s.samples, running.len() as u64 + 1);
             prop_assert_eq!(s.dropped(), (running.len() - kept) as u64);
-            prop_assert_eq!(s.samples, s.rows().len() as u64 + s.dropped());
+            prop_assert_eq!(s.kept(), s.rows().len() as u64);
+            prop_assert_eq!(s.samples, s.kept() + s.dropped());
         }
 
         #[test]
@@ -673,10 +1039,10 @@ mod tests {
                     want.insert(p.key, p.name);
                 }
             }
-            let got: BTreeMap<ProcKey, Comm> = s.table.procs.iter().copied().collect();
-            prop_assert_eq!(got.len(), s.table.procs.len(), "a process twice in {:?}", s.table.procs);
+            let got: BTreeMap<ProcKey, Comm> = s.procs().iter().copied().collect();
+            prop_assert_eq!(got.len(), s.procs().len(), "a process twice in {:?}", s.procs());
             prop_assert_eq!(got, want);
-            prop_assert_eq!(s.listed(), s.table.slots.len());
+            prop_assert_eq!(s.listed(), s.slots());
         }
 
         #[test]
@@ -695,9 +1061,9 @@ mod tests {
             s.push(0, &old, When::Running);
             s.push(1, &new, When::Running);
             s.push(2, &new, When::Final);
-            let slots: Vec<u32> = s.entries.iter().map(|e| e.process.0).collect();
+            let slots: Vec<u32> = s.entries().iter().map(|e| e.process.0).collect();
             prop_assert_eq!(slots, vec![0, 1, 1]);
-            prop_assert_eq!(&s.table.procs, &vec![(old.procs[0].key, names.0), (new.procs[0].key, names.1)]);
+            prop_assert_eq!(s.procs(), &[(old.procs[0].key, names.0), (new.procs[0].key, names.1)][..]);
         }
 
         #[test]
@@ -723,11 +1089,12 @@ mod tests {
                 .iter()
                 .map(|k| numbers(&entries[*k]))
                 .collect();
-            prop_assert!(cols.iter().all(|c| c.len() == s.entries.len()));
+            let entries = s.entries().len();
+            prop_assert!(cols.iter().all(|c| c.len() == entries));
             let rows = m["rows"]["t_us"].as_array().unwrap().len() as u64;
             // Per row, each entry's rank: (larger resident set first, pid, start).
             let mut per_row: BTreeMap<u64, Vec<Rank>> = BTreeMap::new();
-            for i in 0..s.entries.len() {
+            for i in 0..entries {
                 let (row, process) = (cols[0][i], cols[1][i] as usize);
                 prop_assert!(row < rows && process < pid.len(), "entry {}: row {} process {}", i, row, process);
                 prop_assert!(i == 0 || cols[0][i - 1] <= row, "rows out of order");
@@ -752,6 +1119,7 @@ mod tests {
             let s = s.unwrap();
             prop_assert_eq!(r.samples, s.samples);
             let rows = s.rows();
+            let rows = &rows[..];
             let max = |f: fn(&Row) -> Option<u64>| rows.iter().filter_map(f).max().unwrap_or(0);
             let mut pairs = vec![
                 ("max_anon_kib", max(|r| Some(r.max_anon_kib)), r.max_anon_kib),
@@ -782,8 +1150,7 @@ mod tests {
         #[test]
         fn every_column_has_one_entry_per_row_and_null_exactly_where_reads_failed((spec, running, last) in run()) {
             let s = record(&spec, &running, &last);
-            let mut out = vec![];
-            crate::report::series_json(&mut out, "v0.5", &s).unwrap();
+            let out = file(&s);
             prop_assert_eq!(out.iter().filter(|&&b| b == b'\n').count(), 1, "one line");
             prop_assert_eq!(out.last(), Some(&b'\n'));
             let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -879,7 +1246,8 @@ mod tests {
         }
 
         /// The worst case for the process table: every sample's processes
-        /// are new, and more than a row lists.
+        /// are new, and more than a row lists; and for the columns: every
+        /// figure far from the last sample's.
         #[test]
         fn the_bound_covers_every_series_the_spec_allows(
             max in 1..200u32,
@@ -888,39 +1256,43 @@ mod tests {
             pushes in 0..500usize,
         ) {
             let spec = spec(max, n, true, procs);
-            let k = procs as usize + 2;
-            let mut s = MemorySeries::new(spec.clone());
-            for i in 0..pushes {
-                s.push(i as u64, &fresh(i, k), When::Running);
+            let s = worst_series(spec.clone(), procs as usize + 2, pushes, Procs::New);
+            for b in s.blocks() {
+                prop_assert!(b.now <= b.most, "a block above its most: {:?}", b);
             }
-            s.push(pushes as u64, &fresh(pushes, k), When::Final);
-            let (rows_cap, listed_cap) = s.caps();
-            prop_assert!(s.rows.capacity() <= rows_cap, "rows: capacity {}", s.rows.capacity());
-            prop_assert!(s.entries.capacity() <= listed_cap, "entries: capacity {}", s.entries.capacity());
-            prop_assert!(s.table.procs.capacity() <= listed_cap, "table: capacity {}", s.table.procs.capacity());
             prop_assert_eq!(s.bound(), bound(spec.max_samples, n, procs));
             prop_assert!(s.footprint() <= s.bound(), "{} above the bound {}", s.footprint(), s.bound());
+            let without = MemorySeries::new(SeriesSpec { cgroup: CgroupColumns::Absent, ..spec });
+            prop_assert!(without.bound() < s.bound(), "the cgroup columns are not counted");
         }
 
-        /// The cost model against the heap the series really holds.
+        /// The cost model against the heap the series really holds. With
+        /// the same processes in every sample, the slot map's slack is too
+        /// small to hide a missing row of state.
         #[test]
         fn the_footprint_covers_the_series_real_memory(
             max in 1..100u32,
             n in 0..=TMPFS.len(),
-            procs in 0..6u32,
-            pushes in 0..300usize,
+            procs in 0..70u32,
+            pushes in 0..100usize,
+            which in prop_oneof![Just(Procs::New), Just(Procs::Same)],
         ) {
-            let k = procs as usize + 2;
             let spec = spec(max, n, true, procs);
-            let (s, used) = heap::held_by(|| {
-                let mut s = MemorySeries::new(spec);
-                for i in 0..pushes {
-                    s.push(i as u64, &fresh(i, k), When::Running);
-                }
-                s.push(pushes as u64, &fresh(pushes, k), When::Final);
-                s
-            });
+            let (s, used) = heap::held_by(|| worst_series(spec, procs as usize + 2, pushes, which));
             prop_assert!(used <= s.footprint(), "{} bytes held, {} modelled", used, s.footprint());
+        }
+
+        #[test]
+        fn gzip_output_inflates_to_the_plain_json((spec, running, last) in run()) {
+            let plain = record(&spec, &running, &last);
+            let mut json = vec![];
+            series_json(&mut json, "v0.5", &plain).unwrap();
+            prop_assert_eq!(file(&plain), json.clone(), "\"none\" writes the JSON as is");
+            let gz = file(&record(&SeriesSpec { compression: SeriesCompression::Gzip, ..spec }, &running, &last));
+            prop_assert_eq!(&gz[..2], &[0x1f, 0x8b][..], "the gzip magic");
+            let mut inflated = vec![];
+            flate2::read::GzDecoder::new(&gz[..]).read_to_end(&mut inflated).unwrap();
+            prop_assert_eq!(inflated, json);
         }
 
         /// The slot map's model against the heap a B-tree really holds, the

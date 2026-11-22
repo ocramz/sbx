@@ -259,11 +259,24 @@ pub enum SeriesCfg {
     Off,
     /// Keep the first `max_samples` samples and the one after the program
     /// exits; count the others. Each row lists the sample's `max_processes`
-    /// largest processes (0: none) and sums the rest.
+    /// largest processes (0: none) and sums the rest. The file is written
+    /// as `compression` says.
     On {
         max_samples: NonZeroU32,
         max_processes: u32,
+        compression: SeriesCompression,
     },
+}
+
+/// How the series file is written. The series sbx holds in memory is the
+/// same either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SeriesCompression {
+    /// The JSON as is.
+    None,
+    /// The gzip of the same JSON.
+    Gzip,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -282,27 +295,40 @@ struct RawSeries {
     max_samples: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_processes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compression: Option<SeriesCompression>,
 }
 
 impl TryFrom<RawSeries> for SeriesCfg {
     type Error = String;
     fn try_from(r: RawSeries) -> Result<Self, String> {
-        match (r.mode, r.max_samples, r.max_processes) {
-            (SeriesMode::Off, None, None) => Ok(SeriesCfg::Off),
-            (SeriesMode::Off, Some(_), _) => Err("measure.series.max_samples is only used with mode = \"on\"".into()),
-            (SeriesMode::Off, None, Some(_)) => {
-                Err("measure.series.max_processes is only used with mode = \"on\"".into())
+        match r.mode {
+            SeriesMode::Off => {
+                let set = [
+                    ("max_samples", r.max_samples.is_some()),
+                    ("max_processes", r.max_processes.is_some()),
+                    ("compression", r.compression.is_some()),
+                ];
+                match set.into_iter().find(|(_, set)| *set) {
+                    Some((field, _)) => Err(format!("measure.series.{field} is only used with mode = \"on\"")),
+                    None => Ok(SeriesCfg::Off),
+                }
             }
-            (SeriesMode::On, None, _) => Err("measure.series.mode = \"on\" needs measure.series.max_samples".into()),
-            (SeriesMode::On, Some(_), None) => {
-                Err("measure.series.mode = \"on\" needs measure.series.max_processes (0 lists none)".into())
-            }
-            (SeriesMode::On, Some(n), Some(max_processes)) => NonZeroU32::new(n)
-                .map(|max_samples| SeriesCfg::On {
+            SeriesMode::On => {
+                let needs = |what: &str| format!("measure.series.mode = \"on\" needs measure.series.{what}");
+                let n = r.max_samples.ok_or_else(|| needs("max_samples"))?;
+                let max_processes = r.max_processes.ok_or_else(|| needs("max_processes (0 lists none)"))?;
+                let compression = r
+                    .compression
+                    .ok_or_else(|| needs("compression (\"none\" or \"gzip\")"))?;
+                let max_samples =
+                    NonZeroU32::new(n).ok_or_else(|| "measure.series.max_samples must be at least 1".to_string())?;
+                Ok(SeriesCfg::On {
                     max_samples,
                     max_processes,
+                    compression,
                 })
-                .ok_or_else(|| "measure.series.max_samples must be at least 1".into()),
+            }
         }
     }
 }
@@ -314,14 +340,17 @@ impl From<SeriesCfg> for RawSeries {
                 mode: SeriesMode::Off,
                 max_samples: None,
                 max_processes: None,
+                compression: None,
             },
             SeriesCfg::On {
                 max_samples,
                 max_processes,
+                compression,
             } => RawSeries {
                 mode: SeriesMode::On,
                 max_samples: Some(max_samples.get()),
                 max_processes: Some(max_processes),
+                compression: Some(compression),
             },
         }
     }
@@ -1143,6 +1172,7 @@ impl Policy {
         if let SeriesCfg::On {
             max_samples,
             max_processes,
+            ..
         } = series
         {
             if max_samples.get() > MAX_SERIES_SAMPLES {
@@ -1670,11 +1700,13 @@ access = "rw"
 
     fn series() -> impl proptest::strategy::Strategy<Value = SeriesCfg> {
         use proptest::prelude::*;
+        let compression = prop_oneof![Just(SeriesCompression::None), Just(SeriesCompression::Gzip)];
         prop_oneof![
             Just(SeriesCfg::Off),
-            (1..=u32::MAX, any::<u32>()).prop_map(|(n, max_processes)| SeriesCfg::On {
+            (1..=u32::MAX, any::<u32>(), compression).prop_map(|(n, max_processes, compression)| SeriesCfg::On {
                 max_samples: NonZeroU32::new(n).unwrap(),
                 max_processes,
+                compression,
             }),
         ]
     }
@@ -1729,35 +1761,56 @@ access = "rw"
         let err = |ms: u64, body: &str| parse(&with_series(ms, "[]", body)).unwrap_err();
         assert!(err(20, "mode = \"off\"\nmax_samples = 5").contains("max_samples is only used with mode = \"on\""));
         assert!(err(20, "mode = \"off\"\nmax_processes = 0").contains("max_processes is only used with mode = \"on\""));
-        assert!(err(20, "mode = \"on\"\nmax_processes = 8").contains("needs measure.series.max_samples"));
-        assert!(err(20, "mode = \"on\"\nmax_samples = 5").contains("needs measure.series.max_processes"));
-        assert!(err(20, "mode = \"on\"\nmax_samples = 0\nmax_processes = 8").contains("at least 1"));
-        assert!(err(20, "mode = \"on\"\nmax_samples = 5\nmax_processes = -1").contains("invalid value"));
-        assert!(err(20, "mode = \"on\"\nmax_samples = 5\nmax_processes = 1\nmax_rows = 1").contains("unknown field"));
-        assert!(err(20, "mode = \"sampled\"").contains("unknown variant"));
-        assert!(err(0, "mode = \"on\"\nmax_samples = 5\nmax_processes = 8")
-            .contains("needs measure.memory_sample_ms above 0"));
-        let p = parse(&with_series(
-            20,
-            "[]",
-            "mode = \"on\"\nmax_samples = 5\nmax_processes = 0",
-        ))
-        .unwrap();
-        assert_eq!(
-            p.measure.series(),
-            SeriesCfg::On {
-                max_samples: NonZeroU32::new(5).unwrap(),
-                max_processes: 0,
-            }
+        assert!(
+            err(20, "mode = \"off\"\ncompression = \"none\"").contains("compression is only used with mode = \"on\"")
         );
-        assert_eq!(p.validate().unwrap(), Vec::<String>::new());
+        let gz = "\ncompression = \"gzip\"";
+        assert!(err(20, &format!("mode = \"on\"\nmax_processes = 8{gz}")).contains("needs measure.series.max_samples"));
+        assert!(err(20, &format!("mode = \"on\"\nmax_samples = 5{gz}")).contains("needs measure.series.max_processes"));
+        assert!(err(20, "mode = \"on\"\nmax_samples = 5\nmax_processes = 8")
+            .contains("needs measure.series.compression (\"none\" or \"gzip\")"));
+        assert!(err(20, &format!("mode = \"on\"\nmax_samples = 0\nmax_processes = 8{gz}")).contains("at least 1"));
+        assert!(err(20, &format!("mode = \"on\"\nmax_samples = 5\nmax_processes = -1{gz}")).contains("invalid value"));
+        assert!(err(
+            20,
+            &format!("mode = \"on\"\nmax_samples = 5\nmax_processes = 1{gz}\nmax_rows = 1")
+        )
+        .contains("unknown field"));
+        assert!(err(
+            20,
+            "mode = \"on\"\nmax_samples = 5\nmax_processes = 1\ncompression = \"zstd\""
+        )
+        .contains("unknown variant `zstd`"));
+        assert!(err(20, "mode = \"sampled\"").contains("unknown variant"));
+        assert!(
+            err(0, &format!("mode = \"on\"\nmax_samples = 5\nmax_processes = 8{gz}"))
+                .contains("needs measure.memory_sample_ms above 0")
+        );
+        for (word, compression) in [("none", SeriesCompression::None), ("gzip", SeriesCompression::Gzip)] {
+            let p = parse(&with_series(
+                20,
+                "[]",
+                &format!("mode = \"on\"\nmax_samples = 5\nmax_processes = 0\ncompression = \"{word}\""),
+            ))
+            .unwrap();
+            assert_eq!(
+                p.measure.series(),
+                SeriesCfg::On {
+                    max_samples: NonZeroU32::new(5).unwrap(),
+                    max_processes: 0,
+                    compression,
+                }
+            );
+            assert_eq!(p.validate().unwrap(), Vec::<String>::new());
+        }
         assert_eq!(parse(MINIMAL).unwrap().measure.series(), SeriesCfg::Off);
     }
 
     #[test]
     fn series_limits_and_the_memory_ceiling() {
         let errs = |tmpfs: &str, samples: u32, procs: u32| {
-            let body = format!("mode = \"on\"\nmax_samples = {samples}\nmax_processes = {procs}");
+            let body =
+                format!("mode = \"on\"\nmax_samples = {samples}\nmax_processes = {procs}\ncompression = \"none\"");
             parse(&with_series(20, tmpfs, &body)).unwrap().validate()
         };
         let e = errs("[]", MAX_SERIES_SAMPLES + 1, 0).unwrap_err();

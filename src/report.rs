@@ -4,9 +4,11 @@
 
 use crate::cgroup::CgroupStats;
 use crate::memory::MemoryReport;
+use crate::policy::SeriesCompression;
 use crate::series::MemorySeries;
+use flate2::write::GzEncoder;
 use serde::Serialize;
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 
 /// Where `sbx run` failed before the program started: a step of the
 /// supervisor's preparation, or of the child's setup before `execve`.
@@ -290,7 +292,26 @@ impl Outcome {
     }
 }
 
-/// The series file (`--series FILE`): compact JSON, one line.
+/// The series file (`--series FILE`) as `[measure.series] compression`
+/// says: the JSON line, or its gzip.
+pub fn series_file(w: &mut dyn Write, sbx_version: &str, series: &MemorySeries) -> io::Result<()> {
+    match series.compression() {
+        SeriesCompression::None => series_json(w, sbx_version, series),
+        SeriesCompression::Gzip => {
+            let mut gz = GzEncoder::new(w, flate2::Compression::default());
+            // serde_json writes a few bytes at a time: hand the compressor
+            // larger pieces. into_inner writes the rest without a flush,
+            // which would end a deflate block early.
+            let mut batch = BufWriter::with_capacity(1 << 16, &mut gz);
+            series_json(&mut batch, sbx_version, series)?;
+            batch.into_inner().map_err(io::IntoInnerError::into_error)?;
+            // The last block and the trailer: an error here is a failed write.
+            gz.finish().map(drop)
+        }
+    }
+}
+
+/// The series as compact JSON, one line.
 pub fn series_json(w: &mut dyn Write, sbx_version: &str, series: &MemorySeries) -> io::Result<()> {
     #[derive(Serialize)]
     struct Series<'a> {

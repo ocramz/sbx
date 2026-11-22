@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.5
 
 **Breaking:** every policy now needs a `[measure.series]` table. To keep v0.4's behaviour, add:
 
@@ -13,9 +13,11 @@ sbx refuses a policy without it and says what to add. The shipped policies alrea
 
 ### Added
 
-- **The memory time series.** With `[measure.series] mode = "on"`, `max_samples`, `max_processes` and memory sampling on, `--series FILE` (or `SBX_SERIES_FILE`) writes every memory sample, with its time, to a root-owned JSON file next to the report. Each sample holds the largest process per kind, the tree's anonymous total, memfds, SysV segments, each tmpfs mount and, with a delegated cgroup, its `memory.stat` figures. `null` marks a failed read.
+- **The memory time series.** With `[measure.series] mode = "on"`, `max_samples`, `max_processes`, `compression` and memory sampling on, `--series FILE` (or `SBX_SERIES_FILE`) writes every memory sample, with its time, to a root-owned JSON file next to the report. Each sample holds the largest process per kind, the tree's anonymous total, memfds, SysV segments, each tmpfs mount and, with a delegated cgroup, its `memory.stat` figures. `null` marks a failed read.
   - **Processes:** each sample also lists its `max_processes` largest processes (0 to 4096), by resident set, with their figures, and sums the rest into `others_*` columns, so that the two add up to the sample. A table `processes` gives each listed process's pid, start time and latest name. A process is its pid and start time, so a recycled pid is a new process.
-  - **Limits:** sbx keeps the first `max_samples` samples and the one taken right after the program exits, and counts the rest. A policy whose series could take more than 256 MiB of sbx's memory is refused; the worst case counts every listed process as new. The log gives the series' size and that bound when sbx finishes.
+  - **Compression:** `compression = "none"` or `"gzip"` is required with mode "on". With `"gzip"` the file is the gzip of the same JSON; tell the two apart by the first bytes (`1f 8b`), as sbx does not look at the file's name.
+  - **Memory:** sbx holds each number as a varint of its difference from the sample before (zigzag, LEB128), so most take a byte or two. A listed process's figures are differences from the process at the same rank in the row before.
+  - **Limits:** sbx keeps the first `max_samples` samples and the one taken right after the program exits, and counts the rest. A policy whose series could take more than 256 MiB of sbx's memory is refused; the worst case counts every listed process as new and every number as far from the one before. The log gives the series' size and that bound when sbx finishes.
   - **Setup and probe:** `--series` with the mode off is refused at the new setup stage `series`. `sbx probe --series FILE` checks the destination.
   - **The report:** it keeps its 12 keys. If the series cannot be written, sbx exits 125 and the report's `supervisor_error` says why.
 

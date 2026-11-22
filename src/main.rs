@@ -59,7 +59,8 @@ environment variable shown):
   --log FILE             append sbx's own lines to FILE       SBX_LOG_FILE
                          instead of stderr
   --series FILE          write the memory samples as JSON     SBX_SERIES_FILE
-                         (run; needs [measure.series] on)
+                         (run; needs [measure.series] on, whose
+                         compression = \"gzip\" gzips the file)
 
 Exit codes: the program's own, 124 on timeout, 125 for sbx errors,
 127 if the program cannot be executed, 128+N if killed by signal N.
@@ -269,7 +270,7 @@ fn run_and_report(ov: Overrides, cmd: Vec<OsString>, out: &Outputs) -> i32 {
     };
     if let (Some(d), Outcome::Ran(ran)) = (&out.series, &mut outcome) {
         if let Some(s) = &ran.series {
-            if let Err(e) = d.write_atomic_with(|w| report::series_json(w, VERSION, s)) {
+            if let Err(e) = d.write_atomic_with(|w| report::series_file(w, VERSION, s)) {
                 let e = format!("writing the series: {e}");
                 log::error(&e);
                 ran.exit_code = 125;
