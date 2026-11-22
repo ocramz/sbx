@@ -25,12 +25,12 @@ use crate::log::{self, errno, fatal_signal, os_err};
 use crate::memory::{Pid, Sampler};
 use crate::notify::{self, Dispatcher, Listener, Received, Stats};
 use crate::policy::{DnsCfg, LandlockAbi, Limit, Policy, Timeout};
-use crate::procfs;
+use crate::procfs::{self, StartTicks};
 use crate::report::{self, At, Program, Ran, SetupError, Stage, Usage};
 use crate::seccomp_layer::{self, Programs};
 use crate::series::When;
 use landlock::RulesetCreated;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::io::Read;
 use std::net::TcpListener;
@@ -835,29 +835,32 @@ fn sample_memory(m: &mut Sampler, at: Duration, when: When, am_pid1: bool, cg: O
     // SAFETY: getpid has no preconditions.
     let me = unsafe { libc::getpid() };
     let live = live_descendants(&procs, me, am_pid1);
-    let present: BTreeSet<Pid> = procs.iter().map(|&(pid, _, _)| pid).collect();
+    let present: BTreeSet<Pid> = procs.iter().map(|e| e.pid).collect();
     m.sample(at, when, &live, &present, cg);
 }
 
-/// One /proc entry: (pid, parent pid, is a zombie).
-type ProcEntry = (libc::pid_t, libc::pid_t, bool);
+/// One /proc entry.
+#[derive(Clone, Copy, Debug)]
+struct ProcEntry {
+    pid: libc::pid_t,
+    ppid: libc::pid_t,
+    /// Exited, not yet reaped.
+    zombie: bool,
+    start: StartTicks,
+}
 
-/// Live processes below `root`: with `everything` (sbx is PID 1 of the
-/// container), every process but `root` itself.
-fn live_descendants(procs: &[ProcEntry], root: libc::pid_t, everything: bool) -> BTreeSet<libc::pid_t> {
+/// Live processes below `root`, each with its start: with `everything`
+/// (sbx is PID 1 of the container), every process but `root` itself.
+fn live_descendants(procs: &[ProcEntry], root: libc::pid_t, everything: bool) -> BTreeMap<libc::pid_t, StartTicks> {
     let below: BTreeSet<libc::pid_t> = if everything {
-        procs
-            .iter()
-            .map(|&(pid, _, _)| pid)
-            .filter(|&pid| pid != root)
-            .collect()
+        procs.iter().map(|e| e.pid).filter(|&pid| pid != root).collect()
     } else {
         let mut below = BTreeSet::new();
         let mut parents = vec![root];
         while let Some(parent) = parents.pop() {
-            for &(pid, ppid, _) in procs {
-                if ppid == parent && pid != root && below.insert(pid) {
-                    parents.push(pid);
+            for e in procs {
+                if e.ppid == parent && e.pid != root && below.insert(e.pid) {
+                    parents.push(e.pid);
                 }
             }
         }
@@ -865,8 +868,8 @@ fn live_descendants(procs: &[ProcEntry], root: libc::pid_t, everything: bool) ->
     };
     procs
         .iter()
-        .filter(|&&(pid, _, zombie)| !zombie && below.contains(&pid))
-        .map(|&(pid, _, _)| pid)
+        .filter(|e| !e.zombie && below.contains(&e.pid))
+        .map(|e| (e.pid, e.start))
         .collect()
 }
 
@@ -892,7 +895,12 @@ fn proc_table() -> Vec<ProcEntry> {
                 }
             };
             match procfs::Stat::parse(&stat) {
-                Some(s) => Some((pid, s.ppid, s.zombie)),
+                Some(s) => Some(ProcEntry {
+                    pid,
+                    ppid: s.ppid,
+                    zombie: s.zombie,
+                    start: s.start_ticks,
+                }),
                 None => {
                     unplaced(format!("{path} is not in the format sbx knows"));
                     None
@@ -976,8 +984,8 @@ fn own_children() -> Vec<libc::pid_t> {
     let me = unsafe { libc::getpid() };
     proc_table()
         .into_iter()
-        .filter(|&(_, ppid, _)| ppid == me)
-        .map(|(pid, _, _)| pid)
+        .filter(|e| e.ppid == me)
+        .map(|e| e.pid)
         .collect()
 }
 
@@ -989,12 +997,22 @@ mod tests {
     /// A random forest of processes: entry i's parent is an earlier entry,
     /// or a process outside the tree.
     fn table() -> impl Strategy<Value = Vec<ProcEntry>> {
-        prop::collection::vec((any::<prop::sample::Index>(), any::<bool>(), any::<bool>()), 0..40).prop_map(|v| {
-            let mut t: Vec<ProcEntry> = vec![(1, 0, false)];
-            for (i, (parent, outside, zombie)) in v.into_iter().enumerate() {
-                let pid = 2 + i as libc::pid_t;
-                let ppid = if outside { 1000 } else { t[parent.index(t.len())].0 };
-                t.push((pid, ppid, zombie));
+        let entry = (any::<prop::sample::Index>(), any::<bool>(), any::<bool>(), any::<u64>());
+        prop::collection::vec(entry, 0..40).prop_map(|v| {
+            let mut t = vec![ProcEntry {
+                pid: 1,
+                ppid: 0,
+                zombie: false,
+                start: StartTicks(0),
+            }];
+            for (i, (parent, outside, zombie, start)) in v.into_iter().enumerate() {
+                let ppid = if outside { 1000 } else { t[parent.index(t.len())].pid };
+                t.push(ProcEntry {
+                    pid: 2 + i as libc::pid_t,
+                    ppid,
+                    zombie,
+                    start: StartTicks(start),
+                });
             }
             t
         })
@@ -1003,10 +1021,10 @@ mod tests {
     proptest! {
         #[test]
         fn leftovers_are_the_live_descendants(t in table(), root_ix in any::<prop::sample::Index>()) {
-            let root = t[root_ix.index(t.len())].0;
+            let root = t[root_ix.index(t.len())].pid;
             let got = live_descendants(&t, root, false);
             // Brute force: follow each process's parents up to the root.
-            let parent = |pid| t.iter().find(|e| e.0 == pid).map(|e| e.1);
+            let parent = |pid| t.iter().find(|e| e.pid == pid).map(|e| e.ppid);
             let below = |mut pid| loop {
                 match parent(pid) {
                     Some(pp) if pp == root => return true,
@@ -1014,9 +1032,11 @@ mod tests {
                     None => return false,
                 }
             };
-            let want: BTreeSet<libc::pid_t> = t.iter().filter(|e| e.0 != root && !e.2 && below(e.0)).map(|e| e.0).collect();
+            let want: BTreeMap<libc::pid_t, StartTicks> =
+                t.iter().filter(|e| e.pid != root && !e.zombie && below(e.pid)).map(|e| (e.pid, e.start)).collect();
             prop_assert_eq!(got, want);
-            let all: BTreeSet<libc::pid_t> = t.iter().filter(|e| e.0 != root && !e.2).map(|e| e.0).collect();
+            let all: BTreeMap<libc::pid_t, StartTicks> =
+                t.iter().filter(|e| e.pid != root && !e.zombie).map(|e| (e.pid, e.start)).collect();
             prop_assert_eq!(live_descendants(&t, root, true), all);
         }
     }

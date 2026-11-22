@@ -13,21 +13,29 @@
 //! With `--series FILE` and `[measure.series]` on, the samples themselves
 //! are kept as well ([`crate::series`]).
 //!
-//! The parsers, [`Peaks`], [`Tracker`] and [`Tally`] are pure; [`Sampler`]
-//! does the IO.
+//! Each process is read through its /proc directory, held open
+//! ([`ProcDir`]) and checked to be the process the sample found: a pid the
+//! kernel recycles meanwhile is not mistaken for it.
+//!
+//! The parsers, [`Peaks`], [`Tracker`] and [`Tally`] are pure; [`ProcDir`]
+//! and [`Sampler`] do the IO.
 
 use crate::cgroup::{self, Delegation};
 use crate::log::{self, os_err};
 use crate::policy::MeasureCfg;
-use crate::procfs;
+use crate::procfs::{self, Comm, StartTicks, Stat};
 use crate::series::{MemorySeries, SeriesSpec, When};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fmt::{self, Display};
+use std::fs::File;
+use std::io::Read;
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
 use std::time::Duration;
 
 pub type Pid = libc::pid_t;
@@ -61,6 +69,38 @@ impl ProcMem {
             shmem_kib: field("RssShmem:")?,
         })
     }
+
+    /// Whether a status without those fields is of a process that has
+    /// exited: a zombie, or one whose address space is already gone while
+    /// it exits (no `VmRSS` either), rather than of a kernel before 4.5.
+    pub fn exited(status: &[u8]) -> bool {
+        procfs::status_text(status, "State:").is_some_and(|v| v.starts_with(['Z', 'X']))
+            || procfs::status_field(status, "VmRSS:").is_none()
+    }
+
+    /// The whole resident set, which ranks processes in a series.
+    pub fn rss_kib(&self) -> u64 {
+        self.anon_kib
+            .saturating_add(self.file_kib)
+            .saturating_add(self.shmem_kib)
+    }
+}
+
+/// One process, whatever its pid becomes later: a recycled pid starts
+/// later. Ordered by pid, then start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ProcKey {
+    pub pid: Pid,
+    pub start: StartTicks,
+}
+
+/// One process as a sample read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcRead {
+    pub key: ProcKey,
+    /// Its name when the sample read it.
+    pub name: Comm,
+    pub mem: ProcMem,
 }
 
 /// The sandbox cgroup's memory.stat counters sbx reports (bytes). `shmem`
@@ -136,9 +176,9 @@ pub fn parse_sysvipc_shm(s: &str) -> Result<Vec<ShmSeg>, String> {
 
 /// Resident bytes of the sandbox's SysV segments: owned or created by its
 /// uid, or created by one of its live processes.
-pub fn sysv_bytes(segs: &[ShmSeg], uid: u32, live: &BTreeSet<Pid>) -> u64 {
+pub fn sysv_bytes(segs: &[ShmSeg], uid: u32, is_live: impl Fn(Pid) -> bool) -> u64 {
     segs.iter()
-        .filter(|s| s.uid == uid || s.cuid == uid || live.contains(&s.cpid))
+        .filter(|s| s.uid == uid || s.cuid == uid || is_live(s.cpid))
         .map(|s| s.rss_bytes)
         .sum()
 }
@@ -171,8 +211,8 @@ pub fn kib(bytes: u64) -> u64 {
 /// What one sample read. `None` is a failed read.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Sample {
-    /// Each live sandbox process that could be read.
-    pub procs: Vec<ProcMem>,
+    /// Each live sandbox process that could be read, one per pid.
+    pub procs: Vec<ProcRead>,
     pub memfd_bytes: u64,
     pub sysv_bytes: Option<u64>,
     /// Every measured tmpfs mount: the bytes used above its level at start.
@@ -199,12 +239,12 @@ pub struct Peaks {
 impl Peaks {
     /// The figures of a single sample; a failed read adds nothing.
     pub fn of(s: &Sample) -> Peaks {
-        let max = |f: fn(&ProcMem) -> u64| s.procs.iter().map(f).max().unwrap_or(0);
+        let max = |f: fn(&ProcMem) -> u64| s.procs.iter().map(|p| f(&p.mem)).max().unwrap_or(0);
         Peaks {
             max_anon_kib: max(|m| m.anon_kib),
             max_file_kib: max(|m| m.file_kib),
             max_shmem_kib: max(|m| m.shmem_kib),
-            tree_anon_kib: s.procs.iter().map(|m| m.anon_kib).sum(),
+            tree_anon_kib: s.procs.iter().map(|p| p.mem.anon_kib).sum(),
             memfd_bytes: s.memfd_bytes,
             sysv_bytes: s.sysv_bytes.unwrap_or(0),
             tmpfs_bytes: s
@@ -394,53 +434,177 @@ fn read_error(what: impl Display, e: std::io::Error) -> ReadError {
     }
 }
 
-/// The resident set of `pid` by kind.
-pub fn proc_mem(pid: Pid) -> Result<ProcMem, ReadError> {
-    let path = format!("/proc/{pid}/status");
-    // Bytes: the process name in it need not be UTF-8.
-    let s = std::fs::read(&path).map_err(|e| read_error(&path, e))?;
-    match ProcMem::parse_status(&s) {
-        Some(m) => Ok(m),
-        // Exited meanwhile.
-        None if procfs::status_text(&s, "State:").is_some_and(|v| v.starts_with(['Z', 'X'])) => Err(ReadError::Gone),
-        None => Err(ReadError::Failed(format!(
-            "{path} has no RssAnon, RssFile and RssShmem (needs Linux 4.5+)"
-        ))),
+/// One process's /proc directory, held open. The kernel ties it to the
+/// process, not to the pid: once the process has exited, every read
+/// through it fails, even after the pid is reused. So what [`ProcDir::of`]
+/// checked is what the reads are of.
+pub struct ProcDir {
+    fd: OwnedFd,
+    pid: Pid,
+}
+
+impl ProcDir {
+    /// /proc/<pid>, and its stat as read through it.
+    pub fn open(pid: Pid) -> Result<(ProcDir, Stat), ReadError> {
+        let path = format!("/proc/{pid}");
+        let dir = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(&path)
+            .map_err(|e| read_error(&path, e))?;
+        let dir = ProcDir {
+            fd: OwnedFd::from(dir),
+            pid,
+        };
+        // Bytes: the process name in it need not be UTF-8.
+        match Stat::parse(&dir.read(c"stat")?) {
+            Some(stat) => Ok((dir, stat)),
+            None => Err(ReadError::Failed(format!(
+                "/proc/{pid}/stat is not in the format sbx knows"
+            ))),
+        }
+    }
+
+    /// /proc/<pid> if it is still the process `key` names, and its name.
+    pub fn of(key: ProcKey) -> Result<(ProcDir, Comm), ReadError> {
+        let (dir, stat) = ProcDir::open(key.pid)?;
+        if stat.start_ticks != key.start {
+            // It exited, and its pid went to a new process.
+            return Err(ReadError::Gone);
+        }
+        Ok((dir, stat.comm))
+    }
+
+    fn path(&self, name: &CStr) -> String {
+        format!("/proc/{}/{}", self.pid, name.to_string_lossy())
+    }
+
+    fn openat(&self, name: &CStr, flags: libc::c_int) -> Result<OwnedFd, ReadError> {
+        // SAFETY: name is NUL-terminated and self.fd is open.
+        let fd = unsafe { libc::openat(self.fd.as_raw_fd(), name.as_ptr(), flags | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(read_error(self.path(name), std::io::Error::last_os_error()));
+        }
+        // SAFETY: fd is new and nobody else owns it.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    fn read(&self, name: &CStr) -> Result<Vec<u8>, ReadError> {
+        let mut out = vec![];
+        File::from(self.openat(name, libc::O_RDONLY)?)
+            .read_to_end(&mut out)
+            .map_err(|e| read_error(self.path(name), e))?;
+        Ok(out)
+    }
+
+    /// The resident set by kind.
+    pub fn mem(&self) -> Result<ProcMem, ReadError> {
+        // Bytes: the process name in it need not be UTF-8.
+        let s = self.read(c"status")?;
+        match ProcMem::parse_status(&s) {
+            Some(m) => Ok(m),
+            // Exited meanwhile.
+            None if ProcMem::exited(&s) => Err(ReadError::Gone),
+            None => Err(ReadError::Failed(format!(
+                "{} has no RssAnon, RssFile and RssShmem (needs Linux 4.5+)",
+                self.path(c"status")
+            ))),
+        }
+    }
+
+    /// The memfds it holds open. Listing another uid's descriptors needs
+    /// CAP_SYS_PTRACE (see `capabilities`).
+    pub fn memfds(&self) -> Result<Vec<Memfd>, ReadError> {
+        let fds = self.openat(c"fd", libc::O_RDONLY | libc::O_DIRECTORY)?;
+        let mut dir = DirStream::new(fds).map_err(|e| read_error(self.path(c"fd"), e))?;
+        let at = |name: &CStr| format!("{}/{}", self.path(c"fd"), name.to_string_lossy());
+        let mut out = vec![];
+        while let Some(name) = dir.next().map_err(|e| read_error(self.path(c"fd"), e))? {
+            if matches!(name.to_bytes(), b"." | b"..") {
+                continue;
+            }
+            // Only the prefix matters, so a short buffer does.
+            let mut target = [0u8; 16];
+            // SAFETY: name is NUL-terminated, target has the room given.
+            let n = unsafe { libc::readlinkat(dir.fd(), name.as_ptr(), target.as_mut_ptr().cast(), target.len()) };
+            // A descriptor closed meanwhile is skipped.
+            let Ok(n) = usize::try_from(n) else {
+                match read_error(at(&name), std::io::Error::last_os_error()) {
+                    ReadError::Gone => continue,
+                    failed => return Err(failed),
+                }
+            };
+            if !target[..n].starts_with(b"/memfd:") {
+                continue;
+            }
+            // SAFETY: zeroed stat is valid output storage.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // Through the link: the memfd's own inode.
+            // SAFETY: name is NUL-terminated and st is valid.
+            if unsafe { libc::fstatat(dir.fd(), name.as_ptr(), &mut st, 0) } != 0 {
+                match read_error(at(&name), std::io::Error::last_os_error()) {
+                    ReadError::Gone => continue,
+                    failed => return Err(failed),
+                }
+            }
+            out.push(Memfd {
+                dev: st.st_dev,
+                ino: st.st_ino,
+                bytes: u64::try_from(st.st_blocks).unwrap_or(0).saturating_mul(512),
+            });
+        }
+        Ok(out)
     }
 }
 
-/// The memfds `pid` holds open. Listing another uid's descriptors needs
-/// CAP_SYS_PTRACE (see `capabilities`).
-pub fn memfds(pid: Pid) -> Result<Vec<Memfd>, ReadError> {
-    let dir = format!("/proc/{pid}/fd");
-    let mut out = vec![];
-    for entry in std::fs::read_dir(&dir).map_err(|e| read_error(&dir, e))? {
-        let path = entry.map_err(|e| read_error(&dir, e))?.path();
-        // A descriptor closed meanwhile is skipped.
-        let target = match std::fs::read_link(&path) {
-            Ok(t) => t,
-            Err(e) => match read_error(path.display(), e) {
-                ReadError::Gone => continue,
-                failed => return Err(failed),
-            },
-        };
-        if !target.as_os_str().as_bytes().starts_with(b"/memfd:") {
-            continue;
-        }
-        // Through the link: the memfd's own inode.
-        match std::fs::metadata(&path) {
-            Ok(m) => out.push(Memfd {
-                dev: m.dev(),
-                ino: m.ino(),
-                bytes: m.blocks().saturating_mul(512),
-            }),
-            Err(e) => match read_error(path.display(), e) {
-                ReadError::Gone => continue,
-                failed => return Err(failed),
-            },
+/// A directory stream over an open directory (fdopendir), closed on drop.
+struct DirStream(NonNull<libc::DIR>);
+
+impl DirStream {
+    fn new(fd: OwnedFd) -> std::io::Result<DirStream> {
+        let raw = fd.into_raw_fd();
+        // SAFETY: raw is an open directory; on success the stream owns it.
+        match NonNull::new(unsafe { libc::fdopendir(raw) }) {
+            Some(d) => Ok(DirStream(d)),
+            None => {
+                let e = std::io::Error::last_os_error();
+                // SAFETY: fdopendir failed, so raw is still ours to close.
+                drop(unsafe { OwnedFd::from_raw_fd(raw) });
+                Err(e)
+            }
         }
     }
-    Ok(out)
+
+    fn fd(&self) -> RawFd {
+        // SAFETY: the stream is open.
+        unsafe { libc::dirfd(self.0.as_ptr()) }
+    }
+
+    /// The next entry's name, `.` and `..` included; None at the end.
+    fn next(&mut self) -> std::io::Result<Option<CString>> {
+        // readdir sets errno only on an error, so clear it first.
+        // SAFETY: errno is the calling thread's own.
+        unsafe { *libc::__errno_location() = 0 };
+        // SAFETY: the stream is open and only this thread reads it.
+        let e = unsafe { libc::readdir(self.0.as_ptr()) };
+        if e.is_null() {
+            let err = std::io::Error::last_os_error();
+            return if err.raw_os_error() == Some(0) {
+                Ok(None)
+            } else {
+                Err(err)
+            };
+        }
+        // SAFETY: d_name is NUL-terminated and valid until the next readdir.
+        Ok(Some(unsafe { CStr::from_ptr((*e).d_name.as_ptr()) }.to_owned()))
+    }
+}
+
+impl Drop for DirStream {
+    fn drop(&mut self) {
+        // SAFETY: the stream is open, and closed only here.
+        unsafe { libc::closedir(self.0.as_ptr()) };
+    }
 }
 
 /// Every SysV shared memory segment in sbx's IPC namespace.
@@ -505,6 +669,7 @@ fn fs_used(path: &Path) -> Result<u64, String> {
 /// What a failed read was reading.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Kind {
+    Stat,
     Status,
     Fds,
     Sysv,
@@ -515,6 +680,7 @@ enum Kind {
 impl Kind {
     fn as_str(self) -> &'static str {
         match self {
+            Kind::Stat => "/proc/<pid>/stat",
             Kind::Status => "/proc/<pid>/status",
             Kind::Fds => "/proc/<pid>/fd",
             Kind::Sysv => SYSVIPC_SHM,
@@ -581,23 +747,31 @@ impl Sampler {
     }
 
     /// Read everything once, `at` after the program started. `live`: the
-    /// sandbox's live processes; `present`: every pid in /proc, zombies
-    /// included.
+    /// sandbox's live processes, as /proc listed them; `present`: every pid
+    /// in /proc, zombies included.
     pub fn sample(
         &mut self,
         at: Duration,
         when: When,
-        live: &BTreeSet<Pid>,
+        live: &BTreeMap<Pid, StartTicks>,
         present: &BTreeSet<Pid>,
         cg: Option<&Delegation>,
     ) {
         let mut s = Sample::default();
         let mut measured = BTreeSet::new();
         let mut fds = vec![];
-        for &pid in live {
-            match proc_mem(pid) {
-                Ok(m) => {
-                    s.procs.push(m);
+        for (&pid, &start) in live {
+            let key = ProcKey { pid, start };
+            let (dir, name) = match ProcDir::of(key) {
+                Ok(d) => d,
+                Err(e) => {
+                    self.failures.record(Kind::Stat, e);
+                    continue;
+                }
+            };
+            match dir.mem() {
+                Ok(mem) => {
+                    s.procs.push(ProcRead { key, name, mem });
                     measured.insert(pid);
                 }
                 Err(e) => {
@@ -605,14 +779,14 @@ impl Sampler {
                     continue;
                 }
             }
-            match memfds(pid) {
+            match dir.memfds() {
                 Ok(v) => fds.extend(v),
                 Err(e) => self.failures.record(Kind::Fds, e),
             }
         }
         s.memfd_bytes = memfd_bytes(&fds);
         s.sysv_bytes = match sysv_segments() {
-            Ok(segs) => Some(sysv_bytes(&segs, self.uid, live)),
+            Ok(segs) => Some(sysv_bytes(&segs, self.uid, |p| live.contains_key(&p))),
             Err(e) => {
                 self.failures.record(Kind::Sysv, ReadError::Failed(e));
                 None
@@ -651,10 +825,12 @@ impl Sampler {
         let (report, series) = self.tally.finish();
         if let Some(s) = &series {
             log::info(format!(
-                "memory series: {} rows, {} samples dropped, {} KiB in memory",
+                "memory series: {} rows, {} samples dropped, {} processes listed, {} KiB in memory (at most {} KiB)",
                 s.rows().len(),
                 s.dropped(),
-                s.footprint().div_ceil(1024)
+                s.listed(),
+                s.footprint().div_ceil(1024),
+                s.bound().div_ceil(1024)
             ));
         }
         (report, series)
@@ -690,6 +866,42 @@ pub mod tests {
             anon_kib,
             file_kib,
             shmem_kib,
+        })
+    }
+
+    /// Small figures as well, so that processes tie in rank.
+    fn proc_mem_or_tiny() -> impl Strategy<Value = ProcMem> {
+        let tiny = (0..3u64, 0..3u64, 0..3u64).prop_map(|(anon_kib, file_kib, shmem_kib)| ProcMem {
+            anon_kib,
+            file_kib,
+            shmem_kib,
+        });
+        prop_oneof![tiny, proc_mem()]
+    }
+
+    /// Any name the kernel accepts, from a few so that names recur.
+    pub fn comm() -> impl Strategy<Value = Comm> {
+        prop_oneof![
+            prop::sample::select(vec![&b"sh"[..], &b"python3"[..], &b"x\n)y"[..], &b"\xff\xfe"[..]])
+                .prop_map(Comm::new),
+            prop::collection::vec(1..=255u8, 0..16).prop_map(|b| Comm::new(&b)),
+        ]
+    }
+
+    /// The live processes of one sample: one per pid. Pids recur from
+    /// sample to sample, now and then with another start: a recycled pid.
+    pub fn procs() -> impl Strategy<Value = Vec<ProcRead>> {
+        prop::collection::btree_map(1..8 as Pid, (0..3u64, comm(), proc_mem_or_tiny()), 0..8).prop_map(|m| {
+            m.into_iter()
+                .map(|(pid, (start, name, mem))| ProcRead {
+                    key: ProcKey {
+                        pid,
+                        start: StartTicks(start),
+                    },
+                    name,
+                    mem,
+                })
+                .collect()
         })
     }
 
@@ -736,20 +948,15 @@ pub mod tests {
         } else {
             Just(None).boxed()
         };
-        (
-            prop::collection::vec(proc_mem(), 0..20),
-            0..1u64 << 48,
-            prop::option::of(0..1u64 << 48),
-            tmpfs,
-            cgroup,
-        )
-            .prop_map(|(procs, memfd_bytes, sysv_bytes, tmpfs_bytes, cgroup)| Sample {
+        (procs(), 0..1u64 << 48, prop::option::of(0..1u64 << 48), tmpfs, cgroup).prop_map(
+            |(procs, memfd_bytes, sysv_bytes, tmpfs_bytes, cgroup)| Sample {
                 procs,
                 memfd_bytes,
                 sysv_bytes,
                 tmpfs_bytes,
                 cgroup,
-            })
+            },
+        )
     }
 
     fn sample() -> impl Strategy<Value = Sample> {
@@ -857,7 +1064,7 @@ pub mod tests {
             theirs in prop::collection::vec(seg(), 0..8),
         ) {
             let (uid, pid) = (65534, 4242);
-            let live = BTreeSet::from([pid]);
+            let live = |p| p == pid;
             // Ours by owner, by creator (whatever IPC_SET made the owner), or by creating process.
             let ours: Vec<ShmSeg> = ours.into_iter().map(|(s, how)| match how {
                 0 => ShmSeg { uid, ..s },
@@ -872,7 +1079,7 @@ pub mod tests {
             }).collect();
             let mut all = [ours.clone(), theirs].concat();
             all.reverse();
-            prop_assert_eq!(sysv_bytes(&all, uid, &live), ours.iter().map(|s| s.rss_bytes).sum::<u64>());
+            prop_assert_eq!(sysv_bytes(&all, uid, live), ours.iter().map(|s| s.rss_bytes).sum::<u64>());
         }
 
         #[test]
@@ -894,11 +1101,12 @@ pub mod tests {
         #[test]
         fn a_sample_yields_its_largest_process_and_its_tree_sum(s in sample()) {
             let p = Peaks::of(&s);
-            prop_assert_eq!(p.max_anon_kib, s.procs.iter().map(|m| m.anon_kib).max().unwrap_or(0));
-            prop_assert_eq!(p.max_file_kib, s.procs.iter().map(|m| m.file_kib).max().unwrap_or(0));
-            prop_assert_eq!(p.max_shmem_kib, s.procs.iter().map(|m| m.shmem_kib).max().unwrap_or(0));
-            prop_assert_eq!(p.tree_anon_kib, s.procs.iter().map(|m| m.anon_kib).sum::<u64>());
-            prop_assert!(s.procs.iter().all(|m| m.anon_kib <= p.tree_anon_kib));
+            let mems: Vec<ProcMem> = s.procs.iter().map(|p| p.mem).collect();
+            prop_assert_eq!(p.max_anon_kib, mems.iter().map(|m| m.anon_kib).max().unwrap_or(0));
+            prop_assert_eq!(p.max_file_kib, mems.iter().map(|m| m.file_kib).max().unwrap_or(0));
+            prop_assert_eq!(p.max_shmem_kib, mems.iter().map(|m| m.shmem_kib).max().unwrap_or(0));
+            prop_assert_eq!(p.tree_anon_kib, mems.iter().map(|m| m.anon_kib).sum::<u64>());
+            prop_assert!(mems.iter().all(|m| m.anon_kib <= p.tree_anon_kib));
             let read: BTreeMap<PathBuf, u64> =
                 s.tmpfs_bytes.iter().filter_map(|(k, v)| v.map(|v| (k.clone(), v))).collect();
             prop_assert_eq!((p.memfd_bytes, p.sysv_bytes, &p.tmpfs_bytes, p.cgroup),
@@ -936,6 +1144,14 @@ pub mod tests {
     fn zombies_and_garbage_are_not_measured() {
         let zombie = b"Name:\tsh\nState:\tZ (zombie)\nPid:\t9\nThreads:\t1\n";
         assert_eq!(ProcMem::parse_status(zombie), None);
+        // Exiting, its address space gone, and not yet a zombie.
+        let exiting = b"Name:\tsh\nState:\tR (running)\nPid:\t9\nThreads:\t1\n";
+        assert_eq!(ProcMem::parse_status(exiting), None);
+        assert!(ProcMem::exited(zombie) && ProcMem::exited(exiting));
+        // Before Linux 4.5: an address space, but no RssAnon.
+        let old = b"Name:\tsh\nState:\tS (sleeping)\nVmRSS:\t    1024 kB\nThreads:\t1\n";
+        assert_eq!(ProcMem::parse_status(old), None);
+        assert!(!ProcMem::exited(old));
         assert!(CgroupMem::parse("anon_thp 0\nshmem_thp 0\n").is_err());
         assert!(parse_sysvipc_shm("").is_err());
         assert!(parse_sysvipc_shm("key shmid perms size\n").is_err());
@@ -967,5 +1183,72 @@ pub mod tests {
         assert_eq!(r["max_anon_kib"], 3);
         assert_eq!(r["unsampled_processes"], 1);
         assert_eq!(r.as_object().unwrap().len(), 11, "{r}");
+    }
+
+    // The kernel's side of ProcDir, on this process and a child of it.
+
+    #[test]
+    fn a_proc_dir_reads_its_own_process() {
+        use std::io::Write;
+        let me = std::process::id() as Pid;
+        // SAFETY: the name is NUL-terminated.
+        let fd = unsafe { libc::memfd_create(c"sbx-test".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0, "memfd_create: {}", std::io::Error::last_os_error());
+        // SAFETY: fd is new and nobody else owns it.
+        let mut f = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+        f.write_all(&vec![1u8; 1 << 20]).unwrap();
+        let held = f.metadata().unwrap();
+
+        let (dir, stat) = ProcDir::open(me).unwrap();
+        let fds = dir.memfds().unwrap();
+        assert!(
+            fds.iter()
+                .any(|m| (m.dev, m.ino) == (held.dev(), held.ino()) && m.bytes >= 1 << 20),
+            "{fds:?}"
+        );
+        assert!(dir.mem().unwrap().anon_kib > 0);
+        let key = ProcKey {
+            pid: me,
+            start: stat.start_ticks,
+        };
+        let (_, name) = ProcDir::of(key).unwrap();
+        assert_eq!(name, stat.comm);
+        let later = ProcKey {
+            start: StartTicks(stat.start_ticks.0 + 1),
+            ..key
+        };
+        assert!(matches!(ProcDir::of(later), Err(ReadError::Gone)));
+    }
+
+    #[test]
+    fn a_proc_dir_is_pinned_to_its_process() {
+        let mut p = [0; 2];
+        // SAFETY: p has room for two descriptors.
+        assert_eq!(unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: the child only blocks in read(2) and exits, both
+        // async-signal-safe, so the test harness's threads do not matter.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let mut b = 0u8;
+            // SAFETY: reading into b, then exiting without unwinding.
+            unsafe {
+                libc::read(p[0], (&mut b as *mut u8).cast(), 1);
+                libc::_exit(0)
+            }
+        }
+        let (dir, _) = ProcDir::open(pid).unwrap();
+        assert!(dir.mem().is_ok());
+        assert!(dir.memfds().is_ok());
+        let mut st = 0;
+        // SAFETY: killing and reaping our own child, then closing our pipe.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            assert_eq!(libc::waitpid(pid, &mut st, 0), pid);
+            libc::close(p[0]);
+            libc::close(p[1]);
+        }
+        assert!(matches!(dir.mem(), Err(ReadError::Gone)));
+        assert!(matches!(dir.memfds(), Err(ReadError::Gone)));
     }
 }

@@ -6,26 +6,67 @@
 //! `Name:` line. Neither file need be UTF-8, so both are read as bytes and
 //! only the fields sbx uses, which are ASCII, are decoded.
 
+/// When a process started, in clock ticks since boot (field 22 of
+/// /proc/<pid>/stat). With the pid it names one process: a recycled pid
+/// belongs to a process that started later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StartTicks(pub u64);
+
+/// A process name as the kernel keeps it: at most 16 bytes (TASK_COMM_LEN),
+/// any but NUL.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Comm {
+    bytes: [u8; Comm::LEN],
+    len: u8,
+}
+
+impl Comm {
+    pub const LEN: usize = 16;
+
+    /// `name`, cut to [`Comm::LEN`] bytes: only a kernel thread's can be longer.
+    pub fn new(name: &[u8]) -> Comm {
+        let len = name.len().min(Comm::LEN);
+        let mut bytes = [0; Comm::LEN];
+        bytes[..len].copy_from_slice(&name[..len]);
+        Comm { bytes, len: len as u8 }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+}
+
+impl std::fmt::Debug for Comm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Comm({:?})", self.as_bytes().escape_ascii().to_string())
+    }
+}
+
 /// The fields of /proc/<pid>/stat that sbx uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stat {
     pub ppid: libc::pid_t,
     /// State `Z`: exited, not yet reaped.
     pub zombie: bool,
+    pub start_ticks: StartTicks,
+    pub comm: Comm,
 }
 
 impl Stat {
     /// `pid (comm) state ppid ...`: comm may hold anything, `)` and spaces
     /// included, so the fields start after the last `)`.
     pub fn parse(stat: &[u8]) -> Option<Stat> {
+        let open = stat.iter().position(|&b| b == b'(')?;
         let close = stat.iter().rposition(|&b| b == b')')?;
+        let comm = Comm::new(stat.get(open + 1..close)?);
         let rest = std::str::from_utf8(&stat[close + 1..]).ok()?;
-        let mut f = rest.split_ascii_whitespace();
-        let state = f.next()?;
-        let ppid = f.next()?.parse().ok()?;
+        let f: Vec<&str> = rest.split_ascii_whitespace().collect();
+        // Field 3 (state) is f[0], so field 22 (starttime) is f[19].
         Some(Stat {
-            ppid,
-            zombie: state == "Z",
+            ppid: f.get(1)?.parse().ok()?,
+            zombie: *f.first()? == "Z",
+            start_ticks: StartTicks(f.get(19)?.parse().ok()?),
+            comm,
         })
     }
 }
@@ -74,11 +115,11 @@ pub mod render {
     }
 
     /// /proc/<pid>/stat: the name as is.
-    pub fn stat(pid: libc::pid_t, name: &[u8], state: char, ppid: libc::pid_t) -> Vec<u8> {
+    pub fn stat(pid: libc::pid_t, name: &[u8], state: char, ppid: libc::pid_t, start: u64) -> Vec<u8> {
         let mut out = format!("{pid} (").into_bytes();
         out.extend_from_slice(name);
         out.extend_from_slice(
-            format!(") {state} {ppid} {pid} {pid} 0 -1 4194560 120 0 0 0 1 2 0 0 20 0 1 0 987654 ").as_bytes(),
+            format!(") {state} {ppid} {pid} {pid} 0 -1 4194560 120 0 0 0 1 2 0 0 20 0 1 0 {start} ").as_bytes(),
         );
         out.extend_from_slice(b"12345678 300 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0 0 0\n");
         out
@@ -105,9 +146,11 @@ mod tests {
             name in name(),
             state in prop::sample::select(vec!['R', 'S', 'D', 'Z', 'T', 't', 'X', 'I']),
             ppid in 0..libc::pid_t::MAX,
+            start in any::<u64>(),
         ) {
-            let got = Stat::parse(&render::stat(pid, &name, state, ppid));
-            prop_assert_eq!(got, Some(Stat { ppid, zombie: state == 'Z' }));
+            let got = Stat::parse(&render::stat(pid, &name, state, ppid, start));
+            let want = Stat { ppid, zombie: state == 'Z', start_ticks: StartTicks(start), comm: Comm::new(&name) };
+            prop_assert_eq!(got, Some(want));
         }
 
         #[test]
@@ -132,6 +175,14 @@ mod tests {
             prop_assert_eq!(status_text(&s, "RssAnon:"), Some(anon.as_str()));
             prop_assert_eq!(status_text(&s, "VmSwap:"), None);
         }
+    }
+
+    #[test]
+    fn a_stat_line_without_the_start_time_is_not_parsed() {
+        let full = render::stat(7, b"sh", 'S', 1, 42);
+        let cut = full.split(|&b| b == b' ').take(21).collect::<Vec<_>>().join(&b' ');
+        assert_eq!(Stat::parse(&cut), None);
+        assert_eq!(Stat::parse(b"7 sh S 1"), None);
     }
 
     #[test]

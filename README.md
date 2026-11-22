@@ -18,7 +18,7 @@ sbx runs one sandbox at a time, one per container.
 | Volumes | Platform mounts happen before the entrypoint, so sbx opens the mount points and binds rules to them |
 | Configurable at start | A complete policy file, plus `SBX_*` variables and flags for per-run additions |
 | Fail loudly | Requirements are probed before anything starts; unknown or empty settings, symlinked or missing paths, and unsupported ABIs are errors |
-| Trustworthy outcome | `--report FILE`: a root-owned JSON report of how the run ended (exit code or signal, timeout, the setup stage that failed, denied syscalls, leftover processes, wall and CPU time, memory); `--log FILE` keeps sbx's own lines off the program's stderr ([Job report and log file](#job-report-and-log-file)); `--series FILE` keeps every memory sample ([Time series](#time-series)) |
+| Trustworthy outcome | `--report FILE`: a root-owned JSON report of how the run ended (exit code or signal, timeout, the setup stage that failed, denied syscalls, leftover processes, wall and CPU time, memory); `--log FILE` keeps sbx's own lines off the program's stderr ([Job report and log file](#job-report-and-log-file)); `--series FILE` keeps every memory sample, with the largest processes of each ([Time series](#time-series)) |
 | Memory by kind | `[measure] memory_sample_ms`: sbx samples the sandbox's anonymous, file-backed and shared memory per process, its memfds, SysV segments and tmpfs files, and reports the peaks, since `ru_maxrss` counts library pages and misses memory no process maps ([Memory by kind](#memory-by-kind)) |
 | Memory and process limits | `[cgroup] mode = "delegated"`: the sandbox runs in a cgroup of its own with `memory.max` and `pids.max`, so an OOM kill hits the program, not sbx, and is reported ([cgroup limits](#cgroup-limits)) |
 
@@ -192,6 +192,8 @@ The report's `memory` holds `interval_ms`, `samples` and the peaks over all samp
 
 Sampled peaks are lower bounds: what rises and falls between two samples is missed, so a shorter interval catches more at the cost of supervisor time. `rusage.max_rss_kib` stays the exact single-process total. A failed read (other than of a process that exited meanwhile) is logged once per kind and sampling goes on.
 
+Each process is read through its `/proc/<pid>` directory, held open while its `stat`, `status` and `fd` are read, and only if its start time is still the one the sample found when it listed `/proc`. An open `/proc/<pid>` directory belongs to one process, so if that process exits and the kernel gives its pid to another, the reads fail instead of measuring the newcomer.
+
 Sampling needs `CAP_SYS_PTRACE`: listing the descriptors of a process of another uid needs it, and without it the sandbox could hide its memfds with `prctl(PR_SET_DUMPABLE, 0)`. sbx refuses to start without it, and `sbx probe` checks that it can read the status and descriptors of a non-dumpable child running as the sandbox uid. On Cloud Run, where no cgroup is delegated, the `/proc` figures are the whole measurement.
 
 ## Time series
@@ -204,9 +206,10 @@ mode = "off"              # the shipped policies; "off" takes no other field
 # or
 mode = "on"               # needs [measure] memory_sample_ms above 0
 max_samples = 50000       # 1 to 1000000
+max_processes = 32        # 0 to 4096: the largest processes each sample lists; 0 lists none
 ```
 
-The policy says how a series is made, and the flag says where it goes. sbx refuses `--series` when the mode is `"off"` (setup stage `series`), and with `"on"` but no `--series` it keeps nothing. sbx keeps the first `max_samples` samples taken while the program runs, then only counts the others. It always keeps the sample taken right after the program's process was reaped. Every number is held in memory until the program ends. sbx refuses a policy whose series could take more than 256 MiB of its memory in the worst case, and the error names the figure. A kept sample takes 112 bytes, plus 16 per measured tmpfs mount and 16 more if there are any, so 1000000 samples with `/dev/shm` measured take about 137 MiB.
+The policy says how a series is made, and the flag says where it goes. sbx refuses `--series` when the mode is `"off"` (setup stage `series`), and with `"on"` but no `--series` it keeps nothing. sbx keeps the first `max_samples` samples taken while the program runs, then only counts the others. It always keeps the sample taken right after the program's process was reaped. Every number is held in memory until the program ends. sbx refuses a policy whose series could take more than 256 MiB of its memory in the worst case, and the error names the figure. A kept sample takes 144 bytes, plus 16 per measured tmpfs mount and 16 more if there are any. Each process a sample lists takes 32 bytes more, and one listed for the first time about 110 more for the process table. sbx counts the worst case, in which every listed process is new. So with `/dev/shm` measured, 1000000 samples take at most about 168 MiB with `max_processes = 0`, and 50000 samples with `max_processes = 32` about 226 MiB. When sbx finishes, it logs the series' size and this bound, as `memory series: N rows, D samples dropped, P processes listed, K KiB in memory (at most B KiB)`.
 
 The file is written only when the program ran, after the sandbox is gone and before the report. The same path rules as for the report apply, and it may not be the report's or the log's path. When sbx starts, it removes any file at the path, so after a setup failure there is no series file and the report has the error. If writing it fails, sbx exits 125, and the report's `supervisor_error` says why. `sbx probe --series FILE` checks the destination.
 
@@ -214,13 +217,18 @@ The file is one line of JSON, mode 0600, replaced atomically:
 
 ```json
 {"sbx_version": "v0.5",
- "memory": {"interval_ms": 20, "max_samples": 50000, "samples": 3, "dropped": 0,
-   "rows": {"t_us": [20113, 40391, 52007], "live_processes": [1, 1, 0],
+ "memory": {"interval_ms": 20, "max_samples": 50000, "max_processes": 1, "samples": 3, "dropped": 0,
+   "rows": {"t_us": [20113, 40391, 52007], "live_processes": [1, 2, 0],
             "max_anon_kib": [32768, 65872, 0], "max_file_kib": [9216, 9216, 0],
-            "max_shmem_kib": [0, 16384, 0], "tree_anon_kib": [32768, 65872, 0],
+            "max_shmem_kib": [0, 16384, 0], "tree_anon_kib": [32768, 98640, 0],
             "memfd_kib": [0, 49152, 0], "sysv_shm_kib": [0, null, 0],
             "tmpfs_kib": {"/dev/shm": [0, 8192, 8192]},
-            "cgroup_anon_kib": null, "cgroup_shmem_kib": null}}}
+            "cgroup_anon_kib": null, "cgroup_shmem_kib": null,
+            "others_processes": [0, 1, 0], "others_anon_kib": [0, 32768, 0],
+            "others_file_kib": [0, 9216, 0], "others_shmem_kib": [0, 0, 0]},
+   "processes": {"pid": [7, 9], "start_ticks": [415310, 415312], "name": ["python3", "worker"]},
+   "process_rows": {"row": [0, 1], "process": [0, 1], "anon_kib": [32768, 65872],
+                    "file_kib": [9216, 9216], "shmem_kib": [0, 16384]}}}
 ```
 
 | Key | Meaning |
@@ -231,6 +239,11 @@ The file is one line of JSON, mode 0600, replaced atomically:
 | `live_processes` | the sandbox processes the sample read |
 | `max_anon_kib`, `max_file_kib`, `max_shmem_kib` | the largest single process in the sample, per kind |
 | `tree_anon_kib`, `memfd_kib`, `sysv_shm_kib`, `tmpfs_kib`, `cgroup_anon_kib`, `cgroup_shmem_kib` | the sample's figures behind the report's peaks of the same names ([Memory by kind](#memory-by-kind)) |
+| `others_processes`, `others_anon_kib`, `others_file_kib`, `others_shmem_kib` | the sample's processes that its row does not list: how many, and their `RssAnon`, `RssFile` and `RssShmem` summed |
+| `processes` | each listed process once, in the order first listed: its `pid`, its `start_ticks` (clock ticks since boot, field 22 of `/proc/<pid>/stat`) and its `name` |
+| `process_rows` | one entry per listed process per row: `row` indexes `rows` and `process` indexes `processes`; `anon_kib`, `file_kib`, `shmem_kib` are its figures in that sample |
+
+Each row lists the sample's `max_processes` largest processes by `RssAnon + RssFile + RssShmem`, ties broken by the smaller pid, then start time. `process_rows` is ordered by row, then by that rank, so a row's first entry is its largest process. The listed figures and the `others_*` add up exactly to the sample: the listed `anon_kib` plus `others_anon_kib` is `tree_anon_kib`, and the listed processes plus `others_processes` is `live_processes`. A process is its pid and start time, so a pid the kernel gives to a new process is a new entry in `processes`. Its `name` is the one it had when last listed (`exec` changes it), at most 16 bytes, escaped as log lines are (control characters and bytes that are not UTF-8 spelled out as `\n`, `\xff`). With `max_processes = 0`, `processes`, `process_rows` and the `others_*` columns are `null`.
 
 `null` in a column marks a failed read in that sample: of `/proc/sysvipc/shm`, of one tmpfs mount, or of `memory.stat`. Without a delegated cgroup, the cgroup columns are `null` as a whole. Whenever `dropped` is 0, each column's maximum equals the report's figure. Otherwise it is no higher. Time series of other measurements will get their own keys next to `memory`.
 
@@ -427,8 +440,8 @@ policy/no-landlock.example.toml  the egress example with landlock.abi = "off"
 src/main.rs                      CLI: run / probe / policy / version, environment, program lookup, report
 src/policy.rs                    policy model, overrides, validation
 src/report.rs                    setup stages, the run's outcome, the JSON report
-src/memory.rs                    memory by kind: /proc, SysV, tmpfs and memory.stat sampling, peaks
-src/series.rs                    the memory time series: kept samples, the memory bound, the columns
+src/memory.rs                    memory by kind: /proc (through pinned /proc/<pid> directories), SysV, tmpfs and memory.stat sampling, peaks
+src/series.rs                    the memory time series: kept samples, ranked processes, the process table, the memory bound, the columns
 src/destination.rs               safe paths for the report, the series and the log file, atomic writes
 src/cgroup.rs                    delegated cgroup: setup, limits, counters, teardown
 src/landlock_layer.rs            Landlock probe, ruleset, enforcement

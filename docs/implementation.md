@@ -187,3 +187,82 @@ Plan: [plans/v0.5-series.md](plans/v0.5-series.md), part 1 of 3. v0.5 is release
   - Smoke tests added beyond the plan: `SBX_SERIES_FILE`, the missing-table hint, the failed write, and the cgroup columns.
 - **Not modelled by the bound:** a reallocation's transient copy of the row vector. glibc and musl move large allocations with `mremap`, so this should not double the peak, but it was not measured.
 - **Not verified here:** the amd64 runner, and Cloud Run (`make live`). `tests/live.py` rewrites only `[measure]`, so its policy stays valid.
+
+## 2026-11-22: v0.5 part 2, per-process entries in the memory series
+
+Plan: [plans/v0.5-series-processes.md](plans/v0.5-series-processes.md), part 2 of 3.
+
+- **Process identity (`src/procfs.rs`, `src/memory.rs`, `src/supervisor.rs`):**
+  - `procfs::Stat` gains `start_ticks: StartTicks` (field 22) and `comm: Comm` (the raw name between the first `(` and the last `)`, cut to 16 bytes). A stat line with fewer fields is not parsed.
+  - `ProcKey { pid, start }` names a process, and `Sample.procs` is `Vec<ProcRead { key, name, mem }>`. `Peaks::of` maps `mem`, so the report is unchanged.
+  - The supervisor's `ProcEntry` is a struct with the start ticks, and `live_descendants` returns `BTreeMap<Pid, StartTicks>`.
+  - `ProcDir` replaces `proc_mem(pid)` and `memfds(pid)`. It opens `/proc/<pid>` with `O_DIRECTORY` and reads `stat` and `status` through it with `openat`, and the `fd` directory with `openat`, `fdopendir`, `readdir`, `readlinkat` and `fstatat`. `ProcDir::of(key)` gives `Gone` when the start ticks differ, so the sampler reads only the processes `proc_table` found, and `Tracker` sees only those pids. Failed stat reads are a new failure kind, `/proc/<pid>/stat`.
+  - `sysv_bytes` takes `is_live: impl Fn(Pid) -> bool`.
+  - `capabilities::proc_access` reads its non-dumpable child through `ProcDir`, so `sbx probe` exercises the sampler's exact path.
+- **Policy (`src/policy.rs`):** `SeriesCfg::On` gains `max_processes: u32` (0 lists none), required with `"on"` and refused with `"off"`. `validate_measure` refuses more than `MAX_SERIES_PROCESSES` (4096), and the ceiling message names `max_processes`.
+- **`src/series.rs`:**
+  - `SeriesSpec.processes: ProcessColumns { Absent, Top(NonZeroU32) }`.
+  - `rank` orders a sample's processes by `(Reverse(rss_kib), key)` with `select_nth_unstable_by`, then sorts the first n. `Row::of` returns the row and its listed processes, and `Row.others` sums the rest.
+  - The process table is `BTreeMap<ProcKey, Slot>` plus `Vec<(ProcKey, Comm)>`. A process listed again keeps its slot, and its name becomes the latest.
+  - Listed processes go into one flat `entries: Vec<ProcessRow { row, process, mem }>`, by row and then rank.
+  - Every vector grows through `room_for_one`, which doubles but is capped: `max_samples + 1` rows, and `(max_samples + 1) × max_processes` entries and table slots.
+  - `bound(max_samples, n_tmpfs, max_processes)` and `footprint()` share one cost model. Each vector costs its capacity plus 16 bytes of allocator overhead (part 1 left that 16 out). The slot map costs `(1 + n/5) × 352` bytes, which follows std's B-tree layout (at most 11 entries per node, at least 5 in every node but the root while nothing is removed).
+  - JSON:
+    - the header gains `max_processes`
+    - `rows` gains `others_processes`, `others_anon_kib`, `others_file_kib` and `others_shmem_kib`
+    - new `processes` (`pid`, `start_ticks`, `name` through `log::untrusted_bytes`) and `process_rows` (`row`, `process`, `anon_kib`, `file_kib`, `shmem_kib`)
+    - all `null` under `Absent`
+  - `Sampler::finish` logs `memory series: N rows, D samples dropped, P processes listed, K KiB in memory (at most B KiB)`.
+- **Sizes**, from a throwaway test in the dev container (aarch64): `Row` 144 bytes, `ProcessRow` 32, `(ProcKey, Comm)` 40, a modelled map node 352.
+  - So a listed process costs at most 32 + 40 + 70.4 bytes.
+  - 50000 samples × 32 processes with one tmpfs mount is bounded at 225.7 MiB, and the ceiling allows up to 56717 samples there.
+  - 1000000 samples with no processes is 137.3 MiB, or 167.8 MiB with one mount.
+- **Found by the first smoke run:** a process caught between losing its address space and becoming a zombie has a status with no `Rss*` lines and a state of `R`. It was logged as "needs Linux 4.5+". `ProcMem::exited` now treats a status without `VmRSS` as exited too, and so `Gone`. The race predates this part.
+- **Tests:**
+  - property tests in `series.rs`:
+    - `listed_processes_are_the_largest_of_their_sample`, against a full sort
+    - `listed_and_others_add_up_to_the_sample`
+    - `the_process_table_holds_exactly_the_listed_processes_with_their_latest_name`
+    - `a_recycled_pid_is_a_new_process`
+    - `process_rows_point_at_existing_rows_and_processes`, on the JSON
+    - the part 1 properties, now with processes that come and go and pids reused with other start ticks (memory's `procs()` strategy, with tiny sizes so that ranks tie)
+    - the bound test, with samples full of new processes, the table's worst case
+    - procfs's stat property, with start ticks and the name
+  - **Measured heap use.** A counting `#[global_allocator]` (System, counted per thread) checks the cost model against real allocations:
+    - `the_footprint_covers_the_series_real_memory`: the whole series held ≤ `footprint()`
+    - `the_btree_model_covers_its_real_memory`: a slot map of up to 5000 keys, in order, reversed or shuffled, held ≤ `map_cost`
+    - `the_btree_model_and_the_measured_figure_per_entry`: 100000 keys hold 43.6 bytes per entry in order and 35.0 shuffled, against 70.4 modelled
+    - Two mutations of the model were each caught: dropping the 16-byte overhead per vector, and assuming 11 entries per node instead of 5.
+  - `ProcDir` on the real kernel:
+    - `a_proc_dir_reads_its_own_process`: a 1 MiB memfd is found, and a wrong start tick reads `Gone`
+    - `a_proc_dir_is_pinned_to_its_process`: once a forked child is reaped, its open directory reads `Gone`
+  - unit tests:
+    - policy refusals: `max_processes` with "off", missing, negative, above 4096
+    - the ceiling: 1000000 × 0, 1 × 4096 and 50000 × 32 with one mount pass; 1000000 × 32 is refused and names `max_processes`
+    - a stat line without the start time is not parsed
+    - an exiting status counts as exited, a pre-4.5 one does not
+  - smoke, in "time series":
+    - children named `sbx-kid-16/32/64` appear with the pids and names they print, the largest first, and the sums hold
+    - `max_processes = 1` and `= 0`
+    - a fork loop of short-lived children: each (pid, start) once, valid indices, the sums hold, and the logged footprint is within the logged bound
+    - more than 4096 is refused
+    - the ceiling check is now plain `max_samples = 1000000`
+- **Verified locally** (arm64 Mac, podman machine, kernel 6.12.7):
+  - `cargo fmt --check`
+  - clippy with `-D warnings`, natively and for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-musl`, in `rust:1.97.0-slim-bookworm`
+  - 100 unit tests pass
+  - `make smoke` (delegated cgroup): 181 + 13 passed
+    - The KIDS run listed 4 processes in 105 entries over 29 rows.
+    - The fork loop listed 220 processes over 47 rows, in 52 KiB against a bound of 64221 KiB.
+    - The sampling overhead check passed: off 327 ms, 10 ms 363 ms, 20 ms 331 ms.
+    - The first run failed two new checks, both test mistakes: once the smallest child exits, a row lists only two children, and a series file was left before the probe's "writes nothing" check. It also showed the exit race fixed above.
+  - `make probe`: OK
+  - A manual run with two children and a parent that `exec`s `sleep`: the parent keeps its slot and its name becomes `sleep`, and each row's entries add up to `tree_anon_kib`.
+- **Deviations from the plan:**
+  - Listed processes are one flat `entries` vector, not a `Vec` in each row: the same layout as `process_rows`, and no allocation per row.
+  - The B-tree's memory is a model at run time, checked by the heap tests above.
+  - Pid reuse is not forced in smoke: pid_max is global before Linux 6.14, so it cannot be lowered for the test alone. The property test and the reaped-child `ProcDir` test cover it.
+  - The log line gains the bound, so smoke can check the footprint against it.
+  - `max_processes` above 4096 is a validation error, as `max_samples` above 1000000 is.
+- **Not modelled by the bound:** a reallocation's transient copy, as in part 1. The heap counter sees `realloc` as one block that changes size.
+- **Not verified here:** the amd64 runner, and Cloud Run (`make live`).

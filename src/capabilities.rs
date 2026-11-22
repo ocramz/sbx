@@ -482,8 +482,10 @@ fn proc_access(p: &Policy) -> Result<String, String> {
         if unsafe { libc::read(ready_r.as_raw_fd(), (&mut b as *mut u8).cast(), 1) } != 1 {
             return Err(None);
         }
-        memory::proc_mem(pid).map_err(|e| Some(e.to_string()))?;
-        let fds = memory::memfds(pid).map_err(|e| {
+        // Through its /proc directory, as sampling reads every process.
+        let (dir, _) = memory::ProcDir::open(pid).map_err(|e| Some(e.to_string()))?;
+        dir.mem().map_err(|e| Some(e.to_string()))?;
+        let fds = dir.memfds().map_err(|e| {
             Some(format!(
                 "{e} (reading the descriptors of a non-dumpable process of another uid needs CAP_SYS_PTRACE)"
             ))
