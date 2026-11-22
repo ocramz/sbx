@@ -15,6 +15,7 @@ mod memory;
 mod net;
 mod notify;
 mod policy;
+mod procfs;
 mod report;
 mod seccomp_layer;
 mod supervisor;
@@ -197,8 +198,8 @@ fn parse_flags(args: &[OsString], run: bool) -> Result<(Overrides, Vec<OsString>
     }
 }
 
-/// Where sbx's own output goes besides stdout: the log file (opened now, so
-/// every later line lands there) and the report.
+/// Where sbx's own output goes besides stdout: the report and the log file
+/// (opened now, so every later line lands there).
 struct Outputs {
     report: Option<Destination>,
     log: Option<Destination>,
@@ -207,6 +208,16 @@ struct Outputs {
 impl Outputs {
     fn open(ov: &Overrides, cmd: &str) -> Result<Outputs, Vec<String>> {
         let one = |e: String| vec![e];
+        // `sbx policy` has no outcome to report.
+        let report = match &ov.report {
+            Some(path) if cmd != "policy" => Some(Destination::open("report", path).map_err(one)?),
+            _ => None,
+        };
+        // Before anything else can fail, so a report found at the path
+        // always comes from the last `sbx run` that got this far.
+        if let (Some(r), "run") = (&report, cmd) {
+            r.remove_stale().map_err(one)?;
+        }
         let log = match &ov.log {
             Some(path) => {
                 let d = Destination::open("log file", path).map_err(one)?;
@@ -215,11 +226,6 @@ impl Outputs {
             }
             None => None,
         };
-        // `sbx policy` has no outcome to report.
-        let report = match &ov.report {
-            Some(path) if cmd != "policy" => Some(Destination::open("report", path).map_err(one)?),
-            _ => None,
-        };
         Ok(Outputs { report, log })
     }
 }
@@ -227,12 +233,6 @@ impl Outputs {
 /// `sbx run`: every outcome after this point, setup failures included,
 /// ends up in the report.
 fn run_and_report(ov: Overrides, cmd: Vec<OsString>, out: &Outputs) -> i32 {
-    if let Some(r) = &out.report {
-        if let Err(e) = r.remove_stale() {
-            log::error(e);
-            return 125;
-        }
-    }
     let outcome = match run(ov, cmd, out) {
         Ok(ran) => Outcome::Ran(Box::new(ran)),
         Err(e) => {

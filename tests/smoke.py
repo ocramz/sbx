@@ -372,6 +372,51 @@ for pid in filter(str.isdigit, os.listdir("/proc")):
     except OSError:
         pass
 check("orphans are killed on exit", not left, f"left over: {left}")
+# Forks a process that leaves the session, closes its stdio and renames itself
+# to bytes that are not UTF-8, then exits. argv[1] marks the process tree.
+ESCAPEE = """
+import ctypes, os, time
+r, w = os.pipe()
+if os.fork() == 0:
+    os.setsid()
+    null = os.open("/dev/null", os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(null, fd)
+    ctypes.CDLL(None).prctl(15, b"\\xff\\xfe", 0, 0, 0)
+    os.write(w, b"x")
+    time.sleep(300)
+    os._exit(0)
+os.read(r, 1)
+"""
+
+
+def escapees():
+    """Live processes started by ESCAPEE (a zombie's cmdline is empty)."""
+    found = []
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                if b"sbx-smoke-escapee" in f.read().split(b"\0"):
+                    found.append(int(pid))
+        except OSError:
+            pass
+    return found
+
+
+def kill_escapees():
+    left = escapees()
+    for pid in left:
+        try:
+            os.kill(pid, 9)
+        except ProcessLookupError:
+            pass
+    return left
+
+
+sbx(py(ESCAPEE, "sbx-smoke-escapee"))
+time.sleep(0.3)
+left = kill_escapees()
+check("orphans whose name is not UTF-8 are killed on exit", not left, f"left over: {left}")
 expect("--no-subprocesses blocks fork", "nonzero", ["--no-subprocesses", "--", "/bin/sh", "-c", "/bin/true; /bin/true"],
        log="process.subprocesses = false")
 
@@ -430,6 +475,9 @@ expect("threads work without subprocesses", 0,
        ["--no-subprocesses", *py("import threading; t=threading.Thread(target=print); t.start(); t.join()")])
 if allowed_outside(PTRACE):
     expect("kill mode kills the process (SIGKILL)", 137, ["--seccomp-action", "kill", *py(PTRACE)], log="killed python3")
+    expect("kill mode kills a process whose name is not UTF-8", 137,
+           ["--seccomp-action", "kill", *py("import ctypes; ctypes.CDLL(None).prctl(15, b'\\xff', 0, 0, 0)\n" + PTRACE)],
+           log="killed \\xff[pid")
 else:
     print("  n/a  kill mode (the container runtime already refuses ptrace, so sbx never sees it)")
 
@@ -720,6 +768,17 @@ expect("off: refused while another process runs as the sandbox uid", 125, ["--",
        log="already run as uid 65534")
 squatter.kill()
 squatter.wait()
+squatter = subprocess.Popen([*NR, PY, "-c", "import ctypes, time; ctypes.CDLL(None).prctl(15, b'\\xff', 0, 0, 0); "
+                             "time.sleep(60)"], stdin=subprocess.DEVNULL)
+for _ in range(50):
+    with open(f"/proc/{squatter.pid}/comm", "rb") as f:
+        if f.read() == b"\xff\n":
+            break
+    time.sleep(0.1)
+expect("off: refused while a process whose name is not UTF-8 runs as the sandbox uid", 125, ["--", "/bin/true"],
+       pol=OFF, log="\\xff (pid")
+squatter.kill()
+squatter.wait()
 
 EGRESS_OFF = policy(
     abi="off", mode="egress", families=("unix", "inet", "inet6"), dns=DNS,
@@ -844,6 +903,16 @@ run.communicate(timeout=30)
 with open(REPORT) as f:
     r = json.load(f)
 check("report: SIGTERM is forwarded and reported", run.returncode == 143 and r["program"] == {"signaled": 15}, r)
+with open(REPORT, "w") as f:
+    f.write("stale")
+expect("report: a refused log file is an error", 125, ["--report", REPORT, "--log", "/tmp/sbx-smoke.log", "--", "/bin/true"],
+       auto_report=False, log="writable by others")
+check("report: ... and the stale report is gone", not os.path.lexists(REPORT))
+check_report("report: a process left behind whose name is not UTF-8 is counted", py(ESCAPEE, "sbx-smoke-escapee"),
+             lambda r: r["killed_after_exit"] == 1)
+time.sleep(0.3)
+left = kill_escapees()
+check("report: ... and killed", not left, f"left over: {left}")
 
 LOG = f"{RDIR}/sbx.log"
 rc, so, se = sbx(["--log", LOG, "--", "/bin/sh", "-c", "echo out; echo err >&2"])
@@ -941,6 +1010,10 @@ r = check_report("memory: every kind is reported", py(MEMPROG, 0.5), lambda r: r
 if r is not None:
     print(f"  info memory: {r['memory']}; rusage: {r['rusage']}", flush=True)
 check("memory: the program cleaned up", not os.path.exists(f"{SHM}/sbx-smoke-mem"))
+RENAMED_HEAP = ("import ctypes, time; ctypes.CDLL(None).prctl(15, b'\\xff', 0, 0, 0)\n"
+                "b = bytearray(32 << 20)\nfor i in range(0, len(b), 4096): b[i] = 1\ntime.sleep(0.5)")
+check_report("memory: a process whose name is not UTF-8 is sampled", py(RENAMED_HEAP),
+             lambda r: r["exit_code"] == 0 and r["memory"]["max_anon_kib"] >= 32 * 1024, pol=SAMPLED)
 check_report("memory: with sampling off only rusage is reported", py(MEMPROG, 0.1),
              lambda r: r["exit_code"] == 0 and r["memory"] is None and r["rusage"]["max_rss_kib"] >= 64 * 1024,
              pol=policy(extra_fs=[(SHM, "rw")]))

@@ -6,10 +6,11 @@
 //! still single-threaded.
 
 use crate::landlock_layer::{self, abi_kernel, Probe};
-use crate::log::{errno, os_err};
+use crate::log::{self, errno, os_err};
 use crate::memory;
 use crate::notify::{self, Listener, Received};
 use crate::policy::{LandlockAbi, MeasureCfg, NetMode, Policy, ResolvConfMode, RESOLV_CONF};
+use crate::procfs;
 use crate::seccomp_layer::{self, AUDIT_ARCH};
 use crate::supervisor;
 use seccompiler::sock_filter;
@@ -201,15 +202,17 @@ fn uid_unused(uid: u32) -> Result<String, String> {
         let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
             continue;
         };
-        // A process that exits meanwhile is no concern.
-        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+        // A process that exits meanwhile is no concern. Bytes: the process
+        // name in it need not be UTF-8.
+        let Ok(status) = std::fs::read(format!("/proc/{pid}/status")) else {
             continue;
         };
-        let field = |name: &str| status.lines().find_map(|l| l.strip_prefix(name)).map(str::trim);
         // Real, effective, saved and filesystem uid.
-        let uses = field("Uid:").is_some_and(|ids| ids.split_whitespace().any(|id| id.parse() == Ok(uid)));
+        let uses = procfs::status_text(&status, "Uid:")
+            .is_some_and(|ids| ids.split_whitespace().any(|id| id.parse() == Ok(uid)));
         if uses {
-            found.push(format!("{} (pid {pid})", field("Name:").unwrap_or("?")));
+            let name = procfs::status_field(&status, "Name:").map_or_else(|| "?".into(), log::untrusted_bytes);
+            found.push(format!("{name} (pid {pid})"));
         }
     }
     if found.is_empty() {

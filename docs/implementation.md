@@ -78,3 +78,46 @@ Plan: [plans/v0.4-memory-by-kind.md](plans/v0.4-memory-by-kind.md).
   - `make smoke` (delegated cgroup): 148 + 13 passed. The memory program at 20 ms: 30 samples, `memfd_peak_kib` 49152, `sysv_shm_peak_kib` 4096, `tmpfs_peak_kib` 8192, `max_anon_kib` 70328, `max_shmem_kib` 16384, `max_file_kib` 5256, against `rusage.max_rss_kib` 95936. Overhead, wall time of a 0.33 s CPU-bound program: off 344 ms, 10 ms 354 ms, 20 ms 326 ms, 50 ms 328 ms (within noise).
 - Deviations from the plan: none in behaviour. `fs_used` uses `statvfs` (its field types are the same in glibc and musl, so no casts), and the magic check is generic over `f_type`'s type.
 - Not verified here: Cloud Run (`make live`), including whether its `/dev/shm` is a tmpfs; the amd64 runner; a kernel without `RssAnon` (pre-4.5, below what sbx supports anyway).
+
+## 2026-11-22: v0.4.1, /proc read as bytes; no stale report
+
+Plan: [plans/v0.4.1-proc-bytes.md](plans/v0.4.1-proc-bytes.md). The series work that builds on it is planned in [plans/v0.5-series.md](plans/v0.5-series.md), [plans/v0.5-series-processes.md](plans/v0.5-series-processes.md) and [plans/v0.5-series-compression.md](plans/v0.5-series-compression.md).
+
+- **Cause:** a process name can hold any byte but NUL, and the sandbox picks its own with `prctl(PR_SET_NAME)`. `/proc/<pid>/stat` prints the name as is, and `status` escapes only `\n` and `\\`. Every reader that used `read_to_string` failed on a name that is not UTF-8:
+  - `supervisor::proc_table` dropped the process, so `own_children`, `live_descendants` and `leftovers` never saw it. A renamed `setsid` escapee survived sbx when sbx was not PID 1 and had no cgroup.
+  - `memory::proc_mem` skipped it.
+  - `capabilities::uid_unused` passed it.
+  - `notify::tgid_of` failed, which with `on_violation = "kill"` was fatal (exit 125).
+- **`src/procfs.rs` (new, pure):**
+  - `Stat::parse(&[u8])` (ppid, zombie), with the fields after the last `)`
+  - `status_field`/`status_text`: the first line starting with a key, trimmed
+  - a `render` test module with the kernel's escaping of the `Name:` line
+- **Callers now read bytes:**
+  - `proc_table` logs, once per run, a read error other than ENOENT/ESRCH or an unparsable stat, instead of dropping the process silently.
+  - `ProcMem::parse_status` takes bytes. `proc_mem`'s zombie check goes through `status_text`.
+  - `uid_unused` and `tgid_of` parse with `status_text`. `uid_unused`'s message and `comm_of` escape the name with the new `log::untrusted_bytes`: valid UTF-8 as `untrusted` does, and other bytes as `\xNN` (`utf8_chunks`). The message used to print the `Name:` value unescaped.
+- **`src/main.rs`:** `Outputs::open` opens the report and, for `run`, removes a stale one before it opens the log. `run_and_report` no longer removes it. One consequence: an invalid `--report` path is now reported on stderr even with `--log`.
+- **Tests:**
+  - property tests:
+    - `stat_parsing_finds_the_fields_whatever_the_name`
+    - `status_fields_are_found_whatever_the_name`
+    - `status_parsing_survives_any_process_name`, which replaces `status_parsing_inverts_rendering`
+    - three for `untrusted_bytes`: no controls, the same as `untrusted` on UTF-8, an invalid byte between ASCII spelled `\xNN`
+  - unit test: a name cannot forge a `Uid:` line
+  - smoke tests:
+    - a `setsid` escapee renamed to `\xff\xfe` is killed (supervision) and counted in `killed_after_exit` (report)
+    - kill mode kills a renamed process (exit 137, log `killed \xff[pid`)
+    - `abi = "off"` refuses while a renamed process runs as the sandbox uid
+    - a renamed 32 MiB heap is sampled
+    - a refused `--log` leaves no stale report
+- **Verified locally** (arm64 Mac, podman machine, kernel 6.12.7):
+  - `cargo fmt --check`
+  - clippy with `-D warnings`, natively and for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-musl`, in `rust:1.97.0-slim-bookworm`
+  - 81 unit tests pass
+  - `make smoke` with the v0.4 code and the new tests: 149 passed, the 7 new ones failed
+  - `make smoke` with the fix: 156 + 13 passed
+  - `make probe`: OK
+- **Deviations from the plan:**
+  - The parsers live in a new `src/procfs.rs` rather than in `supervisor.rs`, since memory, capabilities and notify use them too.
+  - `ProcMem::parse_status` takes the bytes itself, so the property test covers the decoding.
+- **Not verified here:** the amd64 runner, and Cloud Run (`make live`).

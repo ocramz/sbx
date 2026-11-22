@@ -15,6 +15,7 @@
 use crate::cgroup::{self, Delegation};
 use crate::log::{self, os_err};
 use crate::policy::MeasureCfg;
+use crate::procfs;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
@@ -41,10 +42,13 @@ pub struct ProcMem {
 
 impl ProcMem {
     /// None when the fields are missing: a zombie, or a kernel before 4.5.
-    pub fn parse_status(status: &str) -> Option<ProcMem> {
+    pub fn parse_status(status: &[u8]) -> Option<ProcMem> {
         let field = |name: &str| -> Option<u64> {
-            let v = status.lines().find_map(|l| l.strip_prefix(name))?;
-            v.trim().strip_suffix("kB")?.trim().parse().ok()
+            procfs::status_text(status, name)?
+                .strip_suffix("kB")?
+                .trim_end()
+                .parse()
+                .ok()
         };
         Some(ProcMem {
             anon_kib: field("RssAnon:")?,
@@ -332,16 +336,12 @@ fn read_error(what: impl Display, e: std::io::Error) -> ReadError {
 /// The resident set of `pid` by kind.
 pub fn proc_mem(pid: Pid) -> Result<ProcMem, ReadError> {
     let path = format!("/proc/{pid}/status");
-    let s = std::fs::read_to_string(&path).map_err(|e| read_error(&path, e))?;
+    // Bytes: the process name in it need not be UTF-8.
+    let s = std::fs::read(&path).map_err(|e| read_error(&path, e))?;
     match ProcMem::parse_status(&s) {
         Some(m) => Ok(m),
         // Exited meanwhile.
-        None if s
-            .lines()
-            .any(|l| l.starts_with("State:\tZ") || l.starts_with("State:\tX")) =>
-        {
-            Err(ReadError::Gone)
-        }
+        None if procfs::status_text(&s, "State:").is_some_and(|v| v.starts_with(['Z', 'X'])) => Err(ReadError::Gone),
         None => Err(ReadError::Failed(format!(
             "{path} has no RssAnon, RssFile and RssShmem (needs Linux 4.5+)"
         ))),
@@ -593,14 +593,22 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    fn render_status(m: &ProcMem, name: &str) -> String {
-        format!(
-            "Name:\t{name}\nUmask:\t0022\nState:\tS (sleeping)\nPid:\t42\nVmPeak:\t  123456 kB\nVmRSS:\t{:>8} kB\n\
-             RssAnon:\t{:>8} kB\nRssFile:\t{:>8} kB\nRssShmem:\t{:>8} kB\nVmData:\t    1234 kB\nThreads:\t1\n",
-            m.anon_kib + m.file_kib + m.shmem_kib,
-            m.anon_kib,
-            m.file_kib,
-            m.shmem_kib
+    fn render_status(m: &ProcMem, name: &[u8]) -> Vec<u8> {
+        let kb = |v: u64| format!("{v:>8} kB");
+        procfs::render::status(
+            name,
+            &[
+                ("Umask:", "0022".into()),
+                ("State:", "S (sleeping)".into()),
+                ("Pid:", "42".into()),
+                ("VmPeak:", "  123456 kB".into()),
+                ("VmRSS:", kb(m.anon_kib + m.file_kib + m.shmem_kib)),
+                ("RssAnon:", kb(m.anon_kib)),
+                ("RssFile:", kb(m.file_kib)),
+                ("RssShmem:", kb(m.shmem_kib)),
+                ("VmData:", "    1234 kB".into()),
+                ("Threads:", "1".into()),
+            ],
         )
     }
 
@@ -727,8 +735,9 @@ mod tests {
     }
 
     proptest! {
+        /// The sandbox picks the name: any bytes but NUL, UTF-8 or not.
         #[test]
-        fn status_parsing_inverts_rendering(m in proc_mem(), name in "[a-z(): ]{1,15}") {
+        fn status_parsing_survives_any_process_name(m in proc_mem(), name in prop::collection::vec(1..=255u8, 0..16)) {
             prop_assert_eq!(ProcMem::parse_status(&render_status(&m, &name)), Some(m));
         }
 
@@ -837,7 +846,7 @@ mod tests {
 
     #[test]
     fn zombies_and_garbage_are_not_measured() {
-        let zombie = "Name:\tsh\nState:\tZ (zombie)\nPid:\t9\nThreads:\t1\n";
+        let zombie = b"Name:\tsh\nState:\tZ (zombie)\nPid:\t9\nThreads:\t1\n";
         assert_eq!(ProcMem::parse_status(zombie), None);
         assert!(CgroupMem::parse("anon_thp 0\nshmem_thp 0\n").is_err());
         assert!(parse_sysvipc_shm("").is_err());
