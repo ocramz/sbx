@@ -49,6 +49,9 @@ pub const MAX_SAMPLE_MS: u64 = 60_000;
 /// Most samples a memory series keeps (plus the final one).
 pub const MAX_SERIES_SAMPLES: u32 = 1_000_000;
 
+/// Most processes a row of a memory series lists.
+pub const MAX_SERIES_PROCESSES: u32 = 4096;
+
 /// Most memory a series may take in sbx, worst case ([`crate::series::bound`]).
 pub const SERIES_CEILING_BYTES: u64 = 256 << 20;
 
@@ -255,9 +258,11 @@ impl From<MeasureCfg> for RawMeasure {
 pub enum SeriesCfg {
     Off,
     /// Keep the first `max_samples` samples and the one after the program
-    /// exits; count the others.
+    /// exits; count the others. Each row lists the sample's `max_processes`
+    /// largest processes (0: none) and sums the rest.
     On {
         max_samples: NonZeroU32,
+        max_processes: u32,
     },
 }
 
@@ -275,17 +280,28 @@ struct RawSeries {
     mode: SeriesMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_samples: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_processes: Option<u32>,
 }
 
 impl TryFrom<RawSeries> for SeriesCfg {
     type Error = String;
     fn try_from(r: RawSeries) -> Result<Self, String> {
-        match (r.mode, r.max_samples) {
-            (SeriesMode::Off, None) => Ok(SeriesCfg::Off),
-            (SeriesMode::Off, Some(_)) => Err("measure.series.max_samples is only used with mode = \"on\"".into()),
-            (SeriesMode::On, None) => Err("measure.series.mode = \"on\" needs measure.series.max_samples".into()),
-            (SeriesMode::On, Some(n)) => NonZeroU32::new(n)
-                .map(|max_samples| SeriesCfg::On { max_samples })
+        match (r.mode, r.max_samples, r.max_processes) {
+            (SeriesMode::Off, None, None) => Ok(SeriesCfg::Off),
+            (SeriesMode::Off, Some(_), _) => Err("measure.series.max_samples is only used with mode = \"on\"".into()),
+            (SeriesMode::Off, None, Some(_)) => {
+                Err("measure.series.max_processes is only used with mode = \"on\"".into())
+            }
+            (SeriesMode::On, None, _) => Err("measure.series.mode = \"on\" needs measure.series.max_samples".into()),
+            (SeriesMode::On, Some(_), None) => {
+                Err("measure.series.mode = \"on\" needs measure.series.max_processes (0 lists none)".into())
+            }
+            (SeriesMode::On, Some(n), Some(max_processes)) => NonZeroU32::new(n)
+                .map(|max_samples| SeriesCfg::On {
+                    max_samples,
+                    max_processes,
+                })
                 .ok_or_else(|| "measure.series.max_samples must be at least 1".into()),
         }
     }
@@ -297,10 +313,15 @@ impl From<SeriesCfg> for RawSeries {
             SeriesCfg::Off => RawSeries {
                 mode: SeriesMode::Off,
                 max_samples: None,
+                max_processes: None,
             },
-            SeriesCfg::On { max_samples } => RawSeries {
+            SeriesCfg::On {
+                max_samples,
+                max_processes,
+            } => RawSeries {
                 mode: SeriesMode::On,
                 max_samples: Some(max_samples.get()),
+                max_processes: Some(max_processes),
             },
         }
     }
@@ -1119,17 +1140,27 @@ impl Policy {
                 "measure.memory_sample_ms must be at most {MAX_SAMPLE_MS}, got {interval_ms}"
             ));
         }
-        if let SeriesCfg::On { max_samples } = series {
+        if let SeriesCfg::On {
+            max_samples,
+            max_processes,
+        } = series
+        {
             if max_samples.get() > MAX_SERIES_SAMPLES {
                 errs.push(format!(
                     "measure.series.max_samples must be at most {MAX_SERIES_SAMPLES}, got {max_samples}"
                 ));
             }
-            let bound = crate::series::bound(*max_samples, tmpfs.len());
+            if *max_processes > MAX_SERIES_PROCESSES {
+                errs.push(format!(
+                    "measure.series.max_processes must be at most {MAX_SERIES_PROCESSES}, got {max_processes}"
+                ));
+            }
+            let bound = crate::series::bound(*max_samples, tmpfs.len(), *max_processes);
             if bound > SERIES_CEILING_BYTES {
                 errs.push(format!(
-                    "measure.series: max_samples = {max_samples} with {} tmpfs mount(s) may take up to {} MiB, \
-                     above sbx's ceiling of {} MiB; lower max_samples",
+                    "measure.series: max_samples = {max_samples} and max_processes = {max_processes} with {} tmpfs \
+                     mount(s) may take up to {} MiB, above sbx's ceiling of {} MiB; lower max_samples or \
+                     max_processes",
                     tmpfs.len(),
                     bound.div_ceil(1 << 20),
                     SERIES_CEILING_BYTES >> 20
@@ -1641,8 +1672,9 @@ access = "rw"
         use proptest::prelude::*;
         prop_oneof![
             Just(SeriesCfg::Off),
-            (1..=u32::MAX).prop_map(|n| SeriesCfg::On {
-                max_samples: NonZeroU32::new(n).unwrap()
+            (1..=u32::MAX, any::<u32>()).prop_map(|(n, max_processes)| SeriesCfg::On {
+                max_samples: NonZeroU32::new(n).unwrap(),
+                max_processes,
             }),
         ]
     }
@@ -1695,17 +1727,27 @@ access = "rw"
     #[test]
     fn series_settings_exist_only_when_on() {
         let err = |ms: u64, body: &str| parse(&with_series(ms, "[]", body)).unwrap_err();
-        assert!(err(20, "mode = \"off\"\nmax_samples = 5").contains("only used with mode = \"on\""));
-        assert!(err(20, "mode = \"on\"").contains("needs measure.series.max_samples"));
-        assert!(err(20, "mode = \"on\"\nmax_samples = 0").contains("at least 1"));
-        assert!(err(20, "mode = \"on\"\nmax_samples = 5\nmax_processes = 1").contains("unknown field"));
+        assert!(err(20, "mode = \"off\"\nmax_samples = 5").contains("max_samples is only used with mode = \"on\""));
+        assert!(err(20, "mode = \"off\"\nmax_processes = 0").contains("max_processes is only used with mode = \"on\""));
+        assert!(err(20, "mode = \"on\"\nmax_processes = 8").contains("needs measure.series.max_samples"));
+        assert!(err(20, "mode = \"on\"\nmax_samples = 5").contains("needs measure.series.max_processes"));
+        assert!(err(20, "mode = \"on\"\nmax_samples = 0\nmax_processes = 8").contains("at least 1"));
+        assert!(err(20, "mode = \"on\"\nmax_samples = 5\nmax_processes = -1").contains("invalid value"));
+        assert!(err(20, "mode = \"on\"\nmax_samples = 5\nmax_processes = 1\nmax_rows = 1").contains("unknown field"));
         assert!(err(20, "mode = \"sampled\"").contains("unknown variant"));
-        assert!(err(0, "mode = \"on\"\nmax_samples = 5").contains("needs measure.memory_sample_ms above 0"));
-        let p = parse(&with_series(20, "[]", "mode = \"on\"\nmax_samples = 5")).unwrap();
+        assert!(err(0, "mode = \"on\"\nmax_samples = 5\nmax_processes = 8")
+            .contains("needs measure.memory_sample_ms above 0"));
+        let p = parse(&with_series(
+            20,
+            "[]",
+            "mode = \"on\"\nmax_samples = 5\nmax_processes = 0",
+        ))
+        .unwrap();
         assert_eq!(
             p.measure.series(),
             SeriesCfg::On {
-                max_samples: NonZeroU32::new(5).unwrap()
+                max_samples: NonZeroU32::new(5).unwrap(),
+                max_processes: 0,
             }
         );
         assert_eq!(p.validate().unwrap(), Vec::<String>::new());
@@ -1714,23 +1756,41 @@ access = "rw"
 
     #[test]
     fn series_limits_and_the_memory_ceiling() {
-        let errs = |tmpfs: &str, body: &str| parse(&with_series(20, tmpfs, body)).unwrap().validate();
-        let e = errs(
-            "[]",
-            &format!("mode = \"on\"\nmax_samples = {}", MAX_SERIES_SAMPLES + 1),
-        )
-        .unwrap_err();
-        assert!(e.iter().any(|e| e.contains("at most 1000000")), "{e:?}");
-        assert!(errs("[]", &format!("mode = \"on\"\nmax_samples = {MAX_SERIES_SAMPLES}")).is_ok());
+        let errs = |tmpfs: &str, samples: u32, procs: u32| {
+            let body = format!("mode = \"on\"\nmax_samples = {samples}\nmax_processes = {procs}");
+            parse(&with_series(20, tmpfs, &body)).unwrap().validate()
+        };
+        let e = errs("[]", MAX_SERIES_SAMPLES + 1, 0).unwrap_err();
+        assert!(
+            e.iter().any(|e| e.contains("max_samples must be at most 1000000")),
+            "{e:?}"
+        );
+        let e = errs("[]", 1, MAX_SERIES_PROCESSES + 1).unwrap_err();
+        assert!(
+            e.iter().any(|e| e.contains("max_processes must be at most 4096")),
+            "{e:?}"
+        );
+        assert!(errs("[]", MAX_SERIES_SAMPLES, 0).is_ok());
+        assert!(errs("[]", 1, MAX_SERIES_PROCESSES).is_ok());
+        // The README's example, with one tmpfs mount measured: the path
+        // need not exist for the bound.
+        let over = |tmpfs: &str, samples: u32, procs: u32| {
+            errs(tmpfs, samples, procs).is_err_and(|e| e.iter().any(|e| e.contains("ceiling")))
+        };
+        assert!(!over("[\"/sbx-no-such-mount\"]", 50_000, 32));
+        // Each listed process may be a new one, so the processes dominate.
+        let e = errs("[]", MAX_SERIES_SAMPLES, 32).unwrap_err();
+        let ceiling: Vec<&String> = e.iter().filter(|e| e.contains("ceiling of 256 MiB")).collect();
+        assert_eq!(ceiling.len(), 1, "{e:?}");
+        let mib = crate::series::bound(NonZeroU32::new(MAX_SERIES_SAMPLES).unwrap(), 0, 32).div_ceil(1 << 20);
+        assert!(ceiling[0].contains(&format!("up to {mib} MiB")), "{e:?}");
+        assert!(ceiling[0].contains("lower max_samples or max_processes"), "{e:?}");
         // Each listed mount adds to every row; the paths need not exist for the bound.
         let many: Vec<String> = (0..32).map(|i| format!("\"/sbx-no-such-mount-{i}\"")).collect();
         let many = format!("[{}]", many.join(", "));
-        let e = errs(&many, &format!("mode = \"on\"\nmax_samples = {MAX_SERIES_SAMPLES}")).unwrap_err();
-        let ceiling: Vec<&String> = e.iter().filter(|e| e.contains("ceiling of 256 MiB")).collect();
-        assert_eq!(ceiling.len(), 1, "{e:?}");
-        let mib = crate::series::bound(NonZeroU32::new(MAX_SERIES_SAMPLES).unwrap(), 32).div_ceil(1 << 20);
-        assert!(ceiling[0].contains(&format!("up to {mib} MiB")), "{e:?}");
-        let e = errs(&many, "mode = \"on\"\nmax_samples = 1000").unwrap_err();
+        let e = errs(&many, MAX_SERIES_SAMPLES, 0).unwrap_err();
+        assert!(e.iter().any(|e| e.contains("ceiling of 256 MiB")), "{e:?}");
+        let e = errs(&many, 1000, 0).unwrap_err();
         assert!(!e.iter().any(|e| e.contains("ceiling")), "{e:?}");
     }
 

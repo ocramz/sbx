@@ -47,7 +47,7 @@ memory_sample_ms = 0       # or e.g. 20 to record memory by kind (README, "Job r
 tmpfs = []                 # tmpfs mounts whose use is recorded, with sampling on
 
 [measure.series]
-mode = "off"               # or "on" with max_samples, for --series FILE (README, "Time series")
+mode = "off"               # or "on" with max_samples and max_processes, for --series FILE (README, "Time series")
 
 [env]
 pass = []

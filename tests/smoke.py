@@ -1055,8 +1055,9 @@ print("== time series")
 SERIES = f"{RDIR}/series.json"
 
 
-def series_pol(ms=20, max_samples=50000, tmpfs=(SHM,), **kw):
-    return sampled(ms, tmpfs, series={"mode": "on", "max_samples": max_samples}, **kw)
+def series_pol(ms=20, max_samples=50000, max_processes=32, tmpfs=(SHM,), **kw):
+    return sampled(ms, tmpfs, series={"mode": "on", "max_samples": max_samples, "max_processes": max_processes},
+                   **kw)
 
 
 def load_series():
@@ -1118,6 +1119,7 @@ def post_exit_last(r, s):
 rc, se, r, s = with_series(py(MEMPROG, 0.5), series_pol())
 check("series: every sample is written and agrees with the report",
       rc == 0 and r is not None and s is not None and s["memory"]["max_samples"] == 50000
+      and s["memory"]["max_processes"] == 32 and s["memory"]["processes"] is not None
       and s["memory"]["dropped"] == 0 and series_header(r, s) and series_columns(r, s, same=True)
       and post_exit_last(r, s) and near(column_max(s["memory"]["rows"]["memfd_kib"]), 48),
       f"rc={rc} report={r and r['memory']} series={s and s['memory']} stderr={se[-600:]!r}")
@@ -1149,7 +1151,8 @@ check("series: ... and the file is removed, not written", not os.path.lexists(SE
 check_report("series: refused with sampling off", ["--", "/bin/true"],
              lambda r: r["setup_error"]["stage"] == "policy"
              and "needs measure.memory_sample_ms above 0" in " ".join(r["setup_error"]["messages"]),
-             pol=policy(measure={"memory_sample_ms": 0, "tmpfs": [], "series": {"mode": "on", "max_samples": 5}}))
+             pol=policy(measure={"memory_sample_ms": 0, "tmpfs": [],
+                                 "series": {"mode": "on", "max_samples": 5, "max_processes": 0}}))
 check_report("series: a policy without [measure.series] is refused with a hint", ["--", "/bin/true"],
              lambda r: r["setup_error"]["stage"] == "policy"
              and "[measure.series] is new in sbx v0.5" in " ".join(r["setup_error"]["messages"]),
@@ -1157,7 +1160,11 @@ check_report("series: a policy without [measure.series] is refused with a hint",
 check_report("series: a series that could exceed sbx's memory ceiling is refused", ["--", "/bin/true"],
              lambda r: r["setup_error"]["stage"] == "policy"
              and "ceiling of 256 MiB" in " ".join(r["setup_error"]["messages"]),
-             pol=series_pol(max_samples=1_000_000, tmpfs=[SHM, *(f"/sbx-no-such-mount-{i}" for i in range(31))]))
+             pol=series_pol(max_samples=1_000_000))
+check_report("series: more than 4096 processes per row is refused", ["--", "/bin/true"],
+             lambda r: r["setup_error"]["stage"] == "policy"
+             and "max_processes must be at most 4096" in " ".join(r["setup_error"]["messages"]),
+             pol=series_pol(max_processes=4097))
 expect("series: the same path as --report is refused", 125, ["--report", SERIES, "--series", SERIES, "--", "/bin/true"],
        pol=series_pol(), auto_report=False, log="the same path as --report")
 SLOG = f"{RDIR}/series.log"
@@ -1194,6 +1201,139 @@ check("series: a failed write exits 125, and the report says why",
       run.returncode == 125 and r["exit_code"] == 125 and r["program"] == {"exited": 0}
       and "writing the series" in (r["supervisor_error"] or "") and "writing the series" in se,
       f"rc={run.returncode} report={r} stderr={se[-400:]!r}")
+
+# Children with names and heaps of their own: each prints its pid and name
+# once it holds its heap, then holds it for argv[1] seconds.
+KID_MIB = (16, 32, 64)
+KIDS = f"""
+import ctypes, os, sys, time
+libc = ctypes.CDLL(None)
+kids = []
+for mib in {KID_MIB}:
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        libc.prctl(15, f"sbx-kid-{{mib}}".encode(), 0, 0, 0)  # PR_SET_NAME
+        heap = bytearray(mib << 20)
+        for i in range(0, len(heap), 4096):
+            heap[i] = 1
+        os.write(w, b"x")
+        time.sleep(float(sys.argv[1]))
+        os._exit(0)
+    os.close(w)
+    os.read(r, 1)
+    print(pid, f"sbx-kid-{{mib}}", flush=True)
+    kids.append(pid)
+for pid in kids:
+    os.waitpid(pid, 0)
+"""
+
+
+def kids_series(pol, hold=0.6):
+    """Run KIDS; return rc, stderr, the report, the series and {pid: name} as the children printed them."""
+    if os.path.lexists(SERIES):
+        os.unlink(SERIES)
+    rc, so, se, r = reported(["--series", SERIES, *py(KIDS, hold)], pol=pol)
+    printed = dict((int(f[0]), f[1]) for f in (line.split() for line in so.splitlines()) if len(f) == 2)
+    return rc, se, r, load_series(), printed
+
+
+def listed(s):
+    """Each row's listed processes in order, as (pid, name, anon_kib, rss_kib)."""
+    m = s["memory"]
+    p, e = m["processes"], m["process_rows"]
+    rows = [[] for _ in m["rows"]["t_us"]]
+    for row, i, a, f, sh in zip(e["row"], e["process"], e["anon_kib"], e["file_kib"], e["shmem_kib"]):
+        rows[row].append((p["pid"][i], p["name"][i], a, a + f + sh))
+    return rows
+
+
+def adds_up(s):
+    """In every row, the listed processes and the others add up to the sample."""
+    rows = s["memory"]["rows"]
+    return all(len(entries) + rows["others_processes"][i] == rows["live_processes"][i]
+               and sum(e[2] for e in entries) + rows["others_anon_kib"][i] == rows["tree_anon_kib"][i]
+               for i, entries in enumerate(listed(s)))
+
+
+KIDS_IN_ORDER = [f"sbx-kid-{m}" for m in reversed(KID_MIB)]
+
+
+def full_kids(s):
+    """The rows in which the largest child holds its whole heap (the smaller
+    ones already hold theirs, unless they have exited)."""
+    big = KIDS_IN_ORDER[0]
+    return [entries for entries in listed(s) if any(n == big and a >= KID_MIB[-1] * 1024 for _, n, a, _ in entries)]
+
+
+def kids_of(entries):
+    """The children a row lists, in its order."""
+    return [n for _, n, _, _ in entries if n in KIDS_IN_ORDER]
+
+
+rc, se, r, s, printed = kids_series(series_pol())
+full = full_kids(s) if s is not None else []
+names = dict(zip(s["memory"]["processes"]["pid"], s["memory"]["processes"]["name"])) if s is not None else {}
+check("series: children are listed with their pids and names, the largest first",
+      rc == 0 and s is not None and len(printed) == 3 and all(names.get(p) == n for p, n in printed.items())
+      and any(kids_of(entries) == KIDS_IN_ORDER for entries in full)
+      and all(entries[0][1] == KIDS_IN_ORDER[0]
+              and kids_of(entries) == [k for k in KIDS_IN_ORDER if k in kids_of(entries)] for entries in full)
+      and adds_up(s) and series_columns(r, s, same=True),
+      f"rc={rc} printed={printed} full={full[:2]} processes={s and s['memory']['processes']} stderr={se[-400:]!r}")
+if s is not None:
+    print(f"  info series: {s['memory']['processes']['name']} listed, "
+          f"{len(s['memory']['process_rows']['row'])} entries over {len(s['memory']['rows']['t_us'])} rows", flush=True)
+
+rc, se, r, s, printed = kids_series(series_pol(max_processes=1))
+full = full_kids(s) if s is not None else []
+check("series: with max_processes = 1, the listed process and the others add up to the sample",
+      rc == 0 and s is not None and all(len(entries) <= 1 for entries in listed(s)) and adds_up(s)
+      and len(full) > 0 and all(entries[0][1] == KIDS_IN_ORDER[0] for entries in full),
+      f"rc={rc} full={full[:2]} series={s and s['memory']} stderr={se[-400:]!r}")
+
+rc, se, r, s = with_series(["--", "/bin/true"], series_pol(max_processes=0))
+check("series: with max_processes = 0, no process is listed",
+      rc == 0 and s is not None and s["memory"]["max_processes"] == 0
+      and s["memory"]["processes"] is None and s["memory"]["process_rows"] is None
+      and all(s["memory"]["rows"][k] is None
+              for k in ("others_processes", "others_anon_kib", "others_file_kib", "others_shmem_kib")),
+      f"rc={rc} series={s and s['memory']} stderr={se[-400:]!r}")
+
+# Batches of 8 short-lived children, each with 1 MiB of its own, for argv[1] seconds.
+FORKS = """
+import os, sys, time
+end = time.monotonic() + float(sys.argv[1])
+while time.monotonic() < end:
+    kids = []
+    for _ in range(8):
+        pid = os.fork()
+        if pid == 0:
+            b = bytearray(1 << 20)
+            for i in range(0, len(b), 4096):
+                b[i] = 1
+            time.sleep(0.03)
+            os._exit(0)
+        kids.append(pid)
+    for pid in kids:
+        os.waitpid(pid, 0)
+"""
+rc, se, r, s = with_series(py(FORKS, 1), series_pol(max_processes=8))
+held = re.search(r"(\d+) KiB in memory \(at most (\d+) KiB\)", se)
+procs = s["memory"]["processes"] if s is not None else None
+check("series: a fork loop lists each process once and stays within the bound",
+      rc == 0 and s is not None and held is not None and int(held.group(1)) <= int(held.group(2))
+      and len(procs["pid"]) > 20 and len(set(zip(procs["pid"], procs["start_ticks"]))) == len(procs["pid"])
+      and all(0 <= i < len(procs["pid"]) for i in s["memory"]["process_rows"]["process"])
+      and adds_up(s) and series_columns(r, s, same=True),
+      f"rc={rc} log={held and held.group(0)} processes={procs and len(procs['pid'])} stderr={se[-400:]!r}")
+if s is not None:
+    print(f"  info series, fork loop: {len(procs['pid'])} processes listed, "
+          f"{len(s['memory']['rows']['t_us'])} rows; {held and held.group(0)}", flush=True)
+
+if os.path.lexists(SERIES):
+    os.unlink(SERIES)
 rc, so, se = sbx(["--series", SERIES], pol=series_pol(), cmd="probe")
 check("series: probe checks the destination", rc == 0 and "ok       series file" in so, so + se)
 rc, so, se = sbx(["--series", SERIES], pol=SAMPLED, cmd="probe")
