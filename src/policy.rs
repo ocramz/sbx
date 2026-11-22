@@ -15,7 +15,7 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::num::NonZeroU64;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 
 /// Every SBX_* variable sbx understands. Any other SBX_* variable is an error,
@@ -35,6 +35,7 @@ pub const ENV_VARS: &[&str] = &[
     "SBX_QUIET",
     "SBX_REPORT_FILE",
     "SBX_LOG_FILE",
+    "SBX_SERIES_FILE",
 ];
 
 /// Highest Landlock ABI this build knows how to enforce.
@@ -44,6 +45,12 @@ pub const RESOLV_CONF: &str = "/etc/resolv.conf";
 
 /// Longest interval between two memory samples.
 pub const MAX_SAMPLE_MS: u64 = 60_000;
+
+/// Most samples a memory series keeps (plus the final one).
+pub const MAX_SERIES_SAMPLES: u32 = 1_000_000;
+
+/// Most memory a series may take in sbx, worst case ([`crate::series::bound`]).
+pub const SERIES_CEILING_BYTES: u64 = 256 << 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -175,24 +182,47 @@ pub enum MeasureCfg {
     Sampled {
         interval_ms: NonZeroU64,
         tmpfs: Vec<PathBuf>,
+        series: SeriesCfg,
     },
 }
 
-/// The `[measure]` table as written: tmpfs mounts only with sampling on.
+impl MeasureCfg {
+    /// The series policy; off without sampling.
+    pub fn series(&self) -> SeriesCfg {
+        match self {
+            MeasureCfg::Off => SeriesCfg::Off,
+            MeasureCfg::Sampled { series, .. } => *series,
+        }
+    }
+}
+
+/// The `[measure]` table as written: tmpfs mounts and a series only with
+/// sampling on.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawMeasure {
     memory_sample_ms: u64,
     tmpfs: Vec<PathBuf>,
+    // Last: a table follows the plain values in TOML.
+    series: SeriesCfg,
 }
 
 impl TryFrom<RawMeasure> for MeasureCfg {
     type Error = String;
     fn try_from(r: RawMeasure) -> Result<Self, String> {
-        match (NonZeroU64::new(r.memory_sample_ms), r.tmpfs) {
-            (None, tmpfs) if tmpfs.is_empty() => Ok(MeasureCfg::Off),
-            (None, _) => Err("measure.tmpfs is only used when measure.memory_sample_ms is above 0".into()),
-            (Some(interval_ms), tmpfs) => Ok(MeasureCfg::Sampled { interval_ms, tmpfs }),
+        match (NonZeroU64::new(r.memory_sample_ms), r.tmpfs, r.series) {
+            (None, tmpfs, _) if !tmpfs.is_empty() => {
+                Err("measure.tmpfs is only used when measure.memory_sample_ms is above 0".into())
+            }
+            (None, _, SeriesCfg::On { .. }) => {
+                Err("measure.series.mode = \"on\" needs measure.memory_sample_ms above 0".into())
+            }
+            (None, _, SeriesCfg::Off) => Ok(MeasureCfg::Off),
+            (Some(interval_ms), tmpfs, series) => Ok(MeasureCfg::Sampled {
+                interval_ms,
+                tmpfs,
+                series,
+            }),
         }
     }
 }
@@ -203,10 +233,74 @@ impl From<MeasureCfg> for RawMeasure {
             MeasureCfg::Off => RawMeasure {
                 memory_sample_ms: 0,
                 tmpfs: vec![],
+                series: SeriesCfg::Off,
             },
-            MeasureCfg::Sampled { interval_ms, tmpfs } => RawMeasure {
+            MeasureCfg::Sampled {
+                interval_ms,
+                tmpfs,
+                series,
+            } => RawMeasure {
                 memory_sample_ms: interval_ms.get(),
                 tmpfs,
+                series,
+            },
+        }
+    }
+}
+
+/// Whether sbx keeps every memory sample for `--series FILE` (see the
+/// README, "Time series"). Without `--series` nothing is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawSeries", into = "RawSeries")]
+pub enum SeriesCfg {
+    Off,
+    /// Keep the first `max_samples` samples and the one after the program
+    /// exits; count the others.
+    On {
+        max_samples: NonZeroU32,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum SeriesMode {
+    Off,
+    On,
+}
+
+/// The `[measure.series]` table as written: the settings exist only with "on".
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSeries {
+    mode: SeriesMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_samples: Option<u32>,
+}
+
+impl TryFrom<RawSeries> for SeriesCfg {
+    type Error = String;
+    fn try_from(r: RawSeries) -> Result<Self, String> {
+        match (r.mode, r.max_samples) {
+            (SeriesMode::Off, None) => Ok(SeriesCfg::Off),
+            (SeriesMode::Off, Some(_)) => Err("measure.series.max_samples is only used with mode = \"on\"".into()),
+            (SeriesMode::On, None) => Err("measure.series.mode = \"on\" needs measure.series.max_samples".into()),
+            (SeriesMode::On, Some(n)) => NonZeroU32::new(n)
+                .map(|max_samples| SeriesCfg::On { max_samples })
+                .ok_or_else(|| "measure.series.max_samples must be at least 1".into()),
+        }
+    }
+}
+
+impl From<SeriesCfg> for RawSeries {
+    fn from(s: SeriesCfg) -> Self {
+        match s {
+            SeriesCfg::Off => RawSeries {
+                mode: SeriesMode::Off,
+                max_samples: None,
+            },
+            SeriesCfg::On { max_samples } => RawSeries {
+                mode: SeriesMode::On,
+                max_samples: Some(max_samples.get()),
             },
         }
     }
@@ -537,6 +631,7 @@ pub struct Overrides {
     pub quiet: Option<bool>,
     pub report: Option<PathBuf>,
     pub log: Option<PathBuf>,
+    pub series: Option<PathBuf>,
 }
 
 impl Overrides {
@@ -617,6 +712,9 @@ impl Overrides {
         if let Some(v) = get("SBX_LOG_FILE", &mut e2) {
             o.log = Some(PathBuf::from(v));
         }
+        if let Some(v) = get("SBX_SERIES_FILE", &mut e2) {
+            o.series = Some(PathBuf::from(v));
+        }
         errs.extend(e2);
         if errs.is_empty() {
             Ok(o)
@@ -642,6 +740,7 @@ impl Overrides {
         self.quiet = flags.quiet.or(self.quiet);
         self.report = flags.report.or(self.report);
         self.log = flags.log.or(self.log);
+        self.series = flags.series.or(self.series);
         self
     }
 }
@@ -770,8 +869,11 @@ impl Policy {
             let hint = if e.message().contains("missing field `cgroup`") {
                 "\nhint: [cgroup] is new in sbx v0.3; add it with mode = \"off\" to keep v0.2's behaviour"
             } else if e.message().contains("missing field `measure`") {
-                "\nhint: [measure] is new in sbx v0.4; add it with memory_sample_ms = 0 and tmpfs = [] to keep \
-                 v0.3's behaviour"
+                "\nhint: [measure] is new in sbx v0.4 and [measure.series] in v0.5; add [measure] with \
+                 memory_sample_ms = 0 and tmpfs = [], and [measure.series] with mode = \"off\", to keep v0.3's \
+                 behaviour"
+            } else if e.message().contains("missing field `series`") {
+                "\nhint: [measure.series] is new in sbx v0.5; add it with mode = \"off\" to keep v0.4's behaviour"
             } else {
                 ""
             };
@@ -1004,13 +1106,35 @@ impl Policy {
     }
 
     fn validate_measure(&self, errs: &mut Vec<String>) {
-        let MeasureCfg::Sampled { interval_ms, tmpfs } = &self.measure else {
+        let MeasureCfg::Sampled {
+            interval_ms,
+            tmpfs,
+            series,
+        } = &self.measure
+        else {
             return;
         };
         if interval_ms.get() > MAX_SAMPLE_MS {
             errs.push(format!(
                 "measure.memory_sample_ms must be at most {MAX_SAMPLE_MS}, got {interval_ms}"
             ));
+        }
+        if let SeriesCfg::On { max_samples } = series {
+            if max_samples.get() > MAX_SERIES_SAMPLES {
+                errs.push(format!(
+                    "measure.series.max_samples must be at most {MAX_SERIES_SAMPLES}, got {max_samples}"
+                ));
+            }
+            let bound = crate::series::bound(*max_samples, tmpfs.len());
+            if bound > SERIES_CEILING_BYTES {
+                errs.push(format!(
+                    "measure.series: max_samples = {max_samples} with {} tmpfs mount(s) may take up to {} MiB, \
+                     above sbx's ceiling of {} MiB; lower max_samples",
+                    tmpfs.len(),
+                    bound.div_ceil(1 << 20),
+                    SERIES_CEILING_BYTES >> 20
+                ));
+            }
         }
         let mut seen = BTreeSet::new();
         let mut filesystems: BTreeMap<u64, &Path> = BTreeMap::new();
@@ -1276,6 +1400,9 @@ mode = "off"
 memory_sample_ms = 0
 tmpfs = []
 
+[measure.series]
+mode = "off"
+
 [env]
 pass = []
 [env.set]
@@ -1436,10 +1563,26 @@ access = "rw"
 
     #[test]
     fn the_measure_table_is_required_with_an_upgrade_hint() {
-        let src = MINIMAL.replacen("[measure]\nmemory_sample_ms = 0\ntmpfs = []\n", "", 1);
+        let src = MINIMAL.replacen(
+            "[measure]\nmemory_sample_ms = 0\ntmpfs = []\n\n[measure.series]\nmode = \"off\"\n",
+            "",
+            1,
+        );
         let e = parse(&src).unwrap_err();
         assert!(
-            e.contains("missing field `measure`") && e.contains("new in sbx v0.4"),
+            e.contains("missing field `measure`")
+                && e.contains("[measure] is new in sbx v0.4")
+                && e.contains("[measure.series] with mode = \"off\""),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn the_series_table_is_required_with_an_upgrade_hint() {
+        let src = MINIMAL.replacen("[measure.series]\nmode = \"off\"\n", "", 1);
+        let e = parse(&src).unwrap_err();
+        assert!(
+            e.contains("missing field `series`") && e.contains("[measure.series] is new in sbx v0.5"),
             "{e}"
         );
     }
@@ -1463,7 +1606,8 @@ access = "rw"
             p.measure,
             MeasureCfg::Sampled {
                 interval_ms: NonZeroU64::new(20).unwrap(),
-                tmpfs: vec![]
+                tmpfs: vec![],
+                series: SeriesCfg::Off,
             }
         );
         assert_eq!(parse(MINIMAL).unwrap().measure, MeasureCfg::Off);
@@ -1493,16 +1637,30 @@ access = "rw"
         assert!(e.iter().any(|e| e.contains("at most 60000")), "{e:?}");
     }
 
+    fn series() -> impl proptest::strategy::Strategy<Value = SeriesCfg> {
+        use proptest::prelude::*;
+        prop_oneof![
+            Just(SeriesCfg::Off),
+            (1..=u32::MAX).prop_map(|n| SeriesCfg::On {
+                max_samples: NonZeroU32::new(n).unwrap()
+            }),
+        ]
+    }
+
     fn measure() -> impl proptest::strategy::Strategy<Value = MeasureCfg> {
         use proptest::prelude::*;
         prop_oneof![
             Just(MeasureCfg::Off),
-            (1..=i64::MAX as u64, prop::collection::vec("/[a-z]{1,8}", 0..4)).prop_map(|(ms, tmpfs)| {
-                MeasureCfg::Sampled {
+            (
+                1..=i64::MAX as u64,
+                prop::collection::vec("/[a-z]{1,8}", 0..4),
+                series()
+            )
+                .prop_map(|(ms, tmpfs, series)| MeasureCfg::Sampled {
                     interval_ms: NonZeroU64::new(ms).unwrap(),
                     tmpfs: tmpfs.into_iter().map(PathBuf::from).collect(),
-                }
-            }),
+                    series,
+                }),
         ]
     }
 
@@ -1514,6 +1672,66 @@ access = "rw"
             let again = parse(&toml::to_string_pretty(&p).unwrap()).unwrap();
             proptest::prop_assert_eq!(again.measure, m);
         }
+
+        #[test]
+        fn series_settings_survive_sbx_policy(s in series(), ms in 1..=MAX_SAMPLE_MS) {
+            let mut p = parse(MINIMAL).unwrap();
+            p.measure = MeasureCfg::Sampled { interval_ms: NonZeroU64::new(ms).unwrap(), tmpfs: vec![], series: s };
+            let src = toml::to_string_pretty(&p).unwrap();
+            let again = parse(&src).unwrap();
+            proptest::prop_assert_eq!(again.measure.series(), s);
+            proptest::prop_assert!(src.contains("[measure.series]"), "{}", src);
+        }
+    }
+
+    fn with_series(ms: u64, tmpfs: &str, body: &str) -> String {
+        MINIMAL.replacen(
+            "[measure]\nmemory_sample_ms = 0\ntmpfs = []\n\n[measure.series]\nmode = \"off\"",
+            &format!("[measure]\nmemory_sample_ms = {ms}\ntmpfs = {tmpfs}\n\n[measure.series]\n{body}"),
+            1,
+        )
+    }
+
+    #[test]
+    fn series_settings_exist_only_when_on() {
+        let err = |ms: u64, body: &str| parse(&with_series(ms, "[]", body)).unwrap_err();
+        assert!(err(20, "mode = \"off\"\nmax_samples = 5").contains("only used with mode = \"on\""));
+        assert!(err(20, "mode = \"on\"").contains("needs measure.series.max_samples"));
+        assert!(err(20, "mode = \"on\"\nmax_samples = 0").contains("at least 1"));
+        assert!(err(20, "mode = \"on\"\nmax_samples = 5\nmax_processes = 1").contains("unknown field"));
+        assert!(err(20, "mode = \"sampled\"").contains("unknown variant"));
+        assert!(err(0, "mode = \"on\"\nmax_samples = 5").contains("needs measure.memory_sample_ms above 0"));
+        let p = parse(&with_series(20, "[]", "mode = \"on\"\nmax_samples = 5")).unwrap();
+        assert_eq!(
+            p.measure.series(),
+            SeriesCfg::On {
+                max_samples: NonZeroU32::new(5).unwrap()
+            }
+        );
+        assert_eq!(p.validate().unwrap(), Vec::<String>::new());
+        assert_eq!(parse(MINIMAL).unwrap().measure.series(), SeriesCfg::Off);
+    }
+
+    #[test]
+    fn series_limits_and_the_memory_ceiling() {
+        let errs = |tmpfs: &str, body: &str| parse(&with_series(20, tmpfs, body)).unwrap().validate();
+        let e = errs(
+            "[]",
+            &format!("mode = \"on\"\nmax_samples = {}", MAX_SERIES_SAMPLES + 1),
+        )
+        .unwrap_err();
+        assert!(e.iter().any(|e| e.contains("at most 1000000")), "{e:?}");
+        assert!(errs("[]", &format!("mode = \"on\"\nmax_samples = {MAX_SERIES_SAMPLES}")).is_ok());
+        // Each listed mount adds to every row; the paths need not exist for the bound.
+        let many: Vec<String> = (0..32).map(|i| format!("\"/sbx-no-such-mount-{i}\"")).collect();
+        let many = format!("[{}]", many.join(", "));
+        let e = errs(&many, &format!("mode = \"on\"\nmax_samples = {MAX_SERIES_SAMPLES}")).unwrap_err();
+        let ceiling: Vec<&String> = e.iter().filter(|e| e.contains("ceiling of 256 MiB")).collect();
+        assert_eq!(ceiling.len(), 1, "{e:?}");
+        let mib = crate::series::bound(NonZeroU32::new(MAX_SERIES_SAMPLES).unwrap(), 32).div_ceil(1 << 20);
+        assert!(ceiling[0].contains(&format!("up to {mib} MiB")), "{e:?}");
+        let e = errs(&many, "mode = \"on\"\nmax_samples = 1000").unwrap_err();
+        assert!(!e.iter().any(|e| e.contains("ceiling")), "{e:?}");
     }
 
     #[test]

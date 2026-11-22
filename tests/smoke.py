@@ -33,6 +33,7 @@ Every prerequisite is checked up front; nothing is skipped silently.
 import ctypes
 import json
 import os
+import re
 import shutil
 import socket
 import struct
@@ -192,8 +193,11 @@ def toml_value(v):
 def policy(mode="none", families=("unix",), egress=(), bind_tcp=(), dns=None, subprocesses=True,
            on_violation="errno", deny=(), allow=(), extra_fs=(), workdir="/tmp", timeout="none",
            env_pass=(), drop=None, uid=65534, gid=65534, abi=ABI, fs=None, cgroup=None, measure=None):
-    """abi="off": no scopes and, unless fs is given, no fs rules."""
+    """abi="off": no scopes and, unless fs is given, no fs rules. measure gets
+    series = { mode = "off" } unless it names a series."""
     landlock = abi != "off"
+    measure = dict(measure or {"memory_sample_ms": 0, "tmpfs": []})
+    measure.setdefault("series", {"mode": "off"})
     if fs is None:
         fs = fs_rules(extra_fs) if landlock else []
     sections = {
@@ -202,7 +206,7 @@ def policy(mode="none", families=("unix",), egress=(), bind_tcp=(), dns=None, su
                     "subprocesses": subprocesses},
         "limits": {"nofile": 1024, "nproc": 512, "fsize_mb": 1024, "as_mb": "unlimited", "cpu_secs": "unlimited"},
         "cgroup": cgroup or {"mode": "off"},
-        "measure": measure or {"memory_sample_ms": 0, "tmpfs": []},
+        "measure": measure,
         "env": {"pass": list(env_pass)},
         "env.set": {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/tmp", "LANG": "C.UTF-8"},
         "network": {"mode": mode, "bind_tcp": list(bind_tcp), "egress": list(egress)},
@@ -981,8 +985,9 @@ os.unlink("{SHM}/sbx-smoke-mem")
 """
 
 
-def sampled(ms, tmpfs=(SHM,), **kw):
-    return policy(extra_fs=[(SHM, "rw")], measure={"memory_sample_ms": ms, "tmpfs": list(tmpfs)}, **kw)
+def sampled(ms, tmpfs=(SHM,), series=None, **kw):
+    return policy(extra_fs=[(SHM, "rw")], measure={"memory_sample_ms": ms, "tmpfs": list(tmpfs),
+                                                    "series": series or {"mode": "off"}}, **kw)
 
 
 SAMPLED = sampled(20)
@@ -1043,6 +1048,157 @@ print("  info memory sampling overhead, wall time of a CPU-bound program: "
       + ", ".join(f"{'off' if ms == 0 else f'{ms} ms'} {w} ms" for ms, w in walls.items()), flush=True)
 check("memory: sampling costs a CPU-bound program little",
       all(walls[ms] <= 1.5 * walls[0] + 100 for ms in (10, 20, 50)), walls)
+
+# ---------------------------------------------------------------- time series
+
+print("== time series")
+SERIES = f"{RDIR}/series.json"
+
+
+def series_pol(ms=20, max_samples=50000, tmpfs=(SHM,), **kw):
+    return sampled(ms, tmpfs, series={"mode": "on", "max_samples": max_samples}, **kw)
+
+
+def load_series():
+    try:
+        with open(SERIES) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
+
+def with_series(args, pol, **kw):
+    """Run with --report REPORT --series SERIES; return rc, stderr, the report and the series (None if absent)."""
+    if os.path.lexists(SERIES):
+        os.unlink(SERIES)
+    rc, so, se, r = reported(["--series", SERIES, *args], pol=pol, **kw)
+    return rc, se, r, load_series()
+
+
+# Series column: the report's `memory` figure it peaks at.
+PEAK_OF = {"max_anon_kib": "max_anon_kib", "max_file_kib": "max_file_kib", "max_shmem_kib": "max_shmem_kib",
+           "tree_anon_kib": "tree_peak_anon_kib", "memfd_kib": "memfd_peak_kib", "sysv_shm_kib": "sysv_shm_peak_kib"}
+
+
+def column_max(col):
+    return max((v for v in col if v is not None), default=0)
+
+
+def series_columns(r, s, same):
+    """Every column has one entry per row, and its maximum is the report's
+    figure (same) or no higher."""
+    m, rows = r["memory"], s["memory"]["rows"]
+    n = len(rows["t_us"])
+    cmp = (lambda a, b: a == b) if same else (lambda a, b: a <= b)
+    cols = [rows[k] for k in rows if k != "tmpfs_kib" and rows[k] is not None] + list(rows["tmpfs_kib"].values())
+    cg = m["cgroup"]
+    return (all(len(c) == n for c in cols)
+            and all(cmp(column_max(rows[k]), m[v]) for k, v in PEAK_OF.items())
+            and set(rows["tmpfs_kib"]) == set(m["tmpfs_peak_kib"])
+            and all(cmp(column_max(rows["tmpfs_kib"][p]), m["tmpfs_peak_kib"][p]) for p in m["tmpfs_peak_kib"])
+            and ((rows["cgroup_anon_kib"] is None and rows["cgroup_shmem_kib"] is None) if cg is None else
+                 cmp(column_max(rows["cgroup_anon_kib"]), cg["peak_anon_kib"])
+                 and cmp(column_max(rows["cgroup_shmem_kib"]), cg["peak_shmem_kib"])))
+
+
+def series_header(r, s):
+    h = s["memory"]
+    return (s["sbx_version"] == VERSION and h["interval_ms"] == r["memory"]["interval_ms"]
+            and h["samples"] == r["memory"]["samples"] == len(h["rows"]["t_us"]) + h["dropped"])
+
+
+def post_exit_last(r, s):
+    """Samples in order, and the last one taken right after the program exited."""
+    rows = s["memory"]["rows"]
+    t = rows["t_us"]
+    return (all(a < b for a, b in zip(t, t[1:])) and 0 <= t[-1] / 1000 - r["wall_ms"] < 1000
+            and rows["live_processes"][-1] == 0)
+
+
+rc, se, r, s = with_series(py(MEMPROG, 0.5), series_pol())
+check("series: every sample is written and agrees with the report",
+      rc == 0 and r is not None and s is not None and s["memory"]["max_samples"] == 50000
+      and s["memory"]["dropped"] == 0 and series_header(r, s) and series_columns(r, s, same=True)
+      and post_exit_last(r, s) and near(column_max(s["memory"]["rows"]["memfd_kib"]), 48),
+      f"rc={rc} report={r and r['memory']} series={s and s['memory']} stderr={se[-600:]!r}")
+if s is not None:
+    logged = re.search(r"memory series: .*", se)
+    print(f"  info series: {len(s['memory']['rows']['t_us'])} rows, {os.path.getsize(SERIES)} bytes on disk; "
+          f"{logged and logged.group(0)}", flush=True)
+    st = os.lstat(SERIES)
+    check("series: owned by root, mode 0600", st.st_uid == 0 and st.st_mode & 0o7777 == 0o600, oct(st.st_mode))
+    with open(SERIES) as f:
+        check("series: one line of compact JSON", f.read().count("\n") == 1)
+check("series: the report keeps its 12 keys", r is not None and len(r) == 12, r)
+
+rc, se, r, s = with_series(py(MEMPROG, 0.5), series_pol(max_samples=3))
+check("series: max_samples keeps the first samples and the post-exit one",
+      rc == 0 and r is not None and s is not None and len(s["memory"]["rows"]["t_us"]) == 4
+      and s["memory"]["dropped"] > 0 and series_header(r, s) and series_columns(r, s, same=False)
+      and post_exit_last(r, s) and s["memory"]["rows"]["t_us"][2] < 300_000,
+      f"rc={rc} report={r and r['memory']} series={s and s['memory']} stderr={se[-600:]!r}")
+
+if os.path.lexists(SERIES):
+    os.unlink(SERIES)
+rc, so, se = sbx(["--", "/bin/true"], pol=series_pol(), env={"SBX_SERIES_FILE": SERIES})
+check("series: SBX_SERIES_FILE names the file too", rc == 0 and load_series() is not None, se[-400:])
+check_report("series: refused with [measure.series] off", ["--series", SERIES, "--", "/bin/true"],
+             lambda r: r["exit_code"] == 125 and r["setup_error"]["stage"] == "series"
+             and 'mode is "off"' in " ".join(r["setup_error"]["messages"]), pol=SAMPLED)
+check("series: ... and the file is removed, not written", not os.path.lexists(SERIES))
+check_report("series: refused with sampling off", ["--", "/bin/true"],
+             lambda r: r["setup_error"]["stage"] == "policy"
+             and "needs measure.memory_sample_ms above 0" in " ".join(r["setup_error"]["messages"]),
+             pol=policy(measure={"memory_sample_ms": 0, "tmpfs": [], "series": {"mode": "on", "max_samples": 5}}))
+check_report("series: a policy without [measure.series] is refused with a hint", ["--", "/bin/true"],
+             lambda r: r["setup_error"]["stage"] == "policy"
+             and "[measure.series] is new in sbx v0.5" in " ".join(r["setup_error"]["messages"]),
+             pol=policy(drop="measure.series"))
+check_report("series: a series that could exceed sbx's memory ceiling is refused", ["--", "/bin/true"],
+             lambda r: r["setup_error"]["stage"] == "policy"
+             and "ceiling of 256 MiB" in " ".join(r["setup_error"]["messages"]),
+             pol=series_pol(max_samples=1_000_000, tmpfs=[SHM, *(f"/sbx-no-such-mount-{i}" for i in range(31))]))
+expect("series: the same path as --report is refused", 125, ["--report", SERIES, "--series", SERIES, "--", "/bin/true"],
+       pol=series_pol(), auto_report=False, log="the same path as --report")
+SLOG = f"{RDIR}/series.log"
+with open(SLOG, "w") as f:
+    f.write("kept\n")
+os.chmod(SLOG, 0o600)
+expect("series: the same path as --log is refused", 125, ["--log", SLOG, "--series", SLOG, "--", "/bin/true"],
+       pol=series_pol(), log="the same path as --log")
+with open(SLOG) as f:
+    check("series: ... and the log file is left alone", f.read() == "kept\n")
+os.unlink(SLOG)
+with open(SERIES, "w") as f:
+    f.write("stale")
+rc, so, se, r = reported(["--series", SERIES, "--", "/nonexistent-sbx"], pol=series_pol())
+check("series: a stale file is removed, and none is written after a setup failure",
+      rc == 127 and r is not None and r["setup_error"]["stage"] == "execve" and not os.path.lexists(SERIES),
+      f"rc={rc} report={r} stderr={se[-400:]!r}")
+# The series directory disappears while the program runs, so the write fails.
+GONE = f"{RDIR}/gone"
+os.mkdir(GONE, 0o700)
+if os.path.lexists(REPORT):
+    os.unlink(REPORT)
+run = subprocess.Popen([SBX, "run", "--report", REPORT, "--series", f"{GONE}/s.json", "--", "/bin/sleep", "1"],
+                       env=dict(BASE_ENV, SBX_POLICY_FILE=series_pol()), stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+for line in run.stderr:
+    if "started pid" in line:
+        break
+os.rmdir(GONE)
+_, se = run.communicate(timeout=30)
+with open(REPORT) as f:
+    r = json.load(f)
+check("series: a failed write exits 125, and the report says why",
+      run.returncode == 125 and r["exit_code"] == 125 and r["program"] == {"exited": 0}
+      and "writing the series" in (r["supervisor_error"] or "") and "writing the series" in se,
+      f"rc={run.returncode} report={r} stderr={se[-400:]!r}")
+rc, so, se = sbx(["--series", SERIES], pol=series_pol(), cmd="probe")
+check("series: probe checks the destination", rc == 0 and "ok       series file" in so, so + se)
+rc, so, se = sbx(["--series", SERIES], pol=SAMPLED, cmd="probe")
+check("series: probe reports a series that is off as missing", rc == 1 and "MISSING  series file" in so, so + se)
+check("series: probe writes nothing there", not os.path.lexists(SERIES))
 
 # ---------------------------------------------------------------- cgroup
 
@@ -1115,6 +1271,13 @@ else:
                   and r["memory"]["cgroup"]["peak_shmem_kib"] >= (48 + 8 + 4) * 1024
                   and near(r["memory"]["memfd_peak_kib"], 48),
                   pol=sampled(20, cgroup={"mode": "delegated", "memory_mb": "unlimited", "pids": "unlimited"}))
+    if os.path.lexists(SERIES):
+        os.unlink(SERIES)
+    cgroup_report("cgroup: the series has the memory.stat columns", ["--series", SERIES, *py(MEMPROG, 0.5)],
+                  lambda r: r["exit_code"] == 0 and r["memory"]["cgroup"] is not None
+                  and (s := load_series()) is not None and s["memory"]["dropped"] == 0
+                  and None not in s["memory"]["rows"]["cgroup_anon_kib"] and series_columns(r, s, same=True),
+                  pol=series_pol(cgroup={"mode": "delegated", "memory_mb": "unlimited", "pids": "unlimited"}))
     # Since kernel commit d245698d727a a task that was reaped or joined still
     # counts in its cgroup until its last context switch, so sbx's own check
     # children and threads can briefly keep C or sbx-supervisor busy (issue

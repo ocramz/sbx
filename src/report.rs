@@ -4,7 +4,9 @@
 
 use crate::cgroup::CgroupStats;
 use crate::memory::MemoryReport;
+use crate::series::MemorySeries;
 use serde::Serialize;
+use std::io::{self, Write};
 
 /// Where `sbx run` failed before the program started: a step of the
 /// supervisor's preparation, or of the child's setup before `execve`.
@@ -15,6 +17,7 @@ pub enum Stage {
     Policy,
     Report,
     Log,
+    Series,
     Env,
     Program,
     Capabilities,
@@ -41,10 +44,11 @@ pub enum Stage {
 }
 
 impl Stage {
-    pub const ALL: [Stage; 24] = [
+    pub const ALL: [Stage; 25] = [
         Stage::Policy,
         Stage::Report,
         Stage::Log,
+        Stage::Series,
         Stage::Env,
         Stage::Program,
         Stage::Capabilities,
@@ -73,6 +77,7 @@ impl Stage {
             Stage::Policy => "policy",
             Stage::Report => "report",
             Stage::Log => "log",
+            Stage::Series => "series",
             Stage::Env => "env",
             Stage::Program => "program",
             Stage::Capabilities => "capabilities",
@@ -217,6 +222,9 @@ pub struct Ran {
     pub cgroup: Option<CgroupStats>,
     /// Memory by kind, with `[measure]` sampling on.
     pub memory: Option<MemoryReport>,
+    /// Every memory sample kept, with `--series` and `[measure.series]` on;
+    /// not part of the report.
+    pub series: Option<MemorySeries>,
 }
 
 #[derive(Debug)]
@@ -282,6 +290,23 @@ impl Outcome {
     }
 }
 
+/// The series file (`--series FILE`): compact JSON, one line.
+pub fn series_json(w: &mut dyn Write, sbx_version: &str, series: &MemorySeries) -> io::Result<()> {
+    #[derive(Serialize)]
+    struct Series<'a> {
+        sbx_version: &'a str,
+        memory: &'a MemorySeries,
+    }
+    serde_json::to_writer(
+        &mut *w,
+        &Series {
+            sbx_version,
+            memory: series,
+        },
+    )?;
+    w.write_all(b"\n")
+}
+
 #[derive(Serialize)]
 struct Json<'a> {
     sbx_version: &'a str,
@@ -324,6 +349,9 @@ mod tests {
 
     #[test]
     fn every_stage_round_trips_through_the_child_pipe_format() {
+        let names: std::collections::BTreeSet<&str> = Stage::ALL.iter().map(|s| s.as_str()).collect();
+        assert_eq!(names.len(), 25);
+        assert_eq!(Stage::ALL[3], Stage::Series);
         for s in Stage::ALL {
             let msg = format!("{}: /bin/x: Permission denied", s.as_str());
             assert_eq!(Stage::from_prefix(&msg), Some((s, "/bin/x: Permission denied")));
@@ -417,6 +445,7 @@ mod tests {
             },
             cgroup: None,
             memory: None,
+            series: None,
         }));
         let v: serde_json::Value = serde_json::from_slice(&ran.to_json("v0.4").unwrap()).unwrap();
         assert_eq!(v["program"]["signaled"], 9);

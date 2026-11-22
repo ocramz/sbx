@@ -28,6 +28,7 @@ use crate::policy::{DnsCfg, LandlockAbi, Limit, Policy, Timeout};
 use crate::procfs;
 use crate::report::{self, At, Program, Ran, SetupError, Stage, Usage};
 use crate::seccomp_layer::{self, Programs};
+use crate::series::When;
 use landlock::RulesetCreated;
 use std::collections::BTreeSet;
 use std::ffi::CString;
@@ -674,7 +675,7 @@ fn supervise(
         }
         if let (Some(m), Some(at)) = (&mut acct.memory, next_sample) {
             if now >= at {
-                sample_memory(m, am_pid1, cg);
+                sample_memory(m, started.elapsed(), When::Running, am_pid1, cg);
                 next_sample = Some(Instant::now() + m.interval());
             }
         }
@@ -743,7 +744,7 @@ fn supervise(
     let wall = started.elapsed();
     // What the program left running, in tmpfs or in SysV segments counts too.
     if let Some(m) = &mut acct.memory {
-        sample_memory(m, am_pid1, cg);
+        sample_memory(m, started.elapsed(), When::Final, am_pid1, cg);
     }
 
     // The main program is gone; nothing it left behind may outlive it.
@@ -777,6 +778,10 @@ fn supervise(
         _ => {}
     }
     let code = report::exit_code(fatal, timed_out, program);
+    let (memory, series) = match acct.memory.map(Sampler::finish) {
+        Some((report, series)) => (Some(report), series),
+        None => (None, None),
+    };
     log::info(format!("exit {code} after {:.1}s", wall.as_secs_f64()));
     Ran {
         exit_code: code,
@@ -788,7 +793,8 @@ fn supervise(
         wall_ms: wall.as_millis() as u64,
         usage: acct.usage,
         cgroup: None,
-        memory: acct.memory.map(Sampler::finish),
+        memory,
+        series,
     }
 }
 
@@ -822,14 +828,15 @@ fn leftovers(am_pid1: bool, cg: Option<&Delegation>) -> u32 {
     live_descendants(&proc_table(), me, am_pid1).len() as u32
 }
 
-/// One memory sample of the sandbox's live processes.
-fn sample_memory(m: &mut Sampler, am_pid1: bool, cg: Option<&Delegation>) {
+/// One memory sample of the sandbox's live processes, `at` after the
+/// program started.
+fn sample_memory(m: &mut Sampler, at: Duration, when: When, am_pid1: bool, cg: Option<&Delegation>) {
     let procs = proc_table();
     // SAFETY: getpid has no preconditions.
     let me = unsafe { libc::getpid() };
     let live = live_descendants(&procs, me, am_pid1);
     let present: BTreeSet<Pid> = procs.iter().map(|&(pid, _, _)| pid).collect();
-    m.sample(&live, &present, cg);
+    m.sample(at, when, &live, &present, cg);
 }
 
 /// One /proc entry: (pid, parent pid, is a zombie).

@@ -10,12 +10,17 @@
 //! tmpfs mounts, and with a delegated cgroup its memory.stat. The peaks are
 //! lower bounds: whatever rises and falls between two samples is missed.
 //!
-//! The parsers, [`Peaks`] and [`Tracker`] are pure; [`Sampler`] does the IO.
+//! With `--series FILE` and `[measure.series]` on, the samples themselves
+//! are kept as well ([`crate::series`]).
+//!
+//! The parsers, [`Peaks`], [`Tracker`] and [`Tally`] are pure; [`Sampler`]
+//! does the IO.
 
 use crate::cgroup::{self, Delegation};
 use crate::log::{self, os_err};
 use crate::policy::MeasureCfg;
 use crate::procfs;
+use crate::series::{MemorySeries, SeriesSpec, When};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
@@ -158,16 +163,21 @@ pub fn memfd_bytes(fds: &[Memfd]) -> u64 {
     unique.values().sum()
 }
 
-/// What one sample read.
+/// KiB, rounded down, as the report and the series give every figure.
+pub fn kib(bytes: u64) -> u64 {
+    bytes >> 10
+}
+
+/// What one sample read. `None` is a failed read.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Sample {
     /// Each live sandbox process that could be read.
     pub procs: Vec<ProcMem>,
     pub memfd_bytes: u64,
-    pub sysv_bytes: u64,
-    /// Per measured tmpfs mount, the bytes used above its level at start.
-    pub tmpfs_bytes: BTreeMap<PathBuf, u64>,
-    /// With a delegated cgroup.
+    pub sysv_bytes: Option<u64>,
+    /// Every measured tmpfs mount: the bytes used above its level at start.
+    pub tmpfs_bytes: BTreeMap<PathBuf, Option<u64>>,
+    /// With a delegated cgroup (`None` without one, too).
     pub cgroup: Option<CgroupMem>,
 }
 
@@ -187,7 +197,7 @@ pub struct Peaks {
 }
 
 impl Peaks {
-    /// The figures of a single sample.
+    /// The figures of a single sample; a failed read adds nothing.
     pub fn of(s: &Sample) -> Peaks {
         let max = |f: fn(&ProcMem) -> u64| s.procs.iter().map(f).max().unwrap_or(0);
         Peaks {
@@ -196,8 +206,12 @@ impl Peaks {
             max_shmem_kib: max(|m| m.shmem_kib),
             tree_anon_kib: s.procs.iter().map(|m| m.anon_kib).sum(),
             memfd_bytes: s.memfd_bytes,
-            sysv_bytes: s.sysv_bytes,
-            tmpfs_bytes: s.tmpfs_bytes.clone(),
+            sysv_bytes: s.sysv_bytes.unwrap_or(0),
+            tmpfs_bytes: s
+                .tmpfs_bytes
+                .iter()
+                .filter_map(|(path, b)| b.map(|b| (path.clone(), b)))
+                .collect(),
             cgroup: s.cgroup,
         }
     }
@@ -283,7 +297,6 @@ pub struct CgroupPeaks {
 
 impl MemoryReport {
     pub fn new(interval_ms: u64, samples: u64, p: &Peaks, unsampled: u32) -> MemoryReport {
-        let kib = |b: u64| b >> 10;
         MemoryReport {
             interval_ms,
             samples,
@@ -304,6 +317,54 @@ impl MemoryReport {
             }),
             unsampled_processes: unsampled,
         }
+    }
+}
+
+/// What the samples add up to: the peaks, the processes no sample saw,
+/// and, with a series, the samples themselves.
+#[derive(Debug)]
+pub struct Tally {
+    interval_ms: u64,
+    peaks: Peaks,
+    tracker: Tracker,
+    samples: u64,
+    series: Option<MemorySeries>,
+}
+
+impl Tally {
+    /// `tmpfs`: the measured mounts, each reported even if no read succeeds.
+    pub fn new(interval_ms: u64, tmpfs: &[PathBuf], series: Option<SeriesSpec>) -> Tally {
+        Tally {
+            interval_ms,
+            peaks: Peaks {
+                tmpfs_bytes: tmpfs.iter().map(|p| (p.clone(), 0)).collect(),
+                ..Peaks::default()
+            },
+            tracker: Tracker::default(),
+            samples: 0,
+            series: series.map(MemorySeries::new),
+        }
+    }
+
+    /// A sample taken `at` after the program started. `present`: every pid
+    /// in /proc; `measured`: the sandbox processes the sample read.
+    pub fn record(&mut self, at: Duration, when: When, s: &Sample, present: &BTreeSet<Pid>, measured: &BTreeSet<Pid>) {
+        self.peaks = std::mem::take(&mut self.peaks).fold(s);
+        self.tracker.observe(present, measured);
+        self.samples += 1;
+        if let Some(series) = &mut self.series {
+            series.push(u64::try_from(at.as_micros()).unwrap_or(u64::MAX), s, when);
+        }
+    }
+
+    /// sbx reaped `pid`.
+    pub fn reaped(&mut self, pid: Pid) {
+        self.tracker.reaped(pid);
+    }
+
+    pub fn finish(self) -> (MemoryReport, Option<MemorySeries>) {
+        let report = MemoryReport::new(self.interval_ms, self.samples, &self.peaks, self.tracker.unsampled());
+        (report, self.series)
     }
 }
 
@@ -484,21 +545,18 @@ impl Failures {
 
 /// Samples the sandbox's memory every `interval` (see the module docs).
 pub struct Sampler {
-    interval_ms: u64,
     uid: u32,
     /// Each measured tmpfs mount and its use when sbx started.
     tmpfs: Vec<(PathBuf, u64)>,
-    peaks: Peaks,
-    tracker: Tracker,
-    samples: u64,
     failures: Failures,
+    tally: Tally,
 }
 
 impl Sampler {
     /// None when sampling is off. Reads the tmpfs mounts' baselines, so it
-    /// runs before the program starts.
-    pub fn new(cfg: &MeasureCfg, uid: u32) -> Result<Option<Sampler>, String> {
-        let MeasureCfg::Sampled { interval_ms, tmpfs } = cfg else {
+    /// runs before the program starts. `series`: keep the samples too.
+    pub fn new(cfg: &MeasureCfg, uid: u32, series: Option<SeriesSpec>) -> Result<Option<Sampler>, String> {
+        let MeasureCfg::Sampled { interval_ms, tmpfs, .. } = cfg else {
             return Ok(None);
         };
         let tmpfs: Vec<(PathBuf, u64)> = tmpfs
@@ -509,27 +567,30 @@ impl Sampler {
                     .map_err(|e| format!("measure.tmpfs {}: {e}", p.display()))
             })
             .collect::<Result<_, _>>()?;
+        let paths: Vec<PathBuf> = tmpfs.iter().map(|(p, _)| p.clone()).collect();
         Ok(Some(Sampler {
-            interval_ms: interval_ms.get(),
             uid,
-            peaks: Peaks {
-                tmpfs_bytes: tmpfs.iter().map(|(p, _)| (p.clone(), 0)).collect(),
-                ..Peaks::default()
-            },
             tmpfs,
-            tracker: Tracker::default(),
-            samples: 0,
             failures: Failures::default(),
+            tally: Tally::new(interval_ms.get(), &paths, series),
         }))
     }
 
     pub fn interval(&self) -> Duration {
-        Duration::from_millis(self.interval_ms)
+        Duration::from_millis(self.tally.interval_ms)
     }
 
-    /// Read everything once. `live`: the sandbox's live processes;
-    /// `present`: every pid in /proc, zombies included.
-    pub fn sample(&mut self, live: &BTreeSet<Pid>, present: &BTreeSet<Pid>, cg: Option<&Delegation>) {
+    /// Read everything once, `at` after the program started. `live`: the
+    /// sandbox's live processes; `present`: every pid in /proc, zombies
+    /// included.
+    pub fn sample(
+        &mut self,
+        at: Duration,
+        when: When,
+        live: &BTreeSet<Pid>,
+        present: &BTreeSet<Pid>,
+        cg: Option<&Delegation>,
+    ) {
         let mut s = Sample::default();
         let mut measured = BTreeSet::new();
         let mut fds = vec![];
@@ -550,17 +611,22 @@ impl Sampler {
             }
         }
         s.memfd_bytes = memfd_bytes(&fds);
-        match sysv_segments() {
-            Ok(segs) => s.sysv_bytes = sysv_bytes(&segs, self.uid, live),
-            Err(e) => self.failures.record(Kind::Sysv, ReadError::Failed(e)),
-        }
-        for (path, base) in &self.tmpfs {
-            match fs_used(path) {
-                Ok(used) => {
-                    s.tmpfs_bytes.insert(path.clone(), used.saturating_sub(*base));
-                }
-                Err(e) => self.failures.record(Kind::Tmpfs, ReadError::Failed(e)),
+        s.sysv_bytes = match sysv_segments() {
+            Ok(segs) => Some(sysv_bytes(&segs, self.uid, live)),
+            Err(e) => {
+                self.failures.record(Kind::Sysv, ReadError::Failed(e));
+                None
             }
+        };
+        for (path, base) in &self.tmpfs {
+            let used = match fs_used(path) {
+                Ok(used) => Some(used.saturating_sub(*base)),
+                Err(e) => {
+                    self.failures.record(Kind::Tmpfs, ReadError::Failed(e));
+                    None
+                }
+            };
+            s.tmpfs_bytes.insert(path.clone(), used);
         }
         if let Some(c) = cg {
             match c.memory_stat().and_then(|m| CgroupMem::parse(&m)) {
@@ -568,28 +634,35 @@ impl Sampler {
                 Err(e) => self.failures.record(Kind::Cgroup, ReadError::Failed(e)),
             }
         }
-        self.peaks = std::mem::take(&mut self.peaks).fold(&s);
-        self.tracker.observe(present, &measured);
-        self.samples += 1;
+        self.tally.record(at, when, &s, present, &measured);
     }
 
     /// sbx reaped `pid`.
     pub fn reaped(&mut self, pid: Pid) {
-        self.tracker.reaped(pid);
+        self.tally.reaped(pid);
     }
 
-    pub fn finish(self) -> MemoryReport {
+    pub fn finish(self) -> (MemoryReport, Option<MemorySeries>) {
         for (kind, n) in &self.failures.0 {
             if *n > 1 {
                 log::error(format!("memory sampling: {n} reads of {} failed", kind.as_str()));
             }
         }
-        MemoryReport::new(self.interval_ms, self.samples, &self.peaks, self.tracker.unsampled())
+        let (report, series) = self.tally.finish();
+        if let Some(s) = &series {
+            log::info(format!(
+                "memory series: {} rows, {} samples dropped, {} KiB in memory",
+                s.rows().len(),
+                s.dropped(),
+                s.footprint().div_ceil(1024)
+            ));
+        }
+        (report, series)
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use proptest::prelude::*;
 
@@ -645,19 +718,28 @@ mod tests {
         })
     }
 
-    fn sample() -> impl Strategy<Value = Sample> {
-        let tmpfs = prop::collection::btree_map(prop::sample::select(vec!["/a", "/b", "/c"]), 0..1u64 << 48, 0..3)
-            .prop_map(|m| m.into_iter().map(|(k, v)| (PathBuf::from(k), v)).collect());
-        let cgroup = prop::option::of(
-            (0..1u64 << 48, 0..1u64 << 48).prop_map(|(anon_bytes, shmem_bytes)| CgroupMem {
-                anon_bytes,
-                shmem_bytes,
-            }),
-        );
+    /// The tmpfs mounts test samples measure, sorted.
+    pub const TMPFS: [&str; 3] = ["/a", "/b", "/c"];
+
+    /// A sample as [`Sampler`] takes it: a figure or a failed read for each
+    /// of the first `n_tmpfs` of [`TMPFS`], and for memory.stat if
+    /// `cgroup`; `None` there otherwise.
+    pub fn sample_of(n_tmpfs: usize, cgroup: bool) -> impl Strategy<Value = Sample> {
+        let tmpfs = prop::collection::vec(prop::option::of(0..1u64 << 48), n_tmpfs)
+            .prop_map(|v| TMPFS.iter().map(PathBuf::from).zip(v).collect());
+        let mem = (0..1u64 << 48, 0..1u64 << 48).prop_map(|(anon_bytes, shmem_bytes)| CgroupMem {
+            anon_bytes,
+            shmem_bytes,
+        });
+        let cgroup = if cgroup {
+            prop::option::of(mem).boxed()
+        } else {
+            Just(None).boxed()
+        };
         (
             prop::collection::vec(proc_mem(), 0..20),
             0..1u64 << 48,
-            0..1u64 << 48,
+            prop::option::of(0..1u64 << 48),
             tmpfs,
             cgroup,
         )
@@ -668,6 +750,10 @@ mod tests {
                 tmpfs_bytes,
                 cgroup,
             })
+    }
+
+    fn sample() -> impl Strategy<Value = Sample> {
+        (0..=TMPFS.len()).prop_flat_map(|n| sample_of(n, true))
     }
 
     /// `a` is nowhere above `b`.
@@ -813,8 +899,10 @@ mod tests {
             prop_assert_eq!(p.max_shmem_kib, s.procs.iter().map(|m| m.shmem_kib).max().unwrap_or(0));
             prop_assert_eq!(p.tree_anon_kib, s.procs.iter().map(|m| m.anon_kib).sum::<u64>());
             prop_assert!(s.procs.iter().all(|m| m.anon_kib <= p.tree_anon_kib));
+            let read: BTreeMap<PathBuf, u64> =
+                s.tmpfs_bytes.iter().filter_map(|(k, v)| v.map(|v| (k.clone(), v))).collect();
             prop_assert_eq!((p.memfd_bytes, p.sysv_bytes, &p.tmpfs_bytes, p.cgroup),
-                            (s.memfd_bytes, s.sysv_bytes, &s.tmpfs_bytes, s.cgroup));
+                            (s.memfd_bytes, s.sysv_bytes.unwrap_or(0), &read, s.cgroup));
         }
 
         #[test]
