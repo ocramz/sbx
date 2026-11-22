@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.4.1
+
+### Fixed
+
+- **A sandboxed process could hide from sbx by giving itself a name that is not UTF-8** (`prctl(PR_SET_NAME)`, which the policy allows). sbx read `/proc/<pid>/stat` and `/proc/<pid>/status` as text and skipped any process whose file did not decode. The effects:
+  - **It could outlive sbx.** When sbx was not PID 1 and had no delegated cgroup, a renamed process that had also left the sandbox's process group (`setsid`) was never killed when the program exited.
+  - **It was missed elsewhere:** left out of memory sampling and of `killed_after_exit`, and not caught by the check under `landlock.abi = "off"` that no other process runs as the sandbox uid.
+  - **Kill mode failed:** with `seccomp.on_violation = "kill"`, a call it made that the policy denies made sbx exit 125 instead of killing it.
+
+  sbx now reads these files as bytes. A process whose files it cannot read is logged instead of being skipped silently. In log lines, the bytes of a name that are not UTF-8 appear as `\xNN`.
+- **A stale report could survive a failed run.** The stale report is now removed before the log file is opened, so a bad `--log` path no longer leaves the previous run's report in place. As a result, an invalid `--report` path is now reported on stderr even with `--log`.
+
 ## v0.4
 
 **Breaking:** every policy now needs a `[measure]` table. To keep v0.3's behaviour, add:

@@ -25,6 +25,7 @@ use crate::log::{self, errno, fatal_signal, os_err};
 use crate::memory::{Pid, Sampler};
 use crate::notify::{self, Dispatcher, Listener, Received, Stats};
 use crate::policy::{DnsCfg, LandlockAbi, Limit, Policy, Timeout};
+use crate::procfs;
 use crate::report::{self, At, Program, Ran, SetupError, Stage, Usage};
 use crate::seccomp_layer::{self, Programs};
 use landlock::RulesetCreated;
@@ -36,6 +37,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::{SocketAddr, UnixDatagram};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -871,15 +873,37 @@ fn proc_table() -> Vec<ProcEntry> {
     };
     dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<libc::pid_t>().ok())
         .filter_map(|pid| {
-            // "pid (comm) state ppid ...": comm may contain anything, so split at its last ')'.
-            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-            let (_, rest) = stat.rsplit_once(')')?;
-            let mut f = rest.split_whitespace();
-            let state = f.next()?;
-            let ppid = f.next()?.parse().ok()?;
-            Some((pid, ppid, state == "Z"))
+            // Bytes: the process name in it need not be UTF-8.
+            let path = format!("/proc/{pid}/stat");
+            let stat = match std::fs::read(&path) {
+                Ok(s) => s,
+                // Exited meanwhile.
+                Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => return None,
+                Err(e) => {
+                    unplaced(format!("read {path}: {e}"));
+                    return None;
+                }
+            };
+            match procfs::Stat::parse(&stat) {
+                Some(s) => Some((pid, s.ppid, s.zombie)),
+                None => {
+                    unplaced(format!("{path} is not in the format sbx knows"));
+                    None
+                }
+            }
         })
         .collect()
+}
+
+/// A process missing from the table may escape `kill_tree` and sampling:
+/// say so, once per run.
+fn unplaced(why: String) {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        log::error(format!(
+            "{why}; sbx cannot tell whether that process belongs to the sandbox, so it may not kill or measure it"
+        ));
+    }
 }
 
 fn kill_tree(child: libc::pid_t, am_pid1: bool, cg: Option<&Delegation>) {

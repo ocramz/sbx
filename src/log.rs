@@ -8,7 +8,7 @@
 //! Text the sandbox controls (process names, DNS names) goes through
 //! [`untrusted`] so it cannot start a line of its own.
 
-use std::fmt::Display;
+use std::fmt::{Display, Write as _};
 use std::fs::File;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -95,6 +95,19 @@ pub fn untrusted(s: &str) -> String {
     out
 }
 
+/// [`untrusted`] for bytes that need not be UTF-8, such as a process name:
+/// each byte that is not part of valid UTF-8 becomes `\xNN`.
+pub fn untrusted_bytes(b: &[u8]) -> String {
+    let mut out = String::with_capacity(b.len());
+    for chunk in b.utf8_chunks() {
+        out.push_str(&untrusted(chunk.valid()));
+        for byte in chunk.invalid() {
+            let _ = write!(out, "\\x{byte:02x}");
+        }
+    }
+    out
+}
+
 /// `what: <strerror(errno)>` for the calling thread's last OS error.
 pub fn os_err(what: impl Display) -> String {
     format!("{what}: {}", std::io::Error::last_os_error())
@@ -119,6 +132,23 @@ mod tests {
         #[test]
         fn untrusted_leaves_text_without_control_characters_alone(s in "[^\\p{Cc}]*") {
             prop_assert_eq!(untrusted(&s), s);
+        }
+
+        #[test]
+        fn untrusted_bytes_never_contain_control_characters(b in any::<Vec<u8>>()) {
+            prop_assert!(!untrusted_bytes(&b).chars().any(char::is_control));
+        }
+
+        #[test]
+        fn untrusted_bytes_treat_utf8_as_untrusted_does(s in any::<String>()) {
+            prop_assert_eq!(untrusted_bytes(s.as_bytes()), untrusted(&s));
+        }
+
+        /// Next to ASCII, any byte from 0x80 up is invalid on its own.
+        #[test]
+        fn untrusted_bytes_spell_out_invalid_bytes(a in "[\\x00-\\x7f]*", byte in 0x80..=0xffu8, c in "[\\x00-\\x7f]*") {
+            let b = [a.as_bytes(), &[byte][..], c.as_bytes()].concat();
+            prop_assert_eq!(untrusted_bytes(&b), format!("{}\\x{byte:02x}{}", untrusted(&a), untrusted(&c)));
         }
     }
 

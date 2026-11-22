@@ -12,6 +12,7 @@
 use crate::egress::Egress;
 use crate::log::{self, errno, os_err, raise_fatal};
 use crate::policy::Violation;
+use crate::procfs;
 use crate::seccomp_layer::{syscall_name, Reason, RuleTable};
 use std::collections::BTreeMap;
 use std::mem::size_of;
@@ -158,20 +159,19 @@ pub fn describe(tid: i32) -> String {
 }
 
 /// The task's name, which the sandbox chooses (PR_SET_NAME), escaped for logs.
+/// Read as bytes, since the name need not be UTF-8.
 pub fn comm_of(tid: i32) -> String {
-    std::fs::read_to_string(format!("/proc/{tid}/comm"))
-        .map(|s| log::untrusted(s.strip_suffix('\n').unwrap_or(&s)))
+    std::fs::read(format!("/proc/{tid}/comm"))
+        .map(|s| log::untrusted_bytes(s.strip_suffix(b"\n").unwrap_or(&s)))
         .unwrap_or_else(|_| "<exited>".into())
 }
 
-/// Thread-group id of a task, from /proc/<tid>/status.
+/// Thread-group id of a task, from /proc/<tid>/status (bytes: the task's
+/// name in it need not be UTF-8).
 pub fn tgid_of(tid: i32) -> Result<i32, String> {
-    let status =
-        std::fs::read_to_string(format!("/proc/{tid}/status")).map_err(|e| format!("read /proc/{tid}/status: {e}"))?;
-    status
-        .lines()
-        .find_map(|l| l.strip_prefix("Tgid:"))
-        .and_then(|v| v.trim().parse().ok())
+    let status = std::fs::read(format!("/proc/{tid}/status")).map_err(|e| format!("read /proc/{tid}/status: {e}"))?;
+    procfs::status_text(&status, "Tgid:")
+        .and_then(|v| v.parse().ok())
         .ok_or_else(|| format!("/proc/{tid}/status has no Tgid line"))
 }
 
