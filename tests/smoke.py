@@ -31,6 +31,7 @@ Every prerequisite is checked up front; nothing is skipped silently.
 """
 
 import ctypes
+import gzip
 import json
 import os
 import re
@@ -1055,17 +1056,37 @@ print("== time series")
 SERIES = f"{RDIR}/series.json"
 
 
-def series_pol(ms=20, max_samples=50000, max_processes=32, tmpfs=(SHM,), **kw):
-    return sampled(ms, tmpfs, series={"mode": "on", "max_samples": max_samples, "max_processes": max_processes},
-                   **kw)
+def series_pol(ms=20, max_samples=50000, max_processes=32, compression="none", tmpfs=(SHM,), **kw):
+    return sampled(ms, tmpfs, series={"mode": "on", "max_samples": max_samples, "max_processes": max_processes,
+                                      "compression": compression}, **kw)
+
+
+GZIP_MAGIC = b"\x1f\x8b"
+
+
+def series_raw():
+    """The series file's bytes; None if absent."""
+    try:
+        with open(SERIES, "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
 
 
 def load_series():
-    try:
-        with open(SERIES) as f:
-            return json.load(f)
-    except FileNotFoundError:
+    """The series file, inflated if it is gzip (told by its first bytes, as
+    sbx does not look at the name); None if absent."""
+    raw = series_raw()
+    if raw is None:
         return None
+    return json.loads(gzip.decompress(raw) if raw[:2] == GZIP_MAGIC else raw)
+
+
+def keys_of(v):
+    """The structure of a JSON value: its keys, nested, without the figures."""
+    if isinstance(v, dict):
+        return {k: keys_of(x) for k, x in v.items()}
+    return type(v).__name__ if v is None else "value"
 
 
 def with_series(args, pol, **kw):
@@ -1123,15 +1144,31 @@ check("series: every sample is written and agrees with the report",
       and s["memory"]["dropped"] == 0 and series_header(r, s) and series_columns(r, s, same=True)
       and post_exit_last(r, s) and near(column_max(s["memory"]["rows"]["memfd_kib"]), 48),
       f"rc={rc} report={r and r['memory']} series={s and s['memory']} stderr={se[-600:]!r}")
+plain = s
 if s is not None:
-    logged = re.search(r"memory series: .*", se)
-    print(f"  info series: {len(s['memory']['rows']['t_us'])} rows, {os.path.getsize(SERIES)} bytes on disk; "
-          f"{logged and logged.group(0)}", flush=True)
+    logged = re.search(r"memory series: (\d+) rows, .* (\d+) KiB in memory", se)
+    n_rows = len(s['memory']['rows']['t_us'])
+    plain_bytes = os.path.getsize(SERIES)
+    per_row = f"{int(logged.group(2)) * 1024 / n_rows:.0f} bytes per row in memory" if logged else "no log line"
+    print(f"  info series: {n_rows} rows, {plain_bytes} bytes on disk ({plain_bytes / n_rows:.0f} per row), "
+          f"{per_row}; {logged and logged.group(0)}", flush=True)
     st = os.lstat(SERIES)
     check("series: owned by root, mode 0600", st.st_uid == 0 and st.st_mode & 0o7777 == 0o600, oct(st.st_mode))
-    with open(SERIES) as f:
-        check("series: one line of compact JSON", f.read().count("\n") == 1)
+    raw = series_raw()
+    check("series: one line of compact JSON", raw.count(b"\n") == 1 and raw[:2] != GZIP_MAGIC)
 check("series: the report keeps its 12 keys", r is not None and len(r) == 12, r)
+
+# The same program with compression = "gzip", to the same file name.
+rc, se, r, s = with_series(py(MEMPROG, 0.5), series_pol(compression="gzip"))
+raw = series_raw() or b""
+check("series: compression = \"gzip\" writes the gzip of a series like \"none\" does",
+      rc == 0 and r is not None and s is not None and raw[:2] == GZIP_MAGIC
+      and gzip.decompress(raw).count(b"\n") == 1 and plain is not None and keys_of(s) == keys_of(plain)
+      and s["memory"]["dropped"] == 0 and series_header(r, s) and series_columns(r, s, same=True)
+      and post_exit_last(r, s) and near(column_max(s["memory"]["rows"]["memfd_kib"]), 48),
+      f"rc={rc} magic={raw[:2]!r} report={r and r['memory']} series={s and s['memory']} stderr={se[-600:]!r}")
+if s is not None and raw[:2] == GZIP_MAGIC:
+    print(f"  info series: gzip {len(raw)} bytes on disk for {len(gzip.decompress(raw))} bytes of JSON", flush=True)
 
 rc, se, r, s = with_series(py(MEMPROG, 0.5), series_pol(max_samples=3))
 check("series: max_samples keeps the first samples and the post-exit one",
@@ -1152,7 +1189,8 @@ check_report("series: refused with sampling off", ["--", "/bin/true"],
              lambda r: r["setup_error"]["stage"] == "policy"
              and "needs measure.memory_sample_ms above 0" in " ".join(r["setup_error"]["messages"]),
              pol=policy(measure={"memory_sample_ms": 0, "tmpfs": [],
-                                 "series": {"mode": "on", "max_samples": 5, "max_processes": 0}}))
+                                 "series": {"mode": "on", "max_samples": 5, "max_processes": 0,
+                                            "compression": "none"}}))
 check_report("series: a policy without [measure.series] is refused with a hint", ["--", "/bin/true"],
              lambda r: r["setup_error"]["stage"] == "policy"
              and "[measure.series] is new in sbx v0.5" in " ".join(r["setup_error"]["messages"]),

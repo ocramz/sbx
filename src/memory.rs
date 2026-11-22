@@ -826,7 +826,7 @@ impl Sampler {
         if let Some(s) = &series {
             log::info(format!(
                 "memory series: {} rows, {} samples dropped, {} processes listed, {} KiB in memory (at most {} KiB)",
-                s.rows().len(),
+                s.kept(),
                 s.dropped(),
                 s.listed(),
                 s.footprint().div_ceil(1024),

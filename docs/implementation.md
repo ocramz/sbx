@@ -266,3 +266,84 @@ Plan: [plans/v0.5-series-processes.md](plans/v0.5-series-processes.md), part 2 o
   - `max_processes` above 4096 is a validation error, as `max_samples` above 1000000 is.
 - **Not modelled by the bound:** a reallocation's transient copy, as in part 1. The heap counter sees `realloc` as one block that changes size.
 - **Not verified here:** the amd64 runner, and Cloud Run (`make live`).
+
+## 2026-11-22: v0.5 part 3, compressed series in memory and on disk
+
+Plan: [plans/v0.5-series-compression.md](plans/v0.5-series-compression.md), part 3 of 3. v0.5 is complete with this part.
+
+- **`src/series/codec.rs` (new, pure):**
+  - `zigzag`/`unzigzag`, and LEB128 over values up to 2^64, so a varint is at most 10 bytes. An optional value needs the 65th bit: `null` is 0 and a value is zigzag(delta) + 1. The decoder is total: it stops at the end of the buffer and drops bits past the tenth byte.
+  - `Word` (u64: at most 10 bytes; u32: at most 5, since the zigzag of a delta between two u32 is below 2^33) widens values to u64 for the wrapping delta.
+  - `Column<T>`, `OptColumn` (a `null` leaves the last value as it was) and `RankColumn<T>`. A `RankColumn` stores rows in rank order, each value a delta from the last one at the same rank. Its state, one u64 per rank reached so far, grows only as rows need it.
+  - Every buffer has a byte cap (values × the type's most bytes). `room_for(v, extra, cap)` grows it by doubling but never past the cap; it replaces part 2's `room_for_one`.
+- **`src/series.rs`:**
+  - `MemorySeries` holds `RowColumns` (one column per figure, plus one per tmpfs mount, in a boxed slice) and, under `Top(n)`, a boxed `Listed`: four `RankColumn`s (slot, anon, file, shmem) and the unchanged process table.
+  - **The cgroup columns:** `CgroupStore::Present { anon: OptColumn, shmem: Column }`. `shmem` holds a value only for the rows whose `memory.stat` read succeeded, so a row cannot have one cgroup figure without the other.
+  - **No entry counts:** a row lists `min(max_processes, live_processes)` processes, so no per-entry `row` and no count is stored. `process_rows.row` is rebuilt from `live_processes`.
+  - **`others`** is kept under `Absent` too, so that `Row`s decode whole.
+  - **Serialization:** a `Seq(|| iter)` wrapper decodes each column while serde writes it. The JSON is unchanged.
+  - **API:**
+    - `kept()` replaces `rows().len()`, and `compression()` is new.
+    - `rows()`, `entries()`, `procs()` are test-only; they decode with the iterators the writer uses.
+    - `SeriesSpec` gains `compression`.
+  - **Cost model:** `blocks()` lists every heap block with what it takes now and the most it can take.
+    - `footprint()` sums the first and `bound()` the second.
+    - The most includes the decoding state of one rank column while the file is written.
+    - The free `bound(max_samples, n_tmpfs, max_processes)` builds an empty series with the cgroup columns and sums its blocks. An empty series allocates only its tmpfs slice, so a policy with absurd limits costs nothing to check.
+- **Policy (`src/policy.rs`):** `SeriesCompression { None, Gzip }`. `SeriesCfg::On` gains `compression`, required with "on" and refused with "off". `TryFrom<RawSeries>` is now one arm per mode.
+- **Gzip:**
+  - `flate2 = "1"` (1.1.11, miniz_oxide backend; `Cargo.lock` gains crc32fast, miniz_oxide, adler2, simd-adler32 and the unused optional zlib-rs).
+  - `report::series_file` writes the JSON, or the JSON through a 64 KiB `BufWriter` into a `GzEncoder`, then `into_inner` (no sync flush) and `finish()`. Its errors are write errors, so a failure exits 125 with "writing the series".
+  - `main.rs` calls it inside `write_atomic_with`. The usage text mentions it.
+- **Policies:** the three shipped policies' comments list `compression`.
+- **Worst-case figures** (aarch64 dev container, a throwaway test):
+  - A row takes 130 bytes plus 10 per tmpfs mount: 12 u64 columns and the mounts at 10 bytes, 2 u32 columns at 5. The cgroup columns are counted at policy time.
+  - A listed process takes 35 bytes plus the process table's 40 and the map's 70.4.
+  - Totals:
+    - 1000000 × 0: 133.5 MiB with one mount (167.8 before), 124.0 with none
+    - 50000 × 32 with one mount: 228.5 MiB (225.7 before)
+    - 50000 × 35 still fits (249.3); 50000 × 36 does not (256.3)
+- **Tests:**
+  - codec property tests:
+    - `varints_round_trip`, up to 2^64
+    - `zigzag_round_trips_and_keeps_small_magnitudes_small`
+    - `encoded_columns_decode_to_the_values`: all three kinds of column, with extremes so that deltas wrap, nulls anywhere and rows longer than the ranks; the bytes stay within the type's worst case and the capacities within their caps
+    - `a_steady_rank_takes_a_byte`
+  - codec unit test: `the_largest_varint_is_ten_bytes`
+  - series:
+    - every part 1 and 2 property, unchanged but for the accessors
+    - the JSON tests now go through `series_file`
+    - `the_bound_covers_every_series_the_spec_allows` uses worst-case samples: every figure half the range or 2^56 KiB from the last, a failed read every third sample, times alternating 0 and 2^63. It checks every block against its most, and that the bound counts the cgroup columns.
+    - `the_footprint_covers_the_series_real_memory` runs with up to 71 processes per sample, new ones or the same ones in every sample. With the same ones, the slot map's slack is too small to hide a missing block.
+    - Four mutations of the model were each caught: leaving out the boxed `Listed`, the rank state, the tmpfs slice, or one row column. A fifth, a u32 worst case of 4 bytes, fails the codec tests.
+    - new `gzip_output_inflates_to_the_plain_json`: "none" writes the JSON as is, and "gzip" starts with `1f 8b` and inflates to it byte for byte.
+  - policy:
+    - the round-trip strategy covers `compression`
+    - refusals: with "off", missing with "on", `"zstd"`
+    - the ceiling test is unchanged and passes
+  - smoke, in "time series":
+    - every "on" policy has `compression`
+    - `load_series` inflates when the file starts with the gzip magic
+    - new check: MEMPROG with "gzip", to the same `series.json` name, writes one gzipped line with the same structure as the "none" run, and it agrees with the report as that run does
+    - the info lines give bytes per row on disk and in memory, and gzip against plain
+- **Verified locally** (arm64 Mac, podman machine, kernel 6.12.7):
+  - `cargo fmt --check`
+  - clippy with `-D warnings`, natively and for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-musl`, in `rust:1.97.0-slim-bookworm`
+  - 106 unit tests pass
+  - `make smoke` (delegated cgroup): 182 + 13 passed, including the new gzip check.
+    - The MEMPROG run kept 27 rows in 6 KiB (228 bytes per row), almost all of it the first 64-byte reservation of each buffer. It wrote 2552 bytes, or 574 gzipped.
+    - The fork loop listed 207 processes over 46 rows, in 29 KiB against a bound of 62659 KiB; part 2 took 52 KiB for a similar run.
+  - `make probe PLATFORM=linux/arm64`: OK
+  - **A manual run in the test image:** three children growing their heaps for 4 s, sampled every 10 ms, with `max_processes = 32`.
+    - It kept 362 rows and 1416 entries in 23 KiB, about 65 bytes per row with its four processes. Part 2's vectors would have held about 140 KiB.
+    - The plain file was 41827 bytes and starts with `{"`. The gzip one was 7594 bytes, starts with `1f 8b`, and `gzip -dc` gives one line with the same 8 keys.
+- **Deviations from the plan:**
+  - Listed processes are deltas from the same rank in the row before, not from the same slot: the user's choice when per-slot state turned out to put 50000 × 32 over the ceiling (recorded in the plan).
+  - No per-entry `row` column and no counts (derived from `live_processes`).
+  - The cgroup shmem column holds only the rows whose read succeeded.
+  - The worst case depends on the width: 5 bytes for u32 values, not 10 for every varint.
+  - The bound also counts the decoding state while the file is written.
+  - `rows()` is test-only; `kept()` serves the log line.
+- **Not modelled by the bound:** a reallocation's transient copy, as before.
+- **Cloud Run:** `make live` passed (run by the user).
+- **Not verified here:** the amd64 runner.

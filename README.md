@@ -18,7 +18,7 @@ sbx runs one sandbox at a time, one per container.
 | Volumes | Platform mounts happen before the entrypoint, so sbx opens the mount points and binds rules to them |
 | Configurable at start | A complete policy file, plus `SBX_*` variables and flags for per-run additions |
 | Fail loudly | Requirements are probed before anything starts; unknown or empty settings, symlinked or missing paths, and unsupported ABIs are errors |
-| Trustworthy outcome | `--report FILE`: a root-owned JSON report of how the run ended (exit code or signal, timeout, the setup stage that failed, denied syscalls, leftover processes, wall and CPU time, memory); `--log FILE` keeps sbx's own lines off the program's stderr ([Job report and log file](#job-report-and-log-file)); `--series FILE` keeps every memory sample, with the largest processes of each ([Time series](#time-series)) |
+| Trustworthy outcome | `--report FILE`: a root-owned JSON report of how the run ended (exit code or signal, timeout, the setup stage that failed, denied syscalls, leftover processes, wall and CPU time, memory); `--log FILE` keeps sbx's own lines off the program's stderr ([Job report and log file](#job-report-and-log-file)); `--series FILE` keeps every memory sample, with the largest processes of each, as JSON or gzipped JSON ([Time series](#time-series)) |
 | Memory by kind | `[measure] memory_sample_ms`: sbx samples the sandbox's anonymous, file-backed and shared memory per process, its memfds, SysV segments and tmpfs files, and reports the peaks, since `ru_maxrss` counts library pages and misses memory no process maps ([Memory by kind](#memory-by-kind)) |
 | Memory and process limits | `[cgroup] mode = "delegated"`: the sandbox runs in a cgroup of its own with `memory.max` and `pids.max`, so an OOM kill hits the program, not sbx, and is reported ([cgroup limits](#cgroup-limits)) |
 
@@ -207,13 +207,14 @@ mode = "off"              # the shipped policies; "off" takes no other field
 mode = "on"               # needs [measure] memory_sample_ms above 0
 max_samples = 50000       # 1 to 1000000
 max_processes = 32        # 0 to 4096: the largest processes each sample lists; 0 lists none
+compression = "none"      # or "gzip": the file is then the gzip of the same JSON
 ```
 
-The policy says how a series is made, and the flag says where it goes. sbx refuses `--series` when the mode is `"off"` (setup stage `series`), and with `"on"` but no `--series` it keeps nothing. sbx keeps the first `max_samples` samples taken while the program runs, then only counts the others. It always keeps the sample taken right after the program's process was reaped. Every number is held in memory until the program ends. sbx refuses a policy whose series could take more than 256 MiB of its memory in the worst case, and the error names the figure. A kept sample takes 144 bytes, plus 16 per measured tmpfs mount and 16 more if there are any. Each process a sample lists takes 32 bytes more, and one listed for the first time about 110 more for the process table. sbx counts the worst case, in which every listed process is new. So with `/dev/shm` measured, 1000000 samples take at most about 168 MiB with `max_processes = 0`, and 50000 samples with `max_processes = 32` about 226 MiB. When sbx finishes, it logs the series' size and this bound, as `memory series: N rows, D samples dropped, P processes listed, K KiB in memory (at most B KiB)`.
+The policy says how a series is made, and the flag says where it goes. sbx refuses `--series` when the mode is `"off"` (setup stage `series`), and with `"on"` but no `--series` it keeps nothing. sbx keeps the first `max_samples` samples taken while the program runs, then only counts the others. It always keeps the sample taken right after the program's process was reaped. Every number is held in memory until the program ends, as a varint of its difference from the one in the sample before; for a listed process, from the process at the same rank in the row before. Memory figures change slowly, so most numbers take a byte or two. sbx refuses a policy whose series could take more than 256 MiB of its memory in the worst case, and the error names the figure. In that worst case every number is far from the one before: a kept sample takes 130 bytes, plus 10 per measured tmpfs mount. Each process a sample lists takes 35 bytes more, and one listed for the first time about 110 more for the process table. sbx counts the worst case, in which every listed process is new. So with `/dev/shm` measured, 1000000 samples take at most about 134 MiB with `max_processes = 0`, and 50000 samples with `max_processes = 32` about 229 MiB. When sbx finishes, it logs the series' size and this bound, as `memory series: N rows, D samples dropped, P processes listed, K KiB in memory (at most B KiB)`.
 
 The file is written only when the program ran, after the sandbox is gone and before the report. The same path rules as for the report apply, and it may not be the report's or the log's path. When sbx starts, it removes any file at the path, so after a setup failure there is no series file and the report has the error. If writing it fails, sbx exits 125, and the report's `supervisor_error` says why. `sbx probe --series FILE` checks the destination.
 
-The file is one line of JSON, mode 0600, replaced atomically:
+The file is one line of JSON, mode 0600, replaced atomically. With `compression = "gzip"` it is the gzip of that line instead (`gzip -dc FILE` gives the line back). sbx does not look at the file's name; a gzip file starts with the bytes `1f 8b`, and the JSON with `{`:
 
 ```json
 {"sbx_version": "v0.5",
@@ -287,7 +288,7 @@ The policy file is required (`--policy` or `SBX_POLICY_FILE`; the image sets `SB
 | `--quiet` | `SBX_QUIET=true` | hide info lines (warnings and errors are always printed) |
 | `--report FILE` | `SBX_REPORT_FILE` | write the outcome as JSON ([Job report and log file](#job-report-and-log-file)) |
 | `--log FILE` | `SBX_LOG_FILE` | append sbx's own lines to FILE instead of stderr |
-| `--series FILE` | `SBX_SERIES_FILE` | write every memory sample as JSON; needs `[measure.series] mode = "on"` ([Time series](#time-series)) |
+| `--series FILE` | `SBX_SERIES_FILE` | write every memory sample as JSON, gzipped with `compression = "gzip"`; needs `[measure.series] mode = "on"` ([Time series](#time-series)) |
 
 Booleans are `true`/`false`. An empty `SBX_*` value, a flag given twice, a missing `--` before the program, and **any `SBX_*` variable sbx does not know** are errors, so a typo cannot silently leave a setting at its file value. Keep other software's variables out of the `SBX_` prefix in sbx's environment.
 
@@ -442,6 +443,7 @@ src/policy.rs                    policy model, overrides, validation
 src/report.rs                    setup stages, the run's outcome, the JSON report
 src/memory.rs                    memory by kind: /proc (through pinned /proc/<pid> directories), SysV, tmpfs and memory.stat sampling, peaks
 src/series.rs                    the memory time series: kept samples, ranked processes, the process table, the memory bound, the columns
+src/series/codec.rs              the series' columns in memory: deltas, zigzag and LEB128 varints
 src/destination.rs               safe paths for the report, the series and the log file, atomic writes
 src/cgroup.rs                    delegated cgroup: setup, limits, counters, teardown
 src/landlock_layer.rs            Landlock probe, ruleset, enforcement
