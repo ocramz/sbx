@@ -95,7 +95,7 @@ fi
 
 rc=0
 out=$(run --entrypoint /bin/sh "$image" -c \
-	'sed "s/^mode = \"off\".*/mode = \"delegated\"\nmemory_mb = 256\npids = 128/" /etc/sbx/policy.toml >/tmp/delegated.toml &&
+	'sed "/^\[cgroup\]/,/^mode/s/^mode = \"off\".*/mode = \"delegated\"\nmemory_mb = 256\npids = 128/" /etc/sbx/policy.toml >/tmp/delegated.toml &&
 	exec /usr/local/bin/sbx run --policy /tmp/delegated.toml -- /bin/true' 2>&1) || rc=$?
 if [ "$rc" = 125 ] && echo "$out" | grep -q "mounted read-only"; then
 	ok "cgroup.mode = \"delegated\" is refused on a read-only cgroupfs"

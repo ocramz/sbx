@@ -17,7 +17,7 @@ use crate::log::{errno, os_err};
 use crate::policy::{LandlockAbi, Policy};
 use std::ffi::CString;
 use std::fs::File;
-use std::io::Write;
+use std::io::{self, BufWriter, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -164,9 +164,15 @@ impl Destination {
         Ok(())
     }
 
-    /// Replace the file with `contents` atomically: a temporary file in the
-    /// same directory, fsync, rename over the target, fsync the directory.
+    /// Replace the file with `contents` atomically (see [`Self::write_atomic_with`]).
     pub fn write_atomic(&self, contents: &[u8]) -> Result<(), String> {
+        self.write_atomic_with(|w| w.write_all(contents))
+    }
+
+    /// Replace the file atomically with what `write` writes, buffered: a
+    /// temporary file in the same directory, fsync, rename over the target,
+    /// fsync the directory.
+    pub fn write_atomic_with(&self, write: impl FnOnce(&mut dyn Write) -> io::Result<()>) -> Result<(), String> {
         let p = self.path.display();
         // SAFETY: getpid has no preconditions.
         let tmp = format!(".{}.{}.tmp", self.name.to_string_lossy(), unsafe { libc::getpid() });
@@ -175,10 +181,12 @@ impl Destination {
         // SAFETY: unlinkat relative to our directory fd.
         unsafe { libc::unlinkat(self.dir.as_raw_fd(), ctmp.as_ptr(), 0) };
         let mut f = self.create(&ctmp, libc::O_EXCL)?;
-        let written = f
-            .write_all(contents)
-            .and_then(|_| f.sync_all())
-            .map_err(|e| format!("writing {p}: {e}"));
+        let written = {
+            let mut buf = BufWriter::with_capacity(1 << 16, &mut f);
+            write(&mut buf).and_then(|_| buf.flush())
+        }
+        .and_then(|_| f.sync_all())
+        .map_err(|e| format!("writing {p}: {e}"));
         drop(f);
         // SAFETY: renameat within our directory fd.
         if written.is_err()

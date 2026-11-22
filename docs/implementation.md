@@ -121,3 +121,69 @@ Plan: [plans/v0.4.1-proc-bytes.md](plans/v0.4.1-proc-bytes.md). The series work 
   - The parsers live in a new `src/procfs.rs` rather than in `supervisor.rs`, since memory, capabilities and notify use them too.
   - `ProcMem::parse_status` takes the bytes itself, so the property test covers the decoding.
 - **Not verified here:** the amd64 runner, and Cloud Run (`make live`).
+
+## 2026-11-22: v0.5 part 1, the memory time series
+
+Plan: [plans/v0.5-series.md](plans/v0.5-series.md), part 1 of 3. v0.5 is released after [part 3](plans/v0.5-series-compression.md).
+
+- **Policy (`src/policy.rs`):**
+  - `[measure.series]` is a new required table: `SeriesCfg { Off, On { max_samples: NonZeroU32 } }` through `RawSeries`, like `CgroupCfg`. `max_samples` is refused with `"off"`, required with `"on"`, and must be 1..=1000000.
+  - `MeasureCfg::Sampled` gains `series`, and `RawMeasure` has it as its last field (a table follows plain values in TOML). Series `On` with sampling off is a `TryFrom` error. `MeasureCfg::series()` gives `Off` for `MeasureCfg::Off`.
+  - `validate_measure` refuses a series whose `series::bound` exceeds `SERIES_CEILING_BYTES` (256 MiB), naming the bound in MiB.
+  - Hints: a missing `series` field names the v0.5 fix, and the v0.4 hint names `[measure.series]` too.
+  - `SBX_SERIES_FILE` / `--series FILE`, in `Overrides`.
+- **`src/series.rs` (new, pure):**
+  - `SeriesSpec` (interval, `max_samples`, the tmpfs mounts sorted as the report keys them, `CgroupColumns { Absent, Present }`), built from the policy only when `--series` is given.
+  - `Row::of` takes the maxima and tree sum from `Peaks::of`, so they agree with the report by construction, and converts to KiB with the report's `memory::kib`.
+  - `MemorySeries::push(t_us, &Sample, When { Running, Final })` keeps running samples while there are fewer than `max_samples` rows, and always keeps the final one. The row vector grows by doubling, capped with `reserve_exact` at `max_samples + 1`.
+  - `bound()` and `footprint()` share one cost model: `size_of::<Row>()` (112 bytes) per row plus, with any tmpfs mount, 16 bytes per mount and 16 for the allocator.
+  - The `Serialize` impl streams each column from the rows with `collect_seq`/`collect_map`. The cgroup columns are `null` under `Absent`.
+- **`src/memory.rs`:**
+  - `Sample.sysv_bytes` and each `tmpfs_bytes` value are `Option` (`None` = failed read), and every measured mount has an entry. `Peaks::of` skips `None`, so the report is unchanged.
+  - The pure state of sampling (peaks, tracker, count, series) moved from `Sampler` into a new `Tally`. `Sampler::sample(at, When, …)` reads, then calls `Tally::record`. `finish()` returns `(MemoryReport, Option<MemorySeries>)` and logs `memory series: N rows, D samples dropped, K KiB in memory`.
+- **`src/supervisor.rs`:** running samples get `started.elapsed()` and `When::Running`, and the post-reap sample gets `When::Final`. `Ran.series`. The sampler now finishes before the `exit N after` line, so its lines come first.
+- **`src/report.rs`:**
+  - `Stage::Series` after `Log` (25 stages).
+  - `Ran.series`, which is not part of the report (still 12 keys).
+  - `series_json` writes one line of compact JSON.
+- **`src/destination.rs`:** `write_atomic_with(FnOnce(&mut dyn Write))` over a 64 KiB `BufWriter`, and `write_atomic` delegates to it.
+- **`src/main.rs`:**
+  - `Outputs.series` is opened after the report's stale file is removed and before the log. It is refused when its path equals `--report`'s or `--log`'s, and that check comes before its own `remove_stale`, so it cannot delete the log.
+  - At stage `series`: the mode must be on, and the directory out of the sandbox's reach.
+  - `run_and_report` writes the series before the report. On failure it logs, sets exit 125 and sets `supervisor_error` unless one is set.
+  - `probe` has a `series file` check.
+- **Policies:** the three shipped policies, MINIMAL and smoke's `policy()` have `[measure.series] mode = "off"`. `tests/image-checks.sh` turned every `mode = "off"` line into the delegated cgroup; its sed is now limited to `[cgroup]`.
+- **Tests:**
+  - property tests:
+    - `kept_rows_are_the_first_samples_and_the_final_one` (with `samples = rows + dropped`)
+    - `the_series_agrees_with_the_report`, through `Tally`
+    - `every_column_has_one_entry_per_row_and_null_exactly_where_reads_failed`, on the parsed JSON
+    - `the_bound_covers_every_series_the_spec_allows` (capacity ≤ `max_samples + 1`, footprint ≤ bound)
+    - `series_settings_survive_sbx_policy`
+    - `measure_settings_survive_sbx_policy` now with series
+    - memory's sample strategy now has failed reads
+  - unit tests: the refusals (fields with "off", no `max_samples`, 0, 1000001, sampling off, an unknown field), the ceiling (1000000 samples with 32 listed mounts), both hints, 25 distinct stages with `series` fourth.
+  - smoke, new section "time series":
+    - a MEMPROG run whose columns' maxima equal the report's figures, with `t_us` increasing, the last row within 1 s of `wall_ms` with no live process, mode 0600 and one line
+    - `max_samples = 3` keeps the first 3 and the post-exit row
+    - `SBX_SERIES_FILE`
+    - refusals: mode off at stage `series` (the stale file is removed), on with sampling off, a missing table, the ceiling, the same path as `--report` or `--log` (the log is left alone)
+    - no file after a setup failure
+    - a failed write (the directory is removed while the program runs) exits 125 with `supervisor_error`
+    - probe ok and MISSING
+    - in the delegated cgroup, the memory.stat columns
+- **Verified locally** (arm64 Mac, podman machine, kernel 6.12.7):
+  - `cargo fmt --check`
+  - clippy with `-D warnings`, natively and for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-musl`, in `rust:1.97.0-slim-bookworm`
+  - 90 unit tests pass
+  - `make smoke` (delegated cgroup): 176 + 13 passed, including the 20 new checks. The image build validates the three shipped policies. The MEMPROG run at 20 ms kept 26 rows: 1515 bytes on disk, 8 KiB in memory (the first 64-row reservation).
+  - The first smoke run caught the `image-checks.sh` sed.
+  - `make probe`: OK
+  - A manual run at 50 ms with `max_samples = 5`: 11 samples, 6 rows, 5 dropped, the last `t_us` 539510 against `wall_ms` 539.
+- **Deviations from the plan:**
+  - `series::bound(max_samples, n_tmpfs)` takes no cgroup flag, because the cgroup figures are stored inline and cost the same either way. Part 3's encoded columns may need it.
+  - `live_processes` is `procs.len()`, not a new `Sample` field that would duplicate it.
+  - The new `Tally` lets the agreement property run the real code without IO.
+  - Smoke tests added beyond the plan: `SBX_SERIES_FILE`, the missing-table hint, the failed write, and the cgroup columns.
+- **Not modelled by the bound:** a reallocation's transient copy of the row vector. glibc and musl move large allocations with `mremap`, so this should not double the peak, but it was not measured.
+- **Not verified here:** the amd64 runner, and Cloud Run (`make live`). `tests/live.py` rewrites only `[measure]`, so its policy stays valid.

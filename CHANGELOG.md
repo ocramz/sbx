@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+**Breaking:** every policy now needs a `[measure.series]` table. To keep v0.4's behaviour, add:
+
+```toml
+[measure.series]
+mode = "off"
+```
+
+sbx refuses a policy without it and says what to add. The shipped policies already have it.
+
+### Added
+
+- **The memory time series.** With `[measure.series] mode = "on"`, `max_samples` and memory sampling on, `--series FILE` (or `SBX_SERIES_FILE`) writes every memory sample, with its time, to a root-owned JSON file next to the report. Each sample holds the largest process per kind, the tree's anonymous total, memfds, SysV segments, each tmpfs mount and, with a delegated cgroup, its `memory.stat` figures. `null` marks a failed read.
+  - **Limits:** sbx keeps the first `max_samples` samples and the one taken right after the program exits, and counts the rest. A policy whose series could take more than 256 MiB of sbx's memory is refused.
+  - **Setup and probe:** `--series` with the mode off is refused at the new setup stage `series`. `sbx probe --series FILE` checks the destination.
+  - **The report:** it keeps its 12 keys. If the series cannot be written, sbx exits 125 and the report's `supervisor_error` says why.
+
+  See the README, [Time series](README.md#time-series).
+
 ## v0.4.1
 
 ### Fixed

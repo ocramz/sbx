@@ -18,7 +18,7 @@ sbx runs one sandbox at a time, one per container.
 | Volumes | Platform mounts happen before the entrypoint, so sbx opens the mount points and binds rules to them |
 | Configurable at start | A complete policy file, plus `SBX_*` variables and flags for per-run additions |
 | Fail loudly | Requirements are probed before anything starts; unknown or empty settings, symlinked or missing paths, and unsupported ABIs are errors |
-| Trustworthy outcome | `--report FILE`: a root-owned JSON report of how the run ended (exit code or signal, timeout, the setup stage that failed, denied syscalls, leftover processes, wall and CPU time, memory); `--log FILE` keeps sbx's own lines off the program's stderr ([Job report and log file](#job-report-and-log-file)) |
+| Trustworthy outcome | `--report FILE`: a root-owned JSON report of how the run ended (exit code or signal, timeout, the setup stage that failed, denied syscalls, leftover processes, wall and CPU time, memory); `--log FILE` keeps sbx's own lines off the program's stderr ([Job report and log file](#job-report-and-log-file)); `--series FILE` keeps every memory sample ([Time series](#time-series)) |
 | Memory by kind | `[measure] memory_sample_ms`: sbx samples the sandbox's anonymous, file-backed and shared memory per process, its memfds, SysV segments and tmpfs files, and reports the peaks, since `ru_maxrss` counts library pages and misses memory no process maps ([Memory by kind](#memory-by-kind)) |
 | Memory and process limits | `[cgroup] mode = "delegated"`: the sandbox runs in a cgroup of its own with `memory.max` and `pids.max`, so an OOM kill hits the program, not sbx, and is reported ([cgroup limits](#cgroup-limits)) |
 
@@ -146,7 +146,7 @@ Egress mode needs `CAP_SYS_PTRACE` in the container (`docker run --cap-add=SYS_P
 | `exit_code` | sbx's own exit code, as documented under [Configuration](#configuration) |
 | `program` | `{"exited": N}` or `{"signaled": N}` for the program's own process; `null` if it never started |
 | `timed_out` | the wall-clock limit killed the sandbox (exit 124) |
-| `setup_error` | `{"stage", "messages"}` when the program never started. Stages, in order: `policy`, `report`, `log`, `env`, `program`, `capabilities`, `slot`, `stdio`, `dns`, `cgroup`, `landlock`, `seccomp`, `launch`; then in the child `cgroup`, `setsid`, `chdir`, `setrlimit`, `identity`, `pdeathsig`, `no_new_privs`, `landlock`, `seccomp`, `close_range`, `signals`, `execve` (exit 127); then `listener` and `services` back in the supervisor |
+| `setup_error` | `{"stage", "messages"}` when the program never started. Stages, in order: `policy`, `report`, `log`, `series`, `env`, `program`, `capabilities`, `slot`, `stdio`, `dns`, `cgroup`, `landlock`, `seccomp`, `launch`; then in the child `cgroup`, `setsid`, `chdir`, `setrlimit`, `identity`, `pdeathsig`, `no_new_privs`, `landlock`, `seccomp`, `close_range`, `signals`, `execve` (exit 127); then `listener` and `services` back in the supervisor |
 | `supervisor_error` | why sbx tore a running sandbox down (exit 125), e.g. a failed notification thread or log file |
 | `denials` | syscalls sbx's policy filter denied, per name (egress denials count as `connect`). Not counted: the prelude's `ENOSYS` (`clone3`, x32), Landlock's refusals, calls the container runtime's own seccomp profile refuses, and DNS names the proxy refuses |
 | `killed_after_exit` | processes still running when the program exited, which sbx then killed; `null` when sbx had already killed the tree (timeout, a second SIGTERM or the grace period, a fatal error) |
@@ -194,6 +194,46 @@ Sampled peaks are lower bounds: what rises and falls between two samples is miss
 
 Sampling needs `CAP_SYS_PTRACE`: listing the descriptors of a process of another uid needs it, and without it the sandbox could hide its memfds with `prctl(PR_SET_DUMPABLE, 0)`. sbx refuses to start without it, and `sbx probe` checks that it can read the status and descriptors of a non-dumpable child running as the sandbox uid. On Cloud Run, where no cgroup is delegated, the `/proc` figures are the whole measurement.
 
+## Time series
+
+The report keeps only the peaks. To get every sample, with its time, turn the series on and name a file with `--series FILE` (or `SBX_SERIES_FILE`). `[measure.series]` is required in every policy:
+
+```toml
+[measure.series]
+mode = "off"              # the shipped policies; "off" takes no other field
+# or
+mode = "on"               # needs [measure] memory_sample_ms above 0
+max_samples = 50000       # 1 to 1000000
+```
+
+The policy says how a series is made, and the flag says where it goes. sbx refuses `--series` when the mode is `"off"` (setup stage `series`), and with `"on"` but no `--series` it keeps nothing. sbx keeps the first `max_samples` samples taken while the program runs, then only counts the others. It always keeps the sample taken right after the program's process was reaped. Every number is held in memory until the program ends. sbx refuses a policy whose series could take more than 256 MiB of its memory in the worst case, and the error names the figure. A kept sample takes 112 bytes, plus 16 per measured tmpfs mount and 16 more if there are any, so 1000000 samples with `/dev/shm` measured take about 137 MiB.
+
+The file is written only when the program ran, after the sandbox is gone and before the report. The same path rules as for the report apply, and it may not be the report's or the log's path. When sbx starts, it removes any file at the path, so after a setup failure there is no series file and the report has the error. If writing it fails, sbx exits 125, and the report's `supervisor_error` says why. `sbx probe --series FILE` checks the destination.
+
+The file is one line of JSON, mode 0600, replaced atomically:
+
+```json
+{"sbx_version": "v0.5",
+ "memory": {"interval_ms": 20, "max_samples": 50000, "samples": 3, "dropped": 0,
+   "rows": {"t_us": [20113, 40391, 52007], "live_processes": [1, 1, 0],
+            "max_anon_kib": [32768, 65872, 0], "max_file_kib": [9216, 9216, 0],
+            "max_shmem_kib": [0, 16384, 0], "tree_anon_kib": [32768, 65872, 0],
+            "memfd_kib": [0, 49152, 0], "sysv_shm_kib": [0, null, 0],
+            "tmpfs_kib": {"/dev/shm": [0, 8192, 8192]},
+            "cgroup_anon_kib": null, "cgroup_shmem_kib": null}}}
+```
+
+| Key | Meaning |
+|---|---|
+| `samples`, `dropped` | how many samples were taken, and how many were not kept (taken after the `max_samples`th, before the final one); `samples` equals the report's `memory.samples` |
+| `rows` | one array per column, with entry i of each from sample i, in the order taken. The last is the sample taken right after the program's process was reaped |
+| `t_us` | microseconds since the program started, the origin of the report's `wall_ms` |
+| `live_processes` | the sandbox processes the sample read |
+| `max_anon_kib`, `max_file_kib`, `max_shmem_kib` | the largest single process in the sample, per kind |
+| `tree_anon_kib`, `memfd_kib`, `sysv_shm_kib`, `tmpfs_kib`, `cgroup_anon_kib`, `cgroup_shmem_kib` | the sample's figures behind the report's peaks of the same names ([Memory by kind](#memory-by-kind)) |
+
+`null` in a column marks a failed read in that sample: of `/proc/sysvipc/shm`, of one tmpfs mount, or of `memory.stat`. Without a delegated cgroup, the cgroup columns are `null` as a whole. Whenever `dropped` is 0, each column's maximum equals the report's figure. Otherwise it is no higher. Time series of other measurements will get their own keys next to `memory`.
+
 ## cgroup limits
 
 `[cgroup]` is required in every policy. `mode = "off"` (the shipped policies) leaves the sandbox in sbx's own cgroup, bounded only by the container's limits. `mode = "delegated"` runs it in a cgroup of its own:
@@ -218,7 +258,7 @@ Where a delegated cgroup comes from:
 
 ## Configuration
 
-The policy file is required (`--policy` or `SBX_POLICY_FILE`; the image sets `SBX_POLICY_FILE=/etc/sbx/policy.toml`). Every field must be present and unknown fields are rejected. **Upgrading from v0.3:** add `[measure]` with `memory_sample_ms = 0` and `tmpfs = []` to keep v0.3's behaviour; sbx v0.4 refuses a policy without it and says so. **From v0.2,** also add `[cgroup]` with `mode = "off"`. [`policy/default.toml`](policy/default.toml) is the shipped policy (no network). [`policy/egress.example.toml`](policy/egress.example.toml) shows egress rules and the DNS proxy, and [`policy/no-landlock.example.toml`](policy/no-landlock.example.toml) is the same for kernels without Landlock. All three are validated against the image during the build. Environment variables and flags then extend the policy (path grants and egress rules are added) or replace a few scalars (flags win over the environment):
+The policy file is required (`--policy` or `SBX_POLICY_FILE`; the image sets `SBX_POLICY_FILE=/etc/sbx/policy.toml`). Every field must be present and unknown fields are rejected. **Upgrading from v0.4:** add `[measure.series]` with `mode = "off"` to keep v0.4's behaviour; sbx v0.5 refuses a policy without it and says so. **From v0.3,** also add `[measure]` with `memory_sample_ms = 0` and `tmpfs = []`. **From v0.2,** also add `[cgroup]` with `mode = "off"`. [`policy/default.toml`](policy/default.toml) is the shipped policy (no network). [`policy/egress.example.toml`](policy/egress.example.toml) shows egress rules and the DNS proxy, and [`policy/no-landlock.example.toml`](policy/no-landlock.example.toml) is the same for kernels without Landlock. All three are validated against the image during the build. Environment variables and flags then extend the policy (path grants and egress rules are added) or replace a few scalars (flags win over the environment):
 
 | Flag | Env var | Meaning |
 |---|---|---|
@@ -234,6 +274,7 @@ The policy file is required (`--policy` or `SBX_POLICY_FILE`; the image sets `SB
 | `--quiet` | `SBX_QUIET=true` | hide info lines (warnings and errors are always printed) |
 | `--report FILE` | `SBX_REPORT_FILE` | write the outcome as JSON ([Job report and log file](#job-report-and-log-file)) |
 | `--log FILE` | `SBX_LOG_FILE` | append sbx's own lines to FILE instead of stderr |
+| `--series FILE` | `SBX_SERIES_FILE` | write every memory sample as JSON; needs `[measure.series] mode = "on"` ([Time series](#time-series)) |
 
 Booleans are `true`/`false`. An empty `SBX_*` value, a flag given twice, a missing `--` before the program, and **any `SBX_*` variable sbx does not know** are errors, so a typo cannot silently leave a setting at its file value. Keep other software's variables out of the `SBX_` prefix in sbx's environment.
 
@@ -387,7 +428,8 @@ src/main.rs                      CLI: run / probe / policy / version, environmen
 src/policy.rs                    policy model, overrides, validation
 src/report.rs                    setup stages, the run's outcome, the JSON report
 src/memory.rs                    memory by kind: /proc, SysV, tmpfs and memory.stat sampling, peaks
-src/destination.rs               safe paths for the report and the log file, atomic writes
+src/series.rs                    the memory time series: kept samples, the memory bound, the columns
+src/destination.rs               safe paths for the report, the series and the log file, atomic writes
 src/cgroup.rs                    delegated cgroup: setup, limits, counters, teardown
 src/landlock_layer.rs            Landlock probe, ruleset, enforcement
 src/seccomp_layer.rs             rule table, BPF prelude and policy filter, evaluator

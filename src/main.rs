@@ -18,12 +18,13 @@ mod policy;
 mod procfs;
 mod report;
 mod seccomp_layer;
+mod series;
 mod supervisor;
 
 use capabilities::Check;
 use cgroup::Delegation;
 use destination::Destination;
-use policy::{CgroupCfg, LandlockAbi, NetMode, Overrides, Policy};
+use policy::{CgroupCfg, LandlockAbi, NetMode, Overrides, Policy, SeriesCfg};
 use report::{At, Outcome, Ran, SetupError, Stage};
 use std::collections::BTreeSet;
 use std::ffi::{CString, OsString};
@@ -57,6 +58,8 @@ environment variable shown):
   --report FILE          write the outcome as JSON (run)      SBX_REPORT_FILE
   --log FILE             append sbx's own lines to FILE       SBX_LOG_FILE
                          instead of stderr
+  --series FILE          write the memory samples as JSON     SBX_SERIES_FILE
+                         (run; needs [measure.series] on)
 
 Exit codes: the program's own, 124 on timeout, 125 for sbx errors,
 127 if the program cannot be executed, 128+N if killed by signal N.
@@ -188,6 +191,7 @@ fn parse_flags(args: &[OsString], run: bool) -> Result<(Overrides, Vec<OsString>
             "--quiet" => o.quiet = Some(true),
             "--report" => o.report = Some(PathBuf::from(val)),
             "--log" => o.log = Some(PathBuf::from(val)),
+            "--series" => o.series = Some(PathBuf::from(val)),
             _ => return Err(usage(format!("unknown option {key}"))),
         }
     }
@@ -198,10 +202,11 @@ fn parse_flags(args: &[OsString], run: bool) -> Result<(Overrides, Vec<OsString>
     }
 }
 
-/// Where sbx's own output goes besides stdout: the report and the log file
-/// (opened now, so every later line lands there).
+/// Where sbx's own output goes besides stdout: the report, the memory
+/// series and the log file (opened now, so every later line lands there).
 struct Outputs {
     report: Option<Destination>,
+    series: Option<Destination>,
     log: Option<Destination>,
 }
 
@@ -218,6 +223,25 @@ impl Outputs {
         if let (Some(r), "run") = (&report, cmd) {
             r.remove_stale().map_err(one)?;
         }
+        let series = match &ov.series {
+            Some(path) if cmd != "policy" => {
+                // Before anything is removed: the log may be at the path.
+                for (other, flag) in [(&ov.report, "--report"), (&ov.log, "--log")] {
+                    if other.as_deref() == Some(path.as_path()) {
+                        return Err(one(format!(
+                            "series file {}: the same path as {flag}; give each its own file",
+                            path.display()
+                        )));
+                    }
+                }
+                let d = Destination::open("series file", path).map_err(one)?;
+                if cmd == "run" {
+                    d.remove_stale().map_err(one)?;
+                }
+                Some(d)
+            }
+            _ => None,
+        };
         let log = match &ov.log {
             Some(path) => {
                 let d = Destination::open("log file", path).map_err(one)?;
@@ -226,14 +250,15 @@ impl Outputs {
             }
             None => None,
         };
-        Ok(Outputs { report, log })
+        Ok(Outputs { report, series, log })
     }
 }
 
 /// `sbx run`: every outcome after this point, setup failures included,
-/// ends up in the report.
+/// ends up in the report. The series is written first, so the report can
+/// say if that failed.
 fn run_and_report(ov: Overrides, cmd: Vec<OsString>, out: &Outputs) -> i32 {
-    let outcome = match run(ov, cmd, out) {
+    let mut outcome = match run(ov, cmd, out) {
         Ok(ran) => Outcome::Ran(Box::new(ran)),
         Err(e) => {
             for m in &e.errors {
@@ -242,6 +267,16 @@ fn run_and_report(ov: Overrides, cmd: Vec<OsString>, out: &Outputs) -> i32 {
             Outcome::SetupFailed(e)
         }
     };
+    if let (Some(d), Outcome::Ran(ran)) = (&out.series, &mut outcome) {
+        if let Some(s) = &ran.series {
+            if let Err(e) = d.write_atomic_with(|w| report::series_json(w, VERSION, s)) {
+                let e = format!("writing the series: {e}");
+                log::error(&e);
+                ran.exit_code = 125;
+                ran.supervisor_error.get_or_insert(e);
+            }
+        }
+    }
     if let Some(r) = &out.report {
         if let Err(e) = outcome.to_json(VERSION).and_then(|j| r.write_atomic(&j)) {
             log::error(format!("writing the report: {e}"));
@@ -263,6 +298,11 @@ fn run(ov: Overrides, cmd: Vec<OsString>, out: &Outputs) -> Result<Ran, SetupErr
     }
     if let Some(l) = &out.log {
         l.check_sandbox_access("log file", &p).at(Stage::Log)?;
+    }
+    if let Some(s) = &out.series {
+        series_on(&p, s)
+            .and_then(|_| s.check_sandbox_access("series file", &p))
+            .at(Stage::Series)?;
     }
     let envp = build_env(&p).at(Stage::Env)?;
     let exe = resolve_program(&cmd[0], &envp).at(Stage::Program)?;
@@ -316,8 +356,15 @@ fn run(ov: Overrides, cmd: Vec<OsString>, out: &Outputs) -> Result<Ran, SetupErr
         seccomp: sc,
         cgroup_procs: cg.as_ref().map(Delegation::procs_fd),
     };
+    let series = out.series.as_ref().and_then(|_| {
+        let cgroup = match cg {
+            Some(_) => series::CgroupColumns::Present,
+            None => series::CgroupColumns::Absent,
+        };
+        series::SeriesSpec::new(&p.measure, cgroup)
+    });
     // The tmpfs mounts' baselines, before the program can write to them.
-    let sampler = memory::Sampler::new(&p.measure, p.process.uid).at(Stage::Launch)?;
+    let sampler = memory::Sampler::new(&p.measure, p.process.uid, series).at(Stage::Launch)?;
     let mut ran = supervisor::run(&p, launch, svc, &sig, cg.as_ref(), sampler)?;
     if let Some(c) = cg {
         let (stats, errs) = c.finish();
@@ -334,6 +381,18 @@ fn run(ov: Overrides, cmd: Vec<OsString>, out: &Outputs) -> Result<Ran, SetupErr
         ran.cgroup = stats;
     }
     Ok(ran)
+}
+
+/// `--series` needs a series to write.
+fn series_on(p: &Policy, d: &Destination) -> Result<(), String> {
+    match p.measure.series() {
+        SeriesCfg::On { .. } => Ok(()),
+        SeriesCfg::Off => Err(format!(
+            "series file {}: [measure.series] mode is \"off\", so there is no series to write; set it to \"on\" \
+             (with [measure] memory_sample_ms above 0) or drop --series",
+            d.path().display()
+        )),
+    }
 }
 
 fn limit_text(l: policy::Limit) -> String {
@@ -460,6 +519,14 @@ fn probe(p: &Policy, out: &Outputs) -> i32 {
         checks.push(Check {
             name: "report file",
             outcome: r.check_sandbox_access("report", p).and_then(|_| r.trial()),
+        });
+    }
+    if let Some(s) = &out.series {
+        checks.push(Check {
+            name: "series file",
+            outcome: series_on(p, s)
+                .and_then(|_| s.check_sandbox_access("series file", p))
+                .and_then(|_| s.trial()),
         });
     }
     if let Some(l) = &out.log {
