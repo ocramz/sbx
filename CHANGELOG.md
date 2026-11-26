@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.6
+
+**Breaking:** every policy now needs `seccomp.notify`. To keep v0.5's behaviour, add:
+
+```toml
+[seccomp]
+notify = "listener"
+```
+
+sbx refuses a policy without it and says what to add. The shipped policies already have it.
+
+### Added
+
+- **A policy filter without the listener, for gVisor** (#18). gVisor has no seccomp user notification (`SECCOMP_FILTER_FLAG_NEW_LISTENER` fails with `EINVAL`), so sbx v0.5 could not start there. With `seccomp.notify = "off"`:
+  - **The kernel applies the verdict:** a policy match fails with `EPERM` (`on_violation = "errno"`) or kills the process with SIGSYS (`"kill"`: exit 159, `"program": {"signaled": 31}`), without the supervisor. The prelude, the deny-list, the argument checks and every other layer are unchanged.
+  - **What is lost:** sbx neither logs nor counts denials, so the report's `denials` is `null` (unknown, not none), and sbx warns at setup. `network.mode = "egress"`, whose `connect()` decisions go through the listener, is refused.
+  - **`seccomp.deny` may include `sendmsg`,** which is reserved only to hand the listener over. `execve` stays reserved.
+  - **`sbx probe`** runs the check `seccomp filter` instead of `seccomp user notification`: the prelude and a one-rule filter in a forked child, and the kernel's verdict on a match.
+  - **`policy/gvisor.example.toml`:** Landlock off, `notify = "off"`, `on_violation = "kill"`, cgroup off, no network, sampling off. The image ships it as `/etc/sbx/gvisor.example.toml` and validates it during the build.
+  - **`make gvisor`** builds a static linux/amd64 sbx and runs `tests/gvisor.py` in a Modal sandbox under gVisor, through the uv script `tests/modal_gvisor.py` (`--runtime vm` for a control).
+
+  See the README, [Without the listener](README.md#without-the-listener).
+
+### Changed
+
+- **The report's `denials` can be `null`,** with `seccomp.notify = "off"`. It is still a list with the listener, and `[]` when the program never started.
+- **sbx's seccomp summary line** names `notify`.
+
 ## v0.5
 
 **Breaking:** every policy now needs a `[measure.series]` table. To keep v0.4's behaviour, add:

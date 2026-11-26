@@ -3,22 +3,26 @@
 //!  1. prelude (hand-written, no listener): wrong architecture -> kill;
 //!     x32 ABI -> ENOSYS; clone3 -> ENOSYS (its flags live in memory where BPF
 //!     cannot see them, so libc falls back to clone(2), whose flags we check).
-//!  2. policy filter (seccompiler, installed with a user-notification
-//!     listener): every rule in the [`RuleTable`] returns
-//!     SECCOMP_RET_USER_NOTIF, so the supervisor sees each match. Deny-list
-//!     matches are logged and refused; `connect` matches in egress mode go to
-//!     the egress filter. Everything else is allowed.
+//!  2. policy filter (seccompiler): every rule in the [`RuleTable`] returns
+//!     the same verdict, [`OnMatch`]; everything else is allowed.
+//!     - `seccomp.notify = "listener"`: SECCOMP_RET_USER_NOTIF, installed
+//!       with a user-notification listener, so the supervisor sees each
+//!       match. Deny-list matches are logged and refused; `connect` matches
+//!       in egress mode go to the egress filter.
+//!     - `seccomp.notify = "off"` (no listener, e.g. gVisor): the kernel
+//!       applies `on_violation` itself, EPERM or KILL_PROCESS, and nothing
+//!       is logged or counted.
 //!
 //! When filters stack the kernel picks the most restrictive verdict, so the
-//! prelude's ENOSYS/KILL always win over USER_NOTIF.
+//! prelude's ENOSYS/KILL always win over USER_NOTIF and EPERM.
 //!
 //! The same rule table drives the BPF program and [`RuleTable::evaluate`],
 //! which the supervisor uses to name the rule behind every notification.
-//! Unit tests run the compiled BPF through a small interpreter and check that
-//! both agree.
+//! Property tests run the compiled BPF through a small interpreter and check
+//! that both agree.
 
 use crate::log::os_err;
-use crate::policy::{LandlockAbi, NetMode, Policy, SocketFamily};
+use crate::policy::{LandlockAbi, NetMode, Notify, Policy, SeccompCfg, SocketFamily, Violation};
 use seccompiler::{
     sock_filter, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
     SeccompRule, TargetArch,
@@ -83,7 +87,7 @@ const DEFAULT_DENY_ARCH: &[(&str, i64)] = &[("SYS_kexec_file_load", 294)];
 const EXTRA_NAMES: &[(&str, i64)] = syscalls![
     SYS_execveat, SYS_clone, SYS_kill, SYS_tkill, SYS_tgkill, SYS_socket,
     SYS_socketpair, SYS_connect, SYS_bind, SYS_listen, SYS_accept, SYS_accept4, SYS_sendto,
-    SYS_sendmmsg, SYS_recvfrom, SYS_recvmsg, SYS_memfd_create, SYS_mprotect,
+    SYS_sendmsg, SYS_sendmmsg, SYS_recvfrom, SYS_recvmsg, SYS_memfd_create, SYS_mprotect,
     SYS_pkey_mprotect, SYS_prctl, SYS_seccomp, SYS_inotify_init1, SYS_fanotify_mark,
     SYS_sched_setaffinity, SYS_setpriority, SYS_mknodat, SYS_symlinkat, SYS_linkat,
     SYS_mbind, SYS_migrate_pages, SYS_move_pages, SYS_set_mempolicy, SYS_personality,
@@ -94,13 +98,19 @@ const EXTRA_NAMES_ARCH: &[(&str, i64)] = syscalls![SYS_fork, SYS_vfork, SYS_open
 #[cfg(target_arch = "aarch64")]
 const EXTRA_NAMES_ARCH: &[(&str, i64)] = &[];
 
-/// Syscalls sbx itself makes after the policy filter is installed (to hand
-/// the listener to the supervisor and start the program), so they can never
-/// be denied by policy.
-pub const RESERVED: &[&str] = &["execve", "sendmsg"];
+/// Why sbx itself makes this syscall after the policy filter is installed,
+/// so that the policy can never deny it: `execve` starts the program, and
+/// with the listener `sendmsg` hands it to the supervisor.
+pub fn reserved(name: &str, notify: Notify) -> Option<&'static str> {
+    match (name, notify) {
+        ("execve", _) => Some("to start the program"),
+        ("sendmsg", Notify::Listener) => Some("to hand the seccomp listener to the supervisor"),
+        _ => None,
+    }
+}
 
 /// Names of every syscall a rule may refer to, for log messages.
-const OTHER_NAMES: &[(&str, i64)] = syscalls![SYS_execve, SYS_sendmsg, SYS_setsockopt];
+const OTHER_NAMES: &[(&str, i64)] = syscalls![SYS_execve, SYS_setsockopt];
 
 fn strip(n: &str) -> &str {
     n.strip_prefix("SYS_").unwrap_or(n)
@@ -431,13 +441,32 @@ fn ioctl_request(r: libc::Ioctl) -> u64 {
     r as u64
 }
 
+/// What every match of the policy filter returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnMatch {
+    /// SECCOMP_RET_USER_NOTIF: the supervisor decides, through the listener.
+    Notify,
+    /// The kernel applies the verdict itself: SECCOMP_RET_ERRNO with EPERM,
+    /// or SECCOMP_RET_KILL_PROCESS (SIGSYS).
+    Verdict(Violation),
+}
+
+impl OnMatch {
+    pub fn of(cfg: &SeccompCfg) -> OnMatch {
+        match cfg.notify {
+            Notify::Listener => OnMatch::Notify,
+            Notify::Off => OnMatch::Verdict(cfg.on_violation),
+        }
+    }
+}
+
 /// Marker used for the seccompiler match action before it is rewritten into
 /// SECCOMP_RET_USER_NOTIF (which seccompiler cannot emit).
 const NOTIFY_MARKER: u32 = 0xa5b;
 const BPF_RET_K: u16 = 0x06;
 
-/// Compile the rule table: every match returns USER_NOTIF, everything else is allowed.
-pub fn compile(t: &RuleTable) -> Result<BpfProgram, String> {
+/// Compile the rule table: every match returns `on_match`, everything else is allowed.
+pub fn compile(t: &RuleTable, on_match: OnMatch) -> Result<BpfProgram, String> {
     let mut map: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
     let unconditional: BTreeSet<i64> = t.rules.iter().filter(|r| r.conds.is_empty()).map(|r| r.nr).collect();
     for r in &t.rules {
@@ -452,11 +481,22 @@ pub fn compile(t: &RuleTable) -> Result<BpfProgram, String> {
             .collect::<Result<Vec<_>, _>>()?;
         chain.push(SeccompRule::new(conds).map_err(|e| format!("seccomp rule for {}: {e}", syscall_name(r.nr)))?);
     }
-    let marker = SeccompAction::Trace(NOTIFY_MARKER);
-    let filter = SeccompFilter::new(map, SeccompAction::Allow, marker.clone(), ARCH)
+    let action = match on_match {
+        OnMatch::Notify => SeccompAction::Trace(NOTIFY_MARKER),
+        OnMatch::Verdict(Violation::Errno) => SeccompAction::Errno(libc::EPERM as u32),
+        OnMatch::Verdict(Violation::Kill) => SeccompAction::KillProcess,
+    };
+    let filter = SeccompFilter::new(map, SeccompAction::Allow, action.clone(), ARCH)
         .map_err(|e| format!("seccomp filter: {e}"))?;
-    let mut prog: BpfProgram = filter.try_into().map_err(|e| format!("seccomp filter: {e:?}"))?;
-    let marker_k = u32::from(marker);
+    let prog: BpfProgram = filter.try_into().map_err(|e| format!("seccomp filter: {e:?}"))?;
+    match on_match {
+        OnMatch::Notify => into_user_notif(prog, u32::from(action), t),
+        OnMatch::Verdict(_) => Ok(prog),
+    }
+}
+
+/// Rewrite the marker's returns into SECCOMP_RET_USER_NOTIF.
+fn into_user_notif(mut prog: BpfProgram, marker_k: u32, t: &RuleTable) -> Result<BpfProgram, String> {
     let mut rewritten = 0;
     for ins in prog.iter_mut() {
         if ins.code == BPF_RET_K && ins.k == marker_k {
@@ -500,14 +540,17 @@ pub fn prelude() -> BpfProgram {
 /// Compiled filters plus the table the supervisor evaluates notifications with.
 pub struct Programs {
     pub prelude: BpfProgram,
+    /// Compiled for `on_match`, which also decides how it is installed.
     pub main: BpfProgram,
+    pub on_match: OnMatch,
     pub table: RuleTable,
     pub summary: String,
 }
 
 pub fn build(p: &Policy) -> Result<Programs, String> {
     let table = build_table(p)?;
-    let main = compile(&table)?;
+    let on_match = OnMatch::of(&p.seccomp);
+    let main = compile(&table, on_match)?;
     let fams: Vec<String> = p
         .seccomp
         .socket_families
@@ -515,10 +558,11 @@ pub fn build(p: &Policy) -> Result<Programs, String> {
         .map(|f| format!("{f:?}").to_lowercase())
         .collect();
     let summary = format!(
-        "seccomp: {} rules on {} syscalls ({} BPF instructions), on_violation={}, socket families [{}]{}",
+        "seccomp: {} rules on {} syscalls ({} BPF instructions), notify={}, on_violation={}, socket families [{}]{}",
         table.rules.len(),
         table.syscalls().len(),
         main.len(),
+        format!("{:?}", p.seccomp.notify).to_lowercase(),
         format!("{:?}", p.seccomp.on_violation).to_lowercase(),
         fams.join(", "),
         if p.network.mode == NetMode::Egress {
@@ -530,6 +574,7 @@ pub fn build(p: &Policy) -> Result<Programs, String> {
     Ok(Programs {
         prelude: prelude(),
         main,
+        on_match,
         table,
         summary,
     })
@@ -570,10 +615,17 @@ pub fn install_with_listener(prog: &BpfProgram) -> Result<i32, String> {
     install(prog, flags, "policy filter").map(|fd| fd as i32)
 }
 
+/// Install the policy filter without a listener (`seccomp.notify = "off"`):
+/// the kernel applies its verdicts itself.
+pub fn install_without_listener(prog: &BpfProgram) -> Result<(), String> {
+    install(prog, 0, "policy filter").map(|_| ())
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
     use crate::policy::Policy;
+    use proptest::prelude::*;
 
     /// Minimal classic-BPF interpreter for the instructions seccompiler and
     /// the prelude emit. Panics on anything else so gaps are noticed.
@@ -749,35 +801,105 @@ pub mod tests {
         v
     }
 
-    fn check_agreement(p: &Policy) {
-        let t = build_table(p).unwrap();
-        let prog = compile(&t).unwrap();
-        for (nr, args) in samples() {
-            let bpf = run_bpf(&prog, nr, AUDIT_ARCH, &args);
-            let eval = t.evaluate(nr, &args);
-            let want = if eval.is_some() { NOTIF } else { ALLOW };
-            assert_eq!(
-                bpf,
-                want,
-                "nr {} args {args:x?}: bpf {bpf:#x} vs evaluator {eval:?}",
-                syscall_name(nr)
-            );
+    /// What a match must return, written out from the policy rather than
+    /// taken from [`OnMatch`].
+    fn match_verdict(cfg: &SeccompCfg) -> u32 {
+        match (cfg.notify, cfg.on_violation) {
+            (Notify::Listener, _) => NOTIF,
+            (Notify::Off, Violation::Errno) => 0x0005_0001,
+            (Notify::Off, Violation::Kill) => 0x8000_0000,
         }
     }
 
-    #[test]
-    fn bpf_matches_evaluator() {
-        check_agreement(&policy("none", "\"unix\"", true));
-        check_agreement(&policy("none", "\"unix\", \"netlink\"", false));
-        check_agreement(&policy("egress", "\"unix\", \"inet\", \"inet6\"", true));
-        check_agreement(&policy("egress", "\"unix\", \"inet\"", false));
-        check_agreement(&policy("unrestricted", "\"unix\", \"inet\", \"inet6\"", true));
-        check_agreement(&without_landlock(policy(
-            "egress",
-            "\"unix\", \"inet\", \"inet6\"",
-            true,
-        )));
-        check_agreement(&without_landlock(policy("none", "\"unix\"", true)));
+    fn bare_names(list: &[(&'static str, i64)]) -> Vec<&'static str> {
+        list.iter().map(|(n, _)| strip(n)).collect()
+    }
+
+    /// A policy with any combination of the settings the rule table reads.
+    /// It need not pass validation: compile must be right for any table.
+    fn any_policy() -> impl Strategy<Value = Policy> {
+        use SocketFamily::*;
+        let deniable: Vec<&str> = [DEFAULT_DENY, DEFAULT_DENY_ARCH, EXTRA_NAMES, EXTRA_NAMES_ARCH]
+            .iter()
+            .flat_map(|l| bare_names(l))
+            .collect();
+        let liftable: Vec<&str> = [DEFAULT_DENY, DEFAULT_DENY_ARCH]
+            .iter()
+            .flat_map(|l| bare_names(l))
+            .collect();
+        (
+            prop_oneof![Just(NetMode::None), Just(NetMode::Egress), Just(NetMode::Unrestricted)],
+            prop::sample::subsequence(vec![Unix, Inet, Inet6, Netlink, Packet, Vsock], 0..=6),
+            any::<bool>(),
+            any::<bool>(),
+            prop::sample::subsequence(deniable, 0..=4),
+            prop::sample::subsequence(liftable, 0..=3),
+            prop_oneof![Just(Notify::Listener), Just(Notify::Off)],
+            prop_oneof![Just(Violation::Errno), Just(Violation::Kill)],
+        )
+            .prop_map(
+                |(mode, fams, subprocesses, landlock, deny, allow, notify, on_violation)| {
+                    let mut p = Policy::parse(crate::policy::tests::MINIMAL, std::path::Path::new("t.toml")).unwrap();
+                    p.network.mode = mode;
+                    p.seccomp.socket_families = fams;
+                    p.process.subprocesses = subprocesses;
+                    if !landlock {
+                        p.landlock.abi = LandlockAbi::Off;
+                    }
+                    p.seccomp.deny = deny.into_iter().map(String::from).collect();
+                    p.seccomp.allow = allow.into_iter().map(String::from).collect();
+                    p.seccomp.notify = notify;
+                    p.seccomp.on_violation = on_violation;
+                    p
+                },
+            )
+    }
+
+    /// Calls the rules look at (with arguments that hit their conditions),
+    /// calls of the table's syscalls with any arguments, and any call at all.
+    fn any_calls() -> impl Strategy<Value = Vec<(i64, [u64; 6])>> {
+        let interesting: Vec<i64> = samples().iter().map(|(nr, _)| *nr).collect();
+        let call = prop_oneof![
+            prop::sample::select(samples()),
+            (prop::sample::select(interesting), any::<[u64; 6]>()),
+            (any::<i32>().prop_map(i64::from), any::<[u64; 6]>()),
+        ];
+        prop::collection::vec(call, 1..64)
+    }
+
+    proptest! {
+        #[test]
+        fn the_policy_filter_returns_its_verdict_exactly_when_a_rule_matches(p in any_policy(), calls in any_calls()) {
+            let t = build_table(&p).unwrap();
+            let prog = compile(&t, OnMatch::of(&p.seccomp)).unwrap();
+            let verdict = match_verdict(&p.seccomp);
+            for (nr, args) in calls {
+                let bpf = run_bpf(&prog, nr, AUDIT_ARCH, &args);
+                let eval = t.evaluate(nr, &args);
+                let want = if eval.is_some() { verdict } else { ALLOW };
+                prop_assert_eq!(
+                    bpf, want,
+                    "nr {} args {:x?}: bpf {:#x} vs evaluator {:?}", syscall_name(nr), args, bpf, eval
+                );
+            }
+        }
+
+        #[test]
+        fn the_prelude_verdicts_depend_only_on_the_architecture_and_number(
+            nr in prop_oneof![Just(libc::SYS_clone3 as i32), Just(0x4000_0000), any::<i32>()],
+            arch in prop_oneof![Just(AUDIT_ARCH), any::<u32>()],
+            args in any::<[u64; 6]>(),
+        ) {
+            let x32 = cfg!(target_arch = "x86_64") && nr as u32 >= 0x4000_0000;
+            let want = if arch != AUDIT_ARCH {
+                0x8000_0000
+            } else if i64::from(nr) == libc::SYS_clone3 || x32 {
+                0x0005_0000 | libc::ENOSYS as u32
+            } else {
+                ALLOW
+            };
+            prop_assert_eq!(run_bpf(&prelude(), i64::from(nr), arch, &args), want);
+        }
     }
 
     fn without_landlock(mut p: Policy) -> Policy {
@@ -887,25 +1009,11 @@ pub mod tests {
     }
 
     #[test]
-    fn prelude_verdicts() {
-        let p = prelude();
-        assert_eq!(run_bpf(&p, libc::SYS_read, AUDIT_ARCH, &[0; 6]), ALLOW);
-        assert_eq!(
-            run_bpf(&p, libc::SYS_clone3, AUDIT_ARCH, &[0; 6]),
-            0x0005_0000 | libc::ENOSYS as u32
-        );
-        assert_eq!(run_bpf(&p, libc::SYS_read, 0x4000_0003, &[0; 6]), 0x8000_0000);
-        #[cfg(target_arch = "x86_64")]
-        assert_eq!(
-            run_bpf(&p, 0x4000_0000, AUDIT_ARCH, &[0; 6]),
-            0x0005_0000 | libc::ENOSYS as u32
-        );
-    }
-
-    #[test]
     fn names() {
         assert_eq!(lookup("ptrace"), Some(libc::SYS_ptrace));
+        assert_eq!(lookup("sendmsg"), Some(libc::SYS_sendmsg));
         assert_eq!(lookup("read"), None);
+        assert_eq!(lookup("execve"), None);
         assert!(is_default_denied("bpf"));
         assert!(!is_default_denied("memfd_create"));
         assert_eq!(syscall_name(libc::SYS_setsockopt), "setsockopt");

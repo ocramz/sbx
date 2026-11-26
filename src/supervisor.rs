@@ -1,11 +1,12 @@
 //! Process model:
 //!
 //!   sbx (supervisor: PID 1 in a container, unsandboxed, never runs payload code)
-//!    ├─ threads, started after fork: seccomp notification dispatcher,
-//!    │  blocking egress connects, DNS proxy
+//!    ├─ threads, started after fork: seccomp notification dispatcher (with
+//!    │  the listener), blocking egress connects, DNS proxy
 //!    └─ child: [join the sandbox cgroup] → setsid → chdir → rlimits → drop identity and capabilities
 //!              → PDEATHSIG → NO_NEW_PRIVS → Landlock (unless "off") → seccomp prelude
-//!              → policy filter (listener handed to the supervisor) → execve
+//!              → policy filter (with seccomp.notify = "listener", the listener is handed to
+//!                the supervisor) → execve
 //!         └─ untrusted program and all its descendants (inherit every layer)
 //!
 //! One sandbox per container: `sbx run` claims a slot (an abstract UNIX
@@ -15,7 +16,8 @@
 //!
 //! The supervisor is single-threaded until after fork, so the child may
 //! allocate before exec. Setup failures in the child come back over a
-//! close-on-exec pipe; the listener comes over a SOCK_SEQPACKET socketpair.
+//! close-on-exec pipe; the listener, if any, comes over a SOCK_SEQPACKET
+//! socketpair.
 
 use crate::cgroup::{self, Delegation};
 use crate::dns;
@@ -24,10 +26,10 @@ use crate::landlock_layer;
 use crate::log::{self, errno, fatal_signal, os_err};
 use crate::memory::{Pid, Sampler};
 use crate::notify::{self, Dispatcher, Listener, Received, Stats};
-use crate::policy::{DnsCfg, LandlockAbi, Limit, Policy, Timeout};
+use crate::policy::{DnsCfg, LandlockAbi, Limit, Policy, Timeout, Violation};
 use crate::procfs::{self, StartTicks};
 use crate::report::{self, At, Program, Ran, SetupError, Stage, Usage};
-use crate::seccomp_layer::{self, Programs};
+use crate::seccomp_layer::{self, OnMatch, Programs};
 use crate::series::When;
 use landlock::RulesetCreated;
 use std::collections::{BTreeMap, BTreeSet};
@@ -193,7 +195,11 @@ fn launch(
     }
     sig.check_pending().at(Stage::Launch)?;
     let (err_r, err_w) = pipe().at(Stage::Launch)?;
-    let (sock_parent, sock_child) = socketpair().at(Stage::Launch)?;
+    // (parent's end, child's end), for the listener: none without one.
+    let sock = match l.seccomp.on_match {
+        OnMatch::Notify => Some(socketpair().at(Stage::Launch)?),
+        OnMatch::Verdict(_) => None,
+    };
     // SAFETY: getpid has no preconditions.
     let parent_pid = unsafe { libc::getpid() };
 
@@ -204,8 +210,17 @@ fn launch(
     }
     if pid == 0 {
         drop(err_r);
-        drop(sock_parent);
-        let (stage, e) = child(p, &mut l, err_w.as_raw_fd(), sock_child.as_raw_fd(), parent_pid);
+        let sock_child = sock.map(|(parent, child)| {
+            drop(parent);
+            child
+        });
+        let (stage, e) = child(
+            p,
+            &mut l,
+            err_w.as_raw_fd(),
+            sock_child.as_ref().map(AsRawFd::as_raw_fd),
+            parent_pid,
+        );
         let msg = format!("{}: {e}", stage.as_str());
         // SAFETY: report and exit without running destructors.
         unsafe {
@@ -217,16 +232,20 @@ fn launch(
     // Parent: drop our copy of the ruleset fd and the child's ends.
     drop(l.landlock.take());
     drop(err_w);
-    drop(sock_child);
-    let listener = match notify::recv_fd(sock_parent.as_raw_fd()) {
-        Ok(Received::Fd(fd)) => fd,
-        Ok(Received::Eof) | Ok(Received::Text(_)) => return Err(child_setup_failed(pid, err_r, cg)),
-        Err(e) => {
-            kill_and_wait(pid);
-            return Err(format!("receiving the seccomp listener from the child: {e}")).at(Stage::Listener);
+    let listener = match sock {
+        None => None,
+        Some((sock_parent, sock_child)) => {
+            drop(sock_child);
+            match notify::recv_fd(sock_parent.as_raw_fd()) {
+                Ok(Received::Fd(fd)) => Some(fd),
+                Ok(Received::Eof) | Ok(Received::Text(_)) => return Err(child_setup_failed(pid, err_r, cg)),
+                Err(e) => {
+                    kill_and_wait(pid);
+                    return Err(format!("receiving the seccomp listener from the child: {e}")).at(Stage::Listener);
+                }
+            }
         }
     };
-    drop(sock_parent);
 
     let stats = Arc::new(Stats::default());
     let dispatcher = match start_services(p, &l, listener, svc, &stats) {
@@ -251,25 +270,41 @@ fn launch(
         usage: Usage::default(),
         memory,
     };
-    Ok(supervise(p, pid, am_pid1, sig, &stats, dispatcher, cg, acct))
+    Ok(supervise(
+        p,
+        l.seccomp.on_match,
+        pid,
+        am_pid1,
+        sig,
+        &stats,
+        dispatcher,
+        cg,
+        acct,
+    ))
 }
 
+/// The notification thread, with a listener; nothing without one.
 fn start_services(
     p: &Policy,
     l: &Launch,
-    listener: OwnedFd,
+    listener: Option<OwnedFd>,
     svc: Services,
     stats: &Arc<Stats>,
-) -> Result<JoinHandle<()>, String> {
-    let listener = Arc::new(Listener::new(listener)?);
-    let dispatcher = Dispatcher {
-        listener,
-        table: l.seccomp.table.clone(),
-        on_violation: p.seccomp.on_violation,
-        egress: svc.egress.clone(),
-        stats: Arc::clone(stats),
-    }
-    .spawn()?;
+) -> Result<Option<JoinHandle<()>>, String> {
+    let dispatcher = match listener {
+        Some(fd) => Some(
+            Dispatcher {
+                listener: Arc::new(Listener::new(fd)?),
+                table: l.seccomp.table.clone(),
+                on_violation: p.seccomp.on_violation,
+                egress: svc.egress.clone(),
+                stats: Arc::clone(stats),
+            }
+            .spawn()?,
+        ),
+        None if svc.egress.is_some() => return Err("BUG: an egress filter without a seccomp listener".into()),
+        None => None,
+    };
     if let Some((tcp, cfg)) = svc.dns {
         let egress = svc.egress.ok_or("BUG: DNS proxy without an egress filter")?;
         dns::Proxy::spawn(tcp, cfg, egress)?;
@@ -360,8 +395,9 @@ fn kill_and_wait(pid: libc::pid_t) {
     }
 }
 
-/// Runs in the forked child. Returns only on failure.
-fn child(p: &Policy, l: &mut Launch, err_fd: RawFd, sock_fd: RawFd, parent: libc::pid_t) -> (Stage, String) {
+/// Runs in the forked child. Returns only on failure. `sock_fd` carries the
+/// listener to the supervisor, with `OnMatch::Notify` only.
+fn child(p: &Policy, l: &mut Launch, err_fd: RawFd, sock_fd: Option<RawFd>, parent: libc::pid_t) -> (Stage, String) {
     // First, so everything the child does from here on is charged to the sandbox.
     if let Some(fd) = l.cgroup_procs {
         if let Err(e) = cgroup::join(fd) {
@@ -402,7 +438,8 @@ fn child(p: &Policy, l: &mut Launch, err_fd: RawFd, sock_fd: RawFd, parent: libc
     }
     // Everything the child needs after its policy filter is installed is
     // prepared now: from that point on it only makes the syscalls sbx
-    // reserves (a denied syscall would block on a listener nobody reads yet).
+    // reserves (with the listener, a denied syscall would block on a listener
+    // nobody reads yet; without it, it would fail or kill the child).
     let mut argv: Vec<*const libc::c_char> = l.argv.iter().map(|a| a.as_ptr()).collect();
     argv.push(std::ptr::null());
     let mut envp: Vec<*const libc::c_char> = l.envp.iter().map(|a| a.as_ptr()).collect();
@@ -419,16 +456,28 @@ fn child(p: &Policy, l: &mut Launch, err_fd: RawFd, sock_fd: RawFd, parent: libc
     if let Err(e) = seccomp_layer::install_prelude(&l.seccomp.prelude) {
         return (Stage::Seccomp, e);
     }
-    let listener = match seccomp_layer::install_with_listener(&l.seccomp.main) {
-        Ok(fd) => fd,
-        Err(e) => return (Stage::Seccomp, e),
-    };
-    if let Err(e) = notify::send_fd(sock_fd, listener) {
-        return (Stage::Seccomp, format!("handing the listener to the supervisor: {e}"));
-    }
-    unsafe {
-        libc::close(listener);
-        libc::close(sock_fd);
+    match (l.seccomp.on_match, sock_fd) {
+        (OnMatch::Notify, Some(sock_fd)) => {
+            let listener = match seccomp_layer::install_with_listener(&l.seccomp.main) {
+                Ok(fd) => fd,
+                Err(e) => return (Stage::Seccomp, e),
+            };
+            if let Err(e) = notify::send_fd(sock_fd, listener) {
+                return (Stage::Seccomp, format!("handing the listener to the supervisor: {e}"));
+            }
+            // SAFETY: closing our own descriptors.
+            unsafe {
+                libc::close(listener);
+                libc::close(sock_fd);
+            }
+        }
+        (OnMatch::Verdict(_), None) => {
+            if let Err(e) = seccomp_layer::install_without_listener(&l.seccomp.main) {
+                return (Stage::Seccomp, e);
+            }
+        }
+        (OnMatch::Notify, None) => return (Stage::Seccomp, "BUG: no socket to hand the listener over".into()),
+        (OnMatch::Verdict(_), Some(_)) => return (Stage::Seccomp, "BUG: a listener socket without a listener".into()),
     }
     if let Err(e) = close_fds_except(err_fd) {
         return (Stage::CloseRange, e);
@@ -629,11 +678,13 @@ fn reset_signals() -> Result<(), String> {
 #[expect(clippy::too_many_arguments, reason = "the supervisor's whole state, passed once")]
 fn supervise(
     p: &Policy,
+    on_match: OnMatch,
     child: libc::pid_t,
     am_pid1: bool,
     sig: &Signals,
     stats: &Stats,
-    dispatcher: JoinHandle<()>,
+    // None without the listener: then nothing counts the denials.
+    dispatcher: Option<JoinHandle<()>>,
     cg: Option<&Delegation>,
     mut acct: Accounts,
 ) -> Ran {
@@ -756,23 +807,33 @@ fn supervise(
     }
     kill_tree(child, am_pid1, cg);
     reap_all(am_pid1, &mut acct);
-    // The listener reports POLLHUP once no sandboxed task is left, so the
-    // dispatcher returns and the denial counts are final.
-    let until = Instant::now() + Duration::from_secs(2);
-    while !dispatcher.is_finished() && Instant::now() < until {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    if dispatcher.is_finished() {
-        let _ = dispatcher.join();
-    } else {
-        log::warn("the seccomp notification thread is still running; the denial counts may be incomplete");
-    }
+    let denials = dispatcher.map(|d| {
+        // The listener reports POLLHUP once no sandboxed task is left, so the
+        // dispatcher returns and the denial counts are final.
+        let until = Instant::now() + Duration::from_secs(2);
+        while !d.is_finished() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if d.is_finished() {
+            let _ = d.join();
+        } else {
+            log::warn("the seccomp notification thread is still running; the denial counts may be incomplete");
+        }
+        stats.denials()
+    });
     for line in stats.summary() {
         log::info(format!("repeated: {line}"));
     }
 
     let program = status.and_then(Program::from_wait_status);
     match (status, program) {
+        (_, Some(Program::Signaled(libc::SIGSYS))) if on_match == OnMatch::Verdict(Violation::Kill) => {
+            log::info(format!(
+                "program killed by signal {} (SIGSYS: most likely a syscall the policy denies, with \
+                 seccomp.notify = \"off\" and on_violation = \"kill\")",
+                libc::SIGSYS
+            ))
+        }
         (_, Some(Program::Signaled(s))) => log::info(format!("program killed by signal {s}")),
         (Some(st), None) => log::error(format!("unexpected wait status {st:#x}")),
         _ => {}
@@ -788,7 +849,7 @@ fn supervise(
         program,
         timed_out,
         supervisor_error: if fatal { log::fatal_message() } else { None },
-        denials: stats.denials(),
+        denials,
         killed_after_exit,
         wall_ms: wall.as_millis() as u64,
         usage: acct.usage,

@@ -435,8 +435,22 @@ pub enum ResolvConfMode {
 pub enum Violation {
     /// The denied syscall fails with EPERM (egress denials: EACCES).
     Errno,
-    /// The offending process is killed with SIGKILL.
+    /// The offending process is killed: with SIGKILL by the supervisor with
+    /// the listener, with SIGSYS by the kernel without it.
     Kill,
+}
+
+/// Who sees the policy filter's matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Notify {
+    /// A seccomp user-notification listener: the supervisor logs and counts
+    /// every match, applies `on_violation`, and decides egress connects.
+    Listener,
+    /// No listener, for kernels without seccomp user notification (gVisor):
+    /// the kernel applies `on_violation` itself, and matches are neither
+    /// logged nor counted (see the README, "Without the listener").
+    Off,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -466,6 +480,7 @@ impl SocketFamily {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SeccompCfg {
+    pub notify: Notify,
     pub on_violation: Violation,
     /// Extra syscalls to deny (by name).
     pub deny: Vec<String>,
@@ -924,6 +939,9 @@ impl Policy {
                  behaviour"
             } else if e.message().contains("missing field `series`") {
                 "\nhint: [measure.series] is new in sbx v0.5; add it with mode = \"off\" to keep v0.4's behaviour"
+            } else if e.message().contains("missing field `notify`") {
+                "\nhint: seccomp.notify is new in sbx v0.6; add notify = \"listener\" to [seccomp] to keep v0.5's \
+                 behaviour"
             } else {
                 ""
             };
@@ -1284,6 +1302,14 @@ impl Policy {
             }
             return;
         }
+        match self.seccomp.notify {
+            Notify::Listener => {}
+            Notify::Off => errs.push(
+                "network.mode = \"egress\" needs seccomp.notify = \"listener\": the supervisor decides every \
+                 connect() through the listener"
+                    .into(),
+            ),
+        }
         if n.egress.is_empty() && n.bind_tcp.is_empty() {
             errs.push(
                 "network.mode = \"egress\" with no egress rules and no bind_tcp ports; use mode = \"none\"".into(),
@@ -1377,12 +1403,22 @@ impl Policy {
             if seccomp_layer::lookup(name).is_none() {
                 errs.push(format!("seccomp.deny: unknown or unsupported syscall {name:?}"));
             }
-            if seccomp_layer::RESERVED.contains(&name.as_str()) {
-                errs.push(format!(
-                    "seccomp.deny must not include {name}: sbx needs it to hand over the notification listener \
-                     and start the program"
-                ));
+            if let Some(why) = seccomp_layer::reserved(name, s.notify) {
+                errs.push(format!("seccomp.deny must not include {name}: sbx needs it {why}"));
             }
+        }
+        match (s.notify, s.on_violation) {
+            (Notify::Listener, _) => {}
+            (Notify::Off, Violation::Errno) => warn.push(
+                "seccomp.notify = \"off\": a denied syscall fails with EPERM, and is neither logged nor counted \
+                 (the report's denials is null); on_violation = \"kill\" at least shows it, as SIGSYS"
+                    .into(),
+            ),
+            (Notify::Off, Violation::Kill) => warn.push(
+                "seccomp.notify = \"off\": a denied syscall kills the process with SIGSYS (signal 31), and is \
+                 neither logged nor counted (the report's denials is null)"
+                    .into(),
+            ),
         }
         let mut seen = BTreeSet::new();
         for name in &s.allow {
@@ -1475,6 +1511,7 @@ bind_tcp = []
 egress = []
 
 [seccomp]
+notify = "listener"
 on_violation = "errno"
 deny = []
 allow = []
@@ -1525,6 +1562,7 @@ access = "rw"
             "nofile = 1024",
             "pass = []",
             "bind_tcp = []",
+            "notify = \"listener\"",
             "on_violation = \"errno\"",
             "mode = \"off\"",
             "memory_sample_ms = 0",
@@ -2078,6 +2116,78 @@ answer_scopes = ["global"]
         let src = MINIMAL.replacen("allow = []", "allow = [\"ptrace\"]", 1);
         let warn = parse(&src).unwrap().validate().unwrap();
         assert!(warn.iter().any(|w| w.contains("ptrace")));
+    }
+
+    fn without_listener(src: &str, on_violation: &str) -> String {
+        src.replacen("notify = \"listener\"", "notify = \"off\"", 1).replacen(
+            "on_violation = \"errno\"",
+            &format!("on_violation = \"{on_violation}\""),
+            1,
+        )
+    }
+
+    #[test]
+    fn the_notify_key_is_required_with_an_upgrade_hint() {
+        let e = parse(&MINIMAL.replacen("notify = \"listener\"\n", "", 1)).unwrap_err();
+        assert!(
+            e.contains("missing field `notify`")
+                && e.contains("new in sbx v0.6")
+                && e.contains("notify = \"listener\""),
+            "{e}"
+        );
+        let e = parse(&MINIMAL.replacen("notify = \"listener\"", "notify = \"on\"", 1)).unwrap_err();
+        assert!(e.contains("unknown variant"), "{e}");
+    }
+
+    #[test]
+    fn sendmsg_is_reserved_only_with_the_listener() {
+        let deny = |src: &str, names: &str| {
+            parse(&src.replacen("deny = []", &format!("deny = [{names}]"), 1))
+                .unwrap()
+                .validate()
+        };
+        let errs = deny(MINIMAL, "\"sendmsg\"").unwrap_err();
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(
+            errs[0].contains("must not include sendmsg") && errs[0].contains("listener"),
+            "{errs:?}"
+        );
+        let off = without_listener(MINIMAL, "kill");
+        deny(&off, "\"sendmsg\"").unwrap();
+        for src in [MINIMAL, off.as_str()] {
+            let errs = deny(src, "\"execve\"").unwrap_err();
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains("must not include execve") && e.contains("start the program")),
+                "{errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn egress_needs_the_listener() {
+        let src = egress_policy(r#"{ cidr = "10.0.0.0/8", ports = [5432] }"#, "");
+        parse(&src).unwrap().validate().unwrap();
+        for v in ["errno", "kill"] {
+            let errs = parse(&without_listener(&src, v)).unwrap().validate().unwrap_err();
+            assert_eq!(errs.len(), 1, "{errs:?}");
+            assert!(errs[0].contains("needs seccomp.notify = \"listener\""), "{errs:?}");
+        }
+    }
+
+    #[test]
+    fn without_the_listener_sbx_warns_that_denials_are_not_seen() {
+        let warn = |v| parse(&without_listener(MINIMAL, v)).unwrap().validate().unwrap();
+        let w = warn("errno");
+        assert!(
+            w.len() == 1 && w[0].contains("fails with EPERM") && w[0].contains("neither logged nor counted"),
+            "{w:?}"
+        );
+        let w = warn("kill");
+        assert!(
+            w.len() == 1 && w[0].contains("SIGSYS") && w[0].contains("denials is null"),
+            "{w:?}"
+        );
     }
 
     #[test]

@@ -70,6 +70,13 @@ else
 	bad "probe for the egress example with CAP_SYS_PTRACE" "$out"
 fi
 
+if out=$(run -e SBX_POLICY_FILE=/etc/sbx/gvisor.example.toml --entrypoint /usr/local/bin/sbx "$image" probe 2>&1) &&
+	echo "$out" | grep -q '^ok  *seccomp filter'; then
+	ok "probe passes for the gVisor example (seccomp filter without a listener)"
+else
+	bad "probe for the gVisor example" "$out"
+fi
+
 rc=0
 out=$(run -e SBX_TIMOUT=5 "$image" -- /bin/true 2>&1) || rc=$?
 if [ "$rc" = 125 ] && echo "$out" | grep -q "unknown environment variable SBX_TIMOUT"; then

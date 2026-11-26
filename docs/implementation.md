@@ -347,3 +347,76 @@ Plan: [plans/v0.5-series-compression.md](plans/v0.5-series-compression.md), part
 - **Not modelled by the bound:** a reallocation's transient copy, as before.
 - **Cloud Run:** `make live` passed (run by the user).
 - **Not verified here:** the amd64 runner.
+
+## 2026-11-26: v0.6, a policy filter without the listener, for gVisor (issue #18)
+
+Plan: [plans/v0.6-gvisor.md](plans/v0.6-gvisor.md).
+
+- **Policy (`src/policy.rs`):**
+  - `Notify { Listener, Off }` is the first field of `SeccompCfg`, required. A missing key gets the hint "seccomp.notify is new in sbx v0.6; add notify = "listener"".
+  - `validate_network` refuses egress with `Off`.
+  - `validate_seccomp` asks `seccomp_layer::reserved(name, notify)` why a syscall cannot be denied, and warns once for `Off`, with a text for `errno` and one for `kill`.
+  - The `Violation::Kill` doc names both signals.
+- **Filter (`src/seccomp_layer.rs`):**
+  - `OnMatch { Notify, Verdict(Violation) }`, from `OnMatch::of(&SeccompCfg)`. `compile(table, on_match)` uses the existing marker and its rewrite into `USER_NOTIF` (now `into_user_notif`), or the plain seccompiler actions `Errno(EPERM)` and `KillProcess`.
+  - `Programs.on_match`; the summary line names `notify`.
+  - `RESERVED` became `reserved()`: `execve` always, `sendmsg` with the listener only. `sendmsg` moved into `EXTRA_NAMES`, so `seccomp.deny` accepts it.
+  - `install_without_listener` installs with flags 0.
+- **Supervisor (`src/supervisor.rs`):**
+  - The socketpair, `recv_fd` (`Stage::Listener`) and the dispatcher exist only with `OnMatch::Notify`. The child matches `(on_match, socket)`; a mismatch is a `BUG:` error, as for Landlock.
+  - `start_services` returns `Option<JoinHandle>` and refuses an egress filter without a listener.
+  - `supervise` returns `denials: Some(..)` exactly when a dispatcher ran. Under `Verdict(Kill)`, a program killed by SIGSYS gets a hint in its log line (beyond the issue).
+- **Probe (`src/capabilities.rs`):**
+  - `notify` chooses the check. The new "seccomp filter" check compiles a one-rule table (`getppid`) through `compile`, and in a forked child sets `RLIMIT_CORE` to 0 and `NO_NEW_PRIVS` and installs the prelude and that filter.
+  - It wants `EPERM` (exit 0) or death by SIGSYS.
+  - `fork_check` now returns the wait status; `subreaper` checks it.
+- **Report:** `Ran.denials: Option<Vec<..>>`, `null` in the JSON. A setup failure keeps `[]`. Still 12 keys.
+- **Policies and image:**
+  - the three shipped policies have `notify = "listener"`
+  - `policy/gvisor.example.toml` is new: Landlock off, notify off, kill, cgroup off, network none, sampling off. The Dockerfile ships it and validates it with `sbx policy`.
+  - version 0.6.0.
+- **Tests:**
+  - property `the_policy_filter_returns_its_verdict_exactly_when_a_rule_matches` replaces `bpf_matches_evaluator`.
+    - Inputs: random policies (network mode, socket families, subprocesses, Landlock, `deny` from every lookup-able name, `allow` from the default denials, `notify`, `on_violation`) and calls from `samples()`, the table's numbers with random arguments, and any `i32`.
+    - The expected verdict is written as literals in the test, so `OnMatch::of` is checked too.
+    - Two mutations were caught: `KillThread` for `KillProcess`, and `Off` always mapped to `errno`.
+  - property `the_prelude_verdicts_depend_only_on_the_architecture_and_number` replaces `prelude_verdicts`.
+  - policy:
+    - `the_notify_key_is_required_with_an_upgrade_hint`
+    - `sendmsg_is_reserved_only_with_the_listener` (and `execve` always)
+    - `egress_needs_the_listener`
+    - `without_the_listener_sbx_warns_that_denials_are_not_seen`
+  - report: `denials: None` is `null`, with 12 keys.
+  - smoke: a section "seccomp without the listener" with 14 checks:
+    - the probe
+    - SIGSYS: exit 159, `{"signaled": 31}`, `denials` null, unlogged, the hint and the warning; for `unshare` too, and in a forked child
+    - AF_UNIX
+    - the two filters
+    - `EPERM` with `denials` null
+    - `--seccomp-action kill`
+    - `clone3`
+    - `sendmsg` with off and with the listener
+    - egress refused
+    - the missing-key hint
+  - `tests/image-checks.sh`: the gVisor example's probe passes on runc.
+  - new: `tests/gvisor.py` (stdlib), the in-sandbox suite. It prints the platform facts and both probes, and makes 13 or 14 checks: the listener refusal applies only where there is no listener.
+  - new: `tests/modal_gvisor.py`, a uv script.
+    - It pins `modal==1.6.4`, with `tests/modal_gvisor.py.lock` from `uv lock --script`.
+    - It checks that sbx is a static x86-64 ELF, builds a `debian_slim(python 3.13)` image with sbx, the four policies and the suite, and runs the suite as the sandbox's own command.
+    - The runtime is `"gvisor"` by default; `--runtime vm` is the control.
+  - `make gvisor` builds the amd64 runtime image as `localhost/sbx-modal:<sha>` (so `$(IMAGE)` keeps its tag), copies sbx out and runs the script.
+- **Verified** (arm64 Mac, podman machine, kernel 6.12.7):
+  - `cargo fmt --check`
+  - clippy `-D warnings` natively and for `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`, in `rust:1.97.0-slim-bookworm`
+  - 110 unit tests pass
+  - `make smoke` (delegated cgroup): 196 + 14 passed
+  - `tests/gvisor.py` in the test image on runc: 13 passed
+  - **Modal, gVisor** (`4.19.0-gvisor`, x86_64), with `make gvisor`: 14 passed.
+    - The listener variant's probe shows `MISSING seccomp user notification: seccomp(SECCOMP_GET_NOTIF_SIZES): Invalid argument`, and `sbx run` with it exits 125 at stage `capabilities`.
+    - The sandbox's own command has `CapBnd a80405fb`, without `CAP_SYS_PTRACE`, as #18 measured.
+    - `/proc/self/status` there has no `Seccomp_filters` line.
+  - **Modal, VM** (Linux 7.3.4) with `--runtime vm`: 13 passed. The listener probe passes there too.
+- **Deviations from the plan:**
+  - `OnMatch::ret()` was dropped: `compile` maps to seccompiler's actions, and the tests use literals.
+  - `make gvisor` creates the container without `--platform`. podman records the image as `linux/amd64/v8` (the arm64 build machine's variant), which a `--platform linux/amd64` lookup misses. The script's ELF check covers the architecture.
+- **Not verified here:** the amd64 CI runner; `docker run --runtime=runsc`, which `tests/gvisor.py` supports but no make target runs.

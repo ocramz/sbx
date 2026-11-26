@@ -111,6 +111,21 @@ smoke: image test-image ## integration suite in the test image, then checks of t
 		--entrypoint python3 $(TEST_IMAGE):$(VERSION) /opt/sbx/tests/smoke.py
 	DOCKER="$(DOCKER)" PLATFORM="$(PLATFORM)" SBX_VERSION="$(SBX_VERSION)" tests/image-checks.sh $(IMAGE):$(VERSION)
 
+# The static sbx that `gvisor` uploads to Modal, which runs linux/amd64. The
+# image gets its own name, so the host architecture's $(IMAGE) keeps its tag.
+MODAL_IMAGE := localhost/sbx-modal:$(VERSION)
+MODAL_SBX   := target/modal/sbx
+
+.PHONY: gvisor
+gvisor: ## checks under gVisor in a Modal sandbox (uv, Modal credentials; README "Without the listener")
+	$(MAKE) --no-print-directory image PLATFORM=linux/amd64 REGISTRY=localhost IMAGE_NAME=sbx-modal
+	mkdir -p $(dir $(MODAL_SBX))
+# No --platform: podman may record the build machine's variant (amd64/v8),
+# which such a lookup misses. modal_gvisor.py checks that sbx is x86-64.
+	cid=$$($(DOCKER) create --pull=never $(MODAL_IMAGE)) && \
+	{ $(DOCKER) cp $$cid:/usr/local/bin/sbx $(MODAL_SBX); rc=$$?; $(DOCKER) rm $$cid >/dev/null; exit $$rc; }
+	uv run tests/modal_gvisor.py $(MODAL_SBX)
+
 .PHONY: probe
 probe: ## run `sbx probe` with the default policy in the runtime image
 	$(DOCKER) run --rm --pull=never --platform $(PLATFORM) --entrypoint /usr/local/bin/sbx $(IMAGE):$(VERSION) probe

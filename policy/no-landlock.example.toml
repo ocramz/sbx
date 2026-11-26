@@ -74,6 +74,7 @@ timeout_ms = 2000
 answer_scopes = ["global"]
 
 [seccomp]
+notify = "listener"        # listener | off (README, "Without the listener")
 on_violation = "errno"
 deny = []
 allow = []

@@ -1,0 +1,79 @@
+# Example policy for gVisor (runsc, Modal sandboxes): no Landlock, no seccomp
+# user notification, no cgroup of its own, no network. See the README,
+# "Without the listener" and "Without Landlock", for what this gives up. In
+# short:
+#
+#   * a denied syscall kills the process with SIGSYS (exit 159 when it is the
+#     program itself; the report says {"signaled": 31}), and sbx neither logs
+#     nor counts it: the report's denials is null. With on_violation =
+#     "errno" the call fails with EPERM and nothing shows at all;
+#   * files are protected by their permissions only, so the program can read
+#     everything world-readable in the image and volumes, write everything
+#     world-writable, and run any world-executable binary;
+#   * there is no egress mode, which needs the listener.
+#
+# Use it only if:
+#
+#   * sbx starts as root (the image default) and runs the program as a uid
+#     nothing else in the container uses (sbx checks both);
+#   * one sandbox runs per container (sbx enforces it);
+#   * nothing that uid must not read is world-readable: application code,
+#     configuration, mounted secrets;
+#   * volumes with code to run are mounted read-only.
+#
+# Memory sampling ([measure]) needs CAP_SYS_PTRACE, which a Modal sandbox's
+# own command lacks under gVisor.
+
+# Rules need Landlock. The empty list goes first: TOML puts plain keys
+# before the first table.
+fs = []
+
+[landlock]
+abi = "off"
+scope_signals = false
+scope_abstract_unix = false
+
+[process]
+uid = 65534
+gid = 65534
+workdir = "/workspace"
+timeout_secs = "none"
+kill_grace_secs = 5
+subprocesses = true
+
+[limits]
+nofile = 1024
+nproc = 512
+fsize_mb = 1024
+as_mb = "unlimited"
+cpu_secs = "unlimited"
+
+[cgroup]
+mode = "off"               # gVisor offers no delegated cgroup v2
+
+[measure]
+memory_sample_ms = 0       # or e.g. 20 with CAP_SYS_PTRACE (README, "Memory by kind")
+tmpfs = []                 # tmpfs mounts whose use is recorded, with sampling on
+
+[measure.series]
+mode = "off"               # or "on" with max_samples, max_processes and compression, for --series FILE (README, "Time series")
+
+[env]
+pass = []
+[env.set]
+PATH = "/usr/local/bin:/usr/bin:/bin"
+HOME = "/tmp"
+TMPDIR = "/tmp"
+LANG = "C.UTF-8"
+
+[network]
+mode = "none"              # egress needs seccomp.notify = "listener"
+bind_tcp = []
+egress = []
+
+[seccomp]
+notify = "off"             # gVisor has no seccomp user notification
+on_violation = "kill"      # SIGSYS: a denial at least shows, as the program's signal
+deny = []                  # e.g. ["memfd_create", "execveat"]; "sendmsg" is allowed here too
+allow = []
+socket_families = ["unix"]

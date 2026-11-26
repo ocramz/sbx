@@ -68,6 +68,7 @@ timeout_ms = 2000
 answer_scopes = ["global"]         # learn only public addresses; also "private", "loopback"
 
 [seccomp]
+notify = "listener"        # listener | off (README, "Without the listener")
 on_violation = "errno"
 deny = []
 allow = []
