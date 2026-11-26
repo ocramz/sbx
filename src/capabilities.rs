@@ -9,9 +9,9 @@ use crate::landlock_layer::{self, abi_kernel, Probe};
 use crate::log::{self, errno, os_err};
 use crate::memory;
 use crate::notify::{self, Listener, Received};
-use crate::policy::{LandlockAbi, MeasureCfg, NetMode, Policy, ResolvConfMode, RESOLV_CONF};
+use crate::policy::{LandlockAbi, MeasureCfg, NetMode, Notify, Policy, ResolvConfMode, Violation, RESOLV_CONF};
 use crate::procfs;
-use crate::seccomp_layer::{self, AUDIT_ARCH};
+use crate::seccomp_layer::{self, OnMatch, Reason, Rule, RuleTable, AUDIT_ARCH};
 use crate::supervisor;
 use seccompiler::sock_filter;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -34,9 +34,15 @@ pub fn check(p: &Policy) -> Vec<Check> {
             name: "landlock",
             outcome: landlock(p),
         },
-        Check {
-            name: "seccomp user notification",
-            outcome: seccomp_roundtrip(),
+        match p.seccomp.notify {
+            Notify::Listener => Check {
+                name: "seccomp user notification",
+                outcome: seccomp_roundtrip(),
+            },
+            Notify::Off => Check {
+                name: "seccomp filter",
+                outcome: seccomp_verdict(p.seccomp.on_violation),
+            },
         },
         Check {
             name: "close_range",
@@ -242,18 +248,22 @@ fn supplementary_groups() -> Result<Vec<libc::gid_t>, String> {
 }
 
 fn subreaper() -> Result<String, String> {
-    fork_check(|| {
+    let st = fork_check(|| {
         // SAFETY: prctl in the forked child only.
         if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
             return Err(os_err("prctl(PR_SET_CHILD_SUBREAPER)"));
         }
         Ok(())
-    })
-    .map(|_| "available".into())
+    })?;
+    if !(libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0) {
+        return Err(format!("the test child failed (wait status {st:#x})"));
+    }
+    Ok("available".into())
 }
 
-/// Run `f` in a forked child; its error text comes back over a pipe.
-fn fork_check(f: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+/// Run `f` in a forked child and return its wait status; its error text
+/// comes back over a pipe. `f` may also end the child some other way.
+fn fork_check(f: impl FnOnce() -> Result<(), String>) -> Result<libc::c_int, String> {
     let (r, w) = pipe()?;
     // SAFETY: sbx is single-threaded here; the child only runs `f` and exits.
     let pid = unsafe { libc::fork() };
@@ -275,9 +285,9 @@ fn fork_check(f: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
     }
     drop(w);
     let msg = read_all(r);
-    wait_child(pid)?;
+    let st = wait_child(pid)?;
     if msg.is_empty() {
-        Ok(())
+        Ok(st)
     } else {
         Err(msg)
     }
@@ -417,6 +427,61 @@ fn seccomp_roundtrip() -> Result<String, String> {
         ));
     }
     Ok("listener with WAIT_KILLABLE_RECV, fd passing and replies work".into())
+}
+
+/// seccomp.notify = "off": the prelude and a one-rule policy filter
+/// (getppid), compiled and installed as sbx installs the real ones, and the
+/// kernel's verdict on a match: EPERM, or the process killed by SIGSYS.
+fn seccomp_verdict(v: Violation) -> Result<String, String> {
+    let table = RuleTable {
+        rules: vec![Rule {
+            nr: libc::SYS_getppid,
+            conds: vec![],
+            reason: Reason::DenyList { source: "sbx probe" },
+        }],
+    };
+    let prog = seccomp_layer::compile(&table, OnMatch::Verdict(v))?;
+    let prelude = seccomp_layer::prelude();
+    let st = fork_check(|| {
+        let no_core = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: setrlimit, prctl and syscalls in the forked child only.
+        unsafe {
+            // A process killed by SIGSYS dumps core by default.
+            if libc::setrlimit(libc::RLIMIT_CORE, &no_core) != 0 {
+                return Err(os_err("setrlimit(RLIMIT_CORE = 0)"));
+            }
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                return Err(os_err("prctl(PR_SET_NO_NEW_PRIVS)"));
+            }
+        }
+        seccomp_layer::install_prelude(&prelude)?;
+        seccomp_layer::install_without_listener(&prog)?;
+        // SAFETY: a plain syscall, which the filter refuses.
+        let r = unsafe { libc::syscall(libc::SYS_getppid) };
+        match (v, r, errno()) {
+            (Violation::Errno, -1, libc::EPERM) => Ok(()),
+            (Violation::Errno, _, e) => Err(format!(
+                "getppid returned {r} (errno {e}) under a filter that fails it with EPERM"
+            )),
+            (Violation::Kill, _, _) => Err(format!("getppid returned {r} under a filter that kills the process")),
+        }
+    })?;
+    let what = "prelude and policy filter installed without a listener";
+    match v {
+        Violation::Errno if libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0 => {
+            Ok(format!("{what}; a match fails with EPERM"))
+        }
+        Violation::Kill if libc::WIFSIGNALED(st) && libc::WTERMSIG(st) == libc::SIGSYS => {
+            Ok(format!("{what}; a match kills the process with SIGSYS"))
+        }
+        _ => Err(format!(
+            "the test child ended with wait status {st:#x}, not as on_violation = \"{}\" requires",
+            format!("{v:?}").to_lowercase()
+        )),
+    }
 }
 
 fn cap_sys_ptrace(needed_by: &[&str]) -> Result<String, String> {

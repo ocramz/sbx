@@ -51,6 +51,7 @@ COPY --from=build /sbx /usr/local/bin/sbx
 COPY policy/default.toml /etc/sbx/policy.toml
 COPY policy/egress.example.toml /etc/sbx/egress.example.toml
 COPY policy/no-landlock.example.toml /etc/sbx/no-landlock.example.toml
+COPY policy/gvisor.example.toml /etc/sbx/gvisor.example.toml
 ENV SBX_POLICY_FILE=/etc/sbx/policy.toml
 
 # Scratch dir for the sandboxed uid. On Cloud Run, mount an in-memory volume
@@ -62,6 +63,7 @@ RUN mkdir -p /workspace && chmod 1777 /workspace
 RUN ["/usr/local/bin/sbx", "policy", "--quiet"]
 RUN ["/usr/local/bin/sbx", "policy", "--quiet", "--policy", "/etc/sbx/egress.example.toml"]
 RUN ["/usr/local/bin/sbx", "policy", "--quiet", "--policy", "/etc/sbx/no-landlock.example.toml"]
+RUN ["/usr/local/bin/sbx", "policy", "--quiet", "--policy", "/etc/sbx/gvisor.example.toml"]
 
 # Deliberately root: sbx is PID 1 and needs root only to drop the program to
 # uid 65534 and empty its capability sets. sbx itself never runs payload code.

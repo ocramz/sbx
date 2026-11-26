@@ -62,6 +62,7 @@ bind_tcp = []              # egress mode only
 egress = []                # egress mode only, see policy/egress.example.toml
 
 [seccomp]
+notify = "listener"        # listener | off (README, "Without the listener")
 on_violation = "errno"     # errno | kill
 deny = []                  # e.g. ["memfd_create", "execveat"]
 allow = []                 # e.g. ["ptrace"] to permit debuggers inside the sandbox

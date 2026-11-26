@@ -192,7 +192,7 @@ def toml_value(v):
 
 
 def policy(mode="none", families=("unix",), egress=(), bind_tcp=(), dns=None, subprocesses=True,
-           on_violation="errno", deny=(), allow=(), extra_fs=(), workdir="/tmp", timeout="none",
+           notify="listener", on_violation="errno", deny=(), allow=(), extra_fs=(), workdir="/tmp", timeout="none",
            env_pass=(), drop=None, uid=65534, gid=65534, abi=ABI, fs=None, cgroup=None, measure=None):
     """abi="off": no scopes and, unless fs is given, no fs rules. measure gets
     series = { mode = "off" } unless it names a series."""
@@ -211,7 +211,7 @@ def policy(mode="none", families=("unix",), egress=(), bind_tcp=(), dns=None, su
         "env": {"pass": list(env_pass)},
         "env.set": {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/tmp", "LANG": "C.UTF-8"},
         "network": {"mode": mode, "bind_tcp": list(bind_tcp), "egress": list(egress)},
-        "seccomp": {"on_violation": on_violation, "deny": list(deny), "allow": list(allow),
+        "seccomp": {"notify": notify, "on_violation": on_violation, "deny": list(deny), "allow": list(allow),
                     "socket_families": list(families)},
     }
     if dns:
@@ -942,6 +942,55 @@ check("log: appended, with the program's name escaped",
 os.chmod(LOG, 0o644)
 expect("log: a log file others can read is refused", 125, ["--log", LOG, "--", "/bin/true"], log="mode 0600")
 os.unlink(LOG)
+
+# ---------------------------------------------------------------- seccomp without the listener
+
+print('== seccomp without the listener (seccomp.notify = "off")')
+OFF_KILL = policy(notify="off", on_violation="kill")
+OFF_ERRNO = policy(notify="off")
+# AF_INET: the policies allow unix sockets only, and container runtimes allow it.
+INET = "import socket\nsocket.socket()"
+EXPECT_EPERM = ("import errno, socket\ntry: socket.socket()\n"
+                "except OSError as e: raise SystemExit(0 if e.errno == errno.EPERM else 2)\nraise SystemExit(3)")
+rc, so, se = sbx([], pol=OFF_KILL, cmd="probe")
+check("off: probe passes with the 'seccomp filter' check", rc == 0 and "ok       seccomp filter" in so
+      and "seccomp user notification" not in so, so + se)
+rc, so, se, r = reported(py(INET), pol=OFF_KILL)
+check("off, kill: a denied call kills the program with SIGSYS (exit 159)",
+      rc == 159 and r is not None and r["exit_code"] == 159 and r["program"] == {"signaled": 31}
+      and r["denials"] is None and len(r) == 12, f"rc={rc} report={r} stderr={se[-600:]!r}")
+check("off, kill: nothing logs the denial; the log says SIGSYS and warns at setup",
+      "seccomp: denied" not in se and "killed by signal 31 (SIGSYS" in se
+      and 'warning: seccomp.notify = "off"' in se, se[-800:])
+expect("off, kill: unshare (the built-in deny-list) kills too", 159, py("import os; os.unshare(os.CLONE_NEWUSER)"),
+       pol=OFF_KILL)
+expect("off, kill: a forked child is killed with SIGSYS", 0,
+       py("import subprocess, sys\nr = subprocess.run([sys.executable, '-c', 'import socket; socket.socket()'])\n"
+          "sys.exit(0 if r.returncode == -31 else 1)"), pol=OFF_KILL)
+expect("off: AF_UNIX sockets work (argument checks)", 0, py("import socket; socket.socketpair()"), pol=OFF_KILL)
+rc, so, se = sbx(["--quiet", "--", "/bin/cat", "/proc/self/status"], pol=OFF_KILL)
+fields = dict(l.split(":\t", 1) for l in so.splitlines() if ":\t" in l)
+check("off: no_new_privs and sbx's two seccomp filters", fields.get("NoNewPrivs") == "1"
+      and fields.get("Seccomp_filters", "").strip() == str(OUTER_FILTERS + 2), f"outside: {OUTER_FILTERS} filters; {so}")
+rc, so, se, r = reported(py(EXPECT_EPERM), pol=OFF_ERRNO)
+check("off, errno: a denied call fails with EPERM; denials is null",
+      rc == 0 and r is not None and r["program"] == {"exited": 0} and r["denials"] is None
+      and "seccomp: denied" not in se, f"rc={rc} report={r} stderr={se[-600:]!r}")
+expect("off, errno: --seccomp-action kill switches to SIGSYS", 159, ["--seccomp-action", "kill", *py(INET)],
+       pol=OFF_ERRNO)
+expect("off, errno: clone3 -> ENOSYS (the prelude)", 0,
+       py("import ctypes,errno; l=ctypes.CDLL(None,use_errno=True); l.syscall(435,0,0); "
+          "assert ctypes.get_errno()==errno.ENOSYS"), pol=OFF_ERRNO)
+SENDMSG = ("import errno, socket\na, b = socket.socketpair()\ntry: a.sendmsg([b'x'])\n"
+           "except OSError as e: raise SystemExit(0 if e.errno == errno.EPERM else 2)\nraise SystemExit(3)")
+expect("off: seccomp.deny may include sendmsg", 0, py(SENDMSG), pol=policy(notify="off", deny=("sendmsg",)))
+expect("listener: seccomp.deny must not include sendmsg", 125, ["--", "/bin/true"],
+       pol=policy(deny=("sendmsg",)), log="must not include sendmsg")
+expect("off: egress mode is refused", 125, ["--", "/bin/true"],
+       pol=policy(mode="egress", families=("unix", "inet"), egress=[{"cidr": "127.0.0.1/32", "ports": [A.port]}],
+                  notify="off"), log='needs seccomp.notify = "listener"')
+expect("a policy without seccomp.notify is refused with a hint", 125, ["--", "/bin/true"],
+       pol=policy(drop="seccomp.notify"), log="new in sbx v0.6")
 
 # ---------------------------------------------------------------- memory by kind
 

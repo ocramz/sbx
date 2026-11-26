@@ -1,6 +1,6 @@
 # sbx: a seccomp + Landlock sandbox image for serverless containers
 
-`sbx` is a small (about 1.2 MB, static) Rust launcher that becomes the container's PID 1, builds a sandbox from an operator-supplied policy, and runs the untrusted program inside it. It uses unprivileged kernel APIs only (Landlock, seccomp-BPF with user notification, `no_new_privs`, rlimits): no `--privileged`, no `CAP_SYS_ADMIN`, no user namespaces.
+`sbx` is a small (about 1.2 MB, static) Rust launcher that becomes the container's PID 1, builds a sandbox from an operator-supplied policy, and runs the untrusted program inside it. It uses unprivileged kernel APIs only (Landlock, seccomp-BPF with user notification where the kernel has it, `no_new_privs`, rlimits): no `--privileged`, no `CAP_SYS_ADMIN`, no user namespaces.
 
 sbx is strict by design. Every protection the policy asks for must be enforceable on the running kernel and container, or sbx refuses to start and says why. It has no built-in defaults, no best-effort mode and no fallbacks, and every failure is logged with the operation, the object, the OS error and, where possible, a hint. Landlock can only be turned off explicitly, in the policy file ([Without Landlock](#without-landlock)).
 
@@ -11,7 +11,7 @@ sbx runs one sandbox at a time, one per container.
 | Requirement | How it is met |
 |---|---|
 | Runs on serverless platforms | Unprivileged syscalls only; static binary drops into any base image; PID 1 duties (signal forwarding, zombie reaping, SIGTERM grace period) |
-| seccomp | A prelude filter (architecture, x32, `clone3`) plus a policy filter whose matches are sent to the supervisor through a seccomp user-notification listener, so every denial is logged |
+| seccomp | A prelude filter (architecture, x32, `clone3`) plus a policy filter whose matches are sent to the supervisor through a seccomp user-notification listener, so every denial is logged; or, where there is no listener (gVisor), a policy filter whose verdict the kernel applies itself ([Without the listener](#without-the-listener)) |
 | Landlock | Path rules (read/write/execute), TCP bind/connect handling (ABI v4+), signal and abstract-socket scoping (ABI v6+), for exactly the ABI the policy pins; or explicitly off, with the compensations in [Without Landlock](#without-landlock) |
 | Fine-grained egress | `network.mode = "egress"`: every `connect()` is decided by the supervisor against CIDR and domain rules and carried out by the supervisor itself (TOCTOU-safe); a DNS proxy enforces domain rules |
 | Subprocesses inherit | Landlock domains, seccomp filters, `no_new_privs`, rlimits and the identity switch are inherited across `fork`/`execve` and cannot be removed |
@@ -29,8 +29,9 @@ container start
   sbx run [flags] -- PROGRAM ARGS        (PID 1, root, unsandboxed, never runs payload code)
    │ 0. open the log file and the report's directory; block the signals sbx handles
    │ 1. resolve policy: file + SBX_* env + flags; validate everything, report every error
-   │ 2. check requirements (Landlock ABI, seccomp listener round trip, close_range,
-   │    identity, no other sandbox; egress: CAP_SYS_PTRACE, pidfd_getfd, DNS listener,
+   │ 2. check requirements (Landlock ABI, seccomp listener round trip or, without the
+   │    listener, a filter's verdict; close_range, identity, no other sandbox; egress:
+   │    CAP_SYS_PTRACE, pidfd_getfd, DNS listener,
    │    resolv.conf; memory sampling: CAP_SYS_PTRACE, /proc access), then claim the
    │    container's sandbox slot
    │ 3. delegated cgroup: create the sandbox cgroup; open allowed paths, build the
@@ -40,9 +41,12 @@ container start
    │          → setgroups/setresgid/setresuid(65534) → clear all capabilities (verified)
    │          → PDEATHSIG → NO_NEW_PRIVS → landlock_restrict_self
    │          → seccomp(prelude) → seccomp(policy, NEW_LISTENER | WAIT_KILLABLE_RECV)
-   │          → hand the listener to the parent (SCM_RIGHTS) → close inherited fds
+   │          → hand the listener to the parent (SCM_RIGHTS)
+   │            [seccomp.notify = "off": seccomp(policy), no listener]
+   │          → close inherited fds
    │          → reset every signal disposition and the mask → execve(PROGRAM, scrubbed env)
-   └─ parent ─ notification thread: log/deny policy matches, decide connect() (egress)
+   └─ parent ─ notification thread (with the listener): log/deny policy matches,
+               decide connect() (egress)
                DNS proxy threads (egress with domain rules)
                main loop: forward SIGTERM/INT/HUP/QUIT/USR1/USR2, enforce the timeout
                (exit 124), sample memory by kind, reap, kill everything left on exit,
@@ -52,13 +56,13 @@ container start
 
 The sandbox slot is an abstract UNIX socket (`@sbx/sandbox`) that `sbx run` binds and holds until it exits. A second `sbx run` while one is running exits 125 ("another sbx sandbox is running"), and `sbx probe` reports it. Abstract sockets are per network namespace, so the slot covers the container on Cloud Run, the whole pod on Kubernetes, and the whole host with `docker run --network host`.
 
-Fallible work happens before `fork`, so a bad policy produces a clear error instead of a half-built sandbox. The signals sbx handles are blocked before it changes anything, so a SIGTERM during setup cannot leave resolv.conf or the cgroup half-changed: sbx notices it before `fork` and stops. Setup failures in the child, including `execve` being denied by Landlock, are reported back over a close-on-exec pipe. If the notification thread or the DNS proxy fails, the supervisor tears the sandbox down and exits 125. If the supervisor itself dies, the listener closes and every pending or future notified syscall fails with `ENOSYS`, so the sandbox fails closed.
+Fallible work happens before `fork`, so a bad policy produces a clear error instead of a half-built sandbox. The signals sbx handles are blocked before it changes anything, so a SIGTERM during setup cannot leave resolv.conf or the cgroup half-changed: sbx notices it before `fork` and stops. Setup failures in the child, including `execve` being denied by Landlock, are reported back over a close-on-exec pipe. If the notification thread or the DNS proxy fails, the supervisor tears the sandbox down and exits 125. If the supervisor itself dies, the listener closes and every pending or future notified syscall fails with `ENOSYS`, so the sandbox fails closed. Without the listener, the kernel applies every verdict itself, so none of them depends on the supervisor.
 
 ## The layers
 
 **Landlock (filesystem, TCP, IPC scoping).** `landlock.abi` pins the ABI whose access rights are handled: the kernel must support at least that version (sbx stops otherwise), and when the kernel is newer sbx warns that rights added after the pinned ABI are not restricted. `landlock.abi = "off"` runs without Landlock ([Without Landlock](#without-landlock)). Policy letters map to rights: `r` = read file + read dir; `w` = write, truncate, create (files, dirs, symlinks, fifos, sockets), remove, rename/link (`refer`), device ioctl, pathname-socket connect; `x` = execute. Creating device nodes is never granted. Rule paths must exist and be canonical (a symlink is an error that names its target). In `none` and `egress` modes TCP bind and connect are handled with no connect rules at all, so any connect made from inside the sandbox fails. `scope_signals` / `scope_abstract_unix` (ABI v6+) stop the sandbox from signalling, or connecting to abstract UNIX sockets of, anything outside its domain; Landlock's ptrace check also blocks reading `/proc/<supervisor>/environ` at the same uid.
 
-**seccomp (kernel attack surface).** The payload is an arbitrary program, so the filter is a deny-list of syscalls that let code escape or attack the kernel: ptrace and cross-process memory/fd access, mount and namespace syscalls, `bpf`, `perf_event_open`, `userfaultfd`, io_uring, keyrings, handle-based opens, module loading, kexec, clock setting and similar. Argument checks deny `clone` with any `CLONE_NEW*` flag, restrict `socket`/`socketpair` to `seccomp.socket_families`, block `TIOCSTI`/`TIOCLINUX` and limit `personality`. The prelude kills on a foreign architecture, returns `ENOSYS` for the x32 ABI and for `clone3` (whose flags BPF cannot see; libc falls back to `clone`). Every policy match is delivered to the supervisor, which logs it once per program, syscall and reason (repeats are summarised at exit) and then fails the call with `EPERM` (`on_violation = "errno"`) or kills the process with SIGKILL before the call runs (`"kill"`). A call that the container runtime's own seccomp profile already refuses never reaches sbx's filter (the kernel applies the most restrictive verdict), so it is denied but not logged by sbx.
+**seccomp (kernel attack surface).** The payload is an arbitrary program, so the filter is a deny-list of syscalls that let code escape or attack the kernel: ptrace and cross-process memory/fd access, mount and namespace syscalls, `bpf`, `perf_event_open`, `userfaultfd`, io_uring, keyrings, handle-based opens, module loading, kexec, clock setting and similar. Argument checks deny `clone` with any `CLONE_NEW*` flag, restrict `socket`/`socketpair` to `seccomp.socket_families`, block `TIOCSTI`/`TIOCLINUX` and limit `personality`. The prelude kills on a foreign architecture, returns `ENOSYS` for the x32 ABI and for `clone3` (whose flags BPF cannot see; libc falls back to `clone`). With `seccomp.notify = "listener"`, every policy match is delivered to the supervisor, which logs it once per program, syscall and reason (repeats are summarised at exit) and then fails the call with `EPERM` (`on_violation = "errno"`) or kills the process with SIGKILL before the call runs (`"kill"`). With `"off"`, the kernel applies the verdict itself, `EPERM` or SIGSYS, and nothing is logged ([Without the listener](#without-the-listener)). A call that the container runtime's own seccomp profile already refuses never reaches sbx's filter (the kernel applies the most restrictive verdict), so it is denied but not logged by sbx.
 
 **Process hygiene.** Started as root (the image default), sbx empties the capability bounding set, drops supplementary groups, switches to `65534:65534` and verifies that every capability set is empty. The environment is rebuilt from the policy (`env.pass` names must be set). Inherited file descriptors are closed with `close_range`. Every signal starts at its default disposition with an empty mask (sbx itself is a Rust program, which ignores SIGPIPE). Core dumps are disabled and rlimits cap open files, processes, file size, address space and CPU time (`"unlimited"` must be written explicitly).
 
@@ -100,6 +104,27 @@ sbx: error: required capability missing: identity: landlock.abi = "off" needs sb
 ```
 
 The image's default (`USER 0`) is fine. sbx starts as root and runs the program as 65534. A different uid with no capabilities cannot open root's `/proc/<pid>/environ` or `mem`, or signal it.
+
+## Without the listener
+
+Some sandboxes have no seccomp user notification: gVisor refuses `SECCOMP_FILTER_FLAG_NEW_LISTENER` with `EINVAL` (measured on Modal's gVisor, `4.19.0-gvisor`, in November 2026), while plain seccomp filters work there, their verdicts, stacking and inheritance across `fork` and `execve` included. sbx never falls back on its own: the policy has to say `seccomp.notify = "off"` (`"listener"` is what v0.5 did). [`policy/gvisor.example.toml`](policy/gvisor.example.toml) is a policy for gVisor. The policy filter then returns `on_violation`'s verdict itself, and the kernel applies it:
+
+| Without the listener | What sbx does |
+|---|---|
+| **Denials are not seen.** With the listener, every match reaches the supervisor, which logs the syscall and its reason and counts it in the report. | Nothing can replace this. The report's `denials` is `null` (unknown, not none), and sbx warns at setup. With `on_violation = "errno"` the call fails with `EPERM` and the program may go on, so a denial is invisible. With `"kill"` the kernel kills the whole process with SIGSYS before the call runs: a denial by the program's own process shows as `"program": {"signaled": 31}` and exit code 159 (sbx's log says so), without the syscall's name; a descendant's shows only to its parent. So take `"kill"`. |
+| Egress mode: the supervisor decides each `connect()` through the listener | `network.mode = "egress"` is refused. |
+| `on_violation = "kill"` | SIGSYS from the kernel instead of SIGKILL from the supervisor: exit 159, not 137. |
+| `sendmsg` is reserved, to hand the listener over | `seccomp.deny` may include `sendmsg`. `execve` stays reserved. |
+
+Everything else is unchanged: the deny-list and argument checks, `socket_families`, the prelude, `no_new_privs`, the empty capability sets, the uid switch, rlimits, the scrubbed environment, closed file descriptors and the timeout. `sbx probe` runs the check `seccomp filter` instead of `seccomp user notification`: in a forked child, the prelude and a one-rule filter, and the kernel's verdict on a match.
+
+Under gVisor, also:
+
+* `landlock.abi = "off"`, since gVisor has no Landlock, with the conditions in [Without Landlock](#without-landlock); and `cgroup.mode = "off"`, since its `/sys/fs/cgroup` is a read-only tmpfs of v1 hierarchies.
+* Memory sampling (`[measure]`) needs `CAP_SYS_PTRACE`, which a Modal sandbox's own command lacks under gVisor (its bounding set is `a80405fb`, an `exec`'d process's `a80c05fb`), so a job run that way cannot sample memory.
+* Within the sandbox, gVisor is the kernel the program attacks, which narrows what a syscall that sbx's filter misses could reach.
+
+`make gvisor` checks this on Modal. It builds a static linux/amd64 sbx, and [`tests/modal_gvisor.py`](tests/modal_gvisor.py), a [uv](https://docs.astral.sh/uv/) script, uploads it with the shipped policies and runs [`tests/gvisor.py`](tests/gvisor.py) as a sandbox's own command under gVisor, streaming its output. The suite prints the platform's facts (kernel, capabilities, both probes) and checks that the gVisor example's probe passes, that a denied call kills with SIGSYS or fails with `EPERM`, in a forked child too, that AF_UNIX sockets and `clone3`'s `ENOSYS` are as before, and that the report's `denials` is `null`. It needs uv and Modal's credentials: `~/.modal.toml` (`modal token new`), or `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`. `uv run tests/modal_gvisor.py --runtime vm target/modal/sbx` runs the same suite in a Modal VM, as a control.
 
 ## Egress filtering
 
@@ -148,7 +173,7 @@ Egress mode needs `CAP_SYS_PTRACE` in the container (`docker run --cap-add=SYS_P
 | `timed_out` | the wall-clock limit killed the sandbox (exit 124) |
 | `setup_error` | `{"stage", "messages"}` when the program never started. Stages, in order: `policy`, `report`, `log`, `series`, `env`, `program`, `capabilities`, `slot`, `stdio`, `dns`, `cgroup`, `landlock`, `seccomp`, `launch`; then in the child `cgroup`, `setsid`, `chdir`, `setrlimit`, `identity`, `pdeathsig`, `no_new_privs`, `landlock`, `seccomp`, `close_range`, `signals`, `execve` (exit 127); then `listener` and `services` back in the supervisor |
 | `supervisor_error` | why sbx tore a running sandbox down (exit 125), e.g. a failed notification thread or log file |
-| `denials` | syscalls sbx's policy filter denied, per name (egress denials count as `connect`). Not counted: the prelude's `ENOSYS` (`clone3`, x32), Landlock's refusals, calls the container runtime's own seccomp profile refuses, and DNS names the proxy refuses |
+| `denials` | syscalls sbx's policy filter denied, per name (egress denials count as `connect`). Not counted: the prelude's `ENOSYS` (`clone3`, x32), Landlock's refusals, calls the container runtime's own seccomp profile refuses, and DNS names the proxy refuses. `null` with `seccomp.notify = "off"`, where nothing sees the denials: unknown, not none ([Without the listener](#without-the-listener)) |
 | `killed_after_exit` | processes still running when the program exited, which sbx then killed; `null` when sbx had already killed the tree (timeout, a second SIGTERM or the grace period, a fatal error) |
 | `wall_ms` | from `execve` until the program's process was reaped |
 | `rusage` | CPU time of every process sbx reaped, each including the descendants it waited for itself, and the largest resident set of any single process. Children of a process that ignores SIGCHLD are reaped by the kernel and not counted |
@@ -272,7 +297,7 @@ Where a delegated cgroup comes from:
 
 ## Configuration
 
-The policy file is required (`--policy` or `SBX_POLICY_FILE`; the image sets `SBX_POLICY_FILE=/etc/sbx/policy.toml`). Every field must be present and unknown fields are rejected. **Upgrading from v0.4:** add `[measure.series]` with `mode = "off"` to keep v0.4's behaviour; sbx v0.5 refuses a policy without it and says so. **From v0.3,** also add `[measure]` with `memory_sample_ms = 0` and `tmpfs = []`. **From v0.2,** also add `[cgroup]` with `mode = "off"`. [`policy/default.toml`](policy/default.toml) is the shipped policy (no network). [`policy/egress.example.toml`](policy/egress.example.toml) shows egress rules and the DNS proxy, and [`policy/no-landlock.example.toml`](policy/no-landlock.example.toml) is the same for kernels without Landlock. All three are validated against the image during the build. Environment variables and flags then extend the policy (path grants and egress rules are added) or replace a few scalars (flags win over the environment):
+The policy file is required (`--policy` or `SBX_POLICY_FILE`; the image sets `SBX_POLICY_FILE=/etc/sbx/policy.toml`). Every field must be present and unknown fields are rejected. **Upgrading from v0.5:** add `notify = "listener"` to `[seccomp]` to keep v0.5's behaviour; sbx v0.6 refuses a policy without it and says so. **From v0.4,** also add `[measure.series]` with `mode = "off"`. **From v0.3,** also add `[measure]` with `memory_sample_ms = 0` and `tmpfs = []`. **From v0.2,** also add `[cgroup]` with `mode = "off"`. [`policy/default.toml`](policy/default.toml) is the shipped policy (no network). [`policy/egress.example.toml`](policy/egress.example.toml) shows egress rules and the DNS proxy, [`policy/no-landlock.example.toml`](policy/no-landlock.example.toml) is the same for kernels without Landlock, and [`policy/gvisor.example.toml`](policy/gvisor.example.toml) is for gVisor ([Without the listener](#without-the-listener)). All four are validated against the image during the build. Environment variables and flags then extend the policy (path grants and egress rules are added) or replace a few scalars (flags win over the environment):
 
 | Flag | Env var | Meaning |
 |---|---|---|
@@ -299,7 +324,8 @@ Exit codes: the program's own, 124 on timeout, 125 for sbx errors (bad policy, m
 ### Kernel and container requirements
 
 * Landlock ABI ≥ `landlock.abi` (the default policy pins 6: Linux 6.12). `none` and `egress` modes need ABI 4+ (Linux 6.7). With `landlock.abi = "off"`, no Landlock at all ([Without Landlock](#without-landlock)).
-* seccomp user notification with `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` (Linux 5.19), and no other seccomp listener already installed in the container (`sbx probe` runs a full round trip), plus `close_range` (5.9) and `pidfd_open`/`pidfd_getfd` (5.6).
+* With `seccomp.notify = "listener"`: seccomp user notification with `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` (Linux 5.19), and no other seccomp listener already installed in the container (`sbx probe` runs a full round trip). With `"off"`: seccomp filters with `SECCOMP_RET_KILL_PROCESS` (Linux 4.14), which gVisor has ([Without the listener](#without-the-listener)).
+* `close_range` (5.9) and `pidfd_open`/`pidfd_getfd` (5.6).
 * Root with `CAP_SETPCAP` (for the bounding set) and `CAP_SETUID`/`CAP_SETGID`, which Docker grants by default. A non-root sbx runs the program at its own uid, which must equal the policy's, with no supplementary groups; the sandbox is then separated from the supervisor by Landlock scoping only, so use ABI 6+. With `landlock.abi = "off"`, non-root is refused ([Without Landlock](#without-landlock)).
 * Egress: Linux 6.9+ (`PIDFD_THREAD`), `CAP_SYS_PTRACE`, Yama `ptrace_scope` < 3, and port 53 on the loopback listen address.
 * `cgroup.mode = "delegated"`: Linux 5.19+ (`memory.peak`, `cgroup.kill`), root, and a delegated cgroup v2 ([cgroup limits](#cgroup-limits)).
@@ -316,10 +342,11 @@ make probe            # sbx probe in the runtime image
 make push             # push the runtime image as ghcr.io/ocramz/sbx:<git sha>-<arch>
 make manifest PUSH_TAGS="main"   # podman: join ARCHS' pushed images into :<git sha> and :main
 make live             # live tests on a Cloud Run service and jobs (see below)
+make gvisor           # checks under gVisor in a Modal sandbox (uv, Modal credentials)
 make help             # everything else
 ```
 
-The Rust version comes from `rust-toolchain.toml`. `sbx version` comes from `SBX_VERSION`, which the Makefile sets to `git describe --tags --always --dirty` and passes to cargo and to the image build (a build without it reports `unknown`). Images are built for the host's architecture (`linux/amd64` or `linux/arm64`); pass `PLATFORM=` to override, though the integration suite cannot run under emulation, so CI builds and tests each architecture on a runner of its own. The build stage runs on the build machine's own architecture and cross-compiles a static musl binary on `rust:<version>-slim-bookworm`, linked with `rust-lld`, so an amd64 image can be built on an arm64 Mac (x86_64 rustc crashes under QEMU); the build fails if the binary is not static. The integration suite ([`tests/smoke.py`](tests/smoke.py)) runs in a test image (the runtime stage on `python:3.13-slim-bookworm`) with `--cap-add SYS_PTRACE`. It covers escape attempts that only Landlock or seccomp can stop, strictness errors, egress allow/deny decisions, DNS learning and refusals, one sandbox per container, the Landlock-off mode, and two race tests: one flips the sockaddr from another thread during `connect`, the other swaps an AF_UNIX and a TCP socket under the same fd number. Both assert that the denied server never sees a connection. The suite also checks the report and the log file, and, in a container with a writable cgroup2 (`--systemd=always`, `TEST_REQUIRE_CGROUP=true`), the delegated cgroup: OOM kills, `pids.max`, refusals, and that sbx leaves its cgroup as it found it. With Docker, run `make smoke DOCKER=docker SMOKE_CGROUP=false`; the suite then checks that sbx refuses the delegated mode, as it does under `make smoke-local`. [`tests/image-checks.sh`](tests/image-checks.sh) then exercises the runtime image as shipped (PID 1, signal forwarding, cleanup of leftover processes, the version, the report and log as PID 1, and the refusal of the delegated mode on a read-only cgroupfs).
+The Rust version comes from `rust-toolchain.toml`. `sbx version` comes from `SBX_VERSION`, which the Makefile sets to `git describe --tags --always --dirty` and passes to cargo and to the image build (a build without it reports `unknown`). Images are built for the host's architecture (`linux/amd64` or `linux/arm64`); pass `PLATFORM=` to override, though the integration suite cannot run under emulation, so CI builds and tests each architecture on a runner of its own. The build stage runs on the build machine's own architecture and cross-compiles a static musl binary on `rust:<version>-slim-bookworm`, linked with `rust-lld`, so an amd64 image can be built on an arm64 Mac (x86_64 rustc crashes under QEMU); the build fails if the binary is not static. The integration suite ([`tests/smoke.py`](tests/smoke.py)) runs in a test image (the runtime stage on `python:3.13-slim-bookworm`) with `--cap-add SYS_PTRACE`. It covers escape attempts that only Landlock or seccomp can stop, strictness errors, egress allow/deny decisions, DNS learning and refusals, one sandbox per container, the Landlock-off mode, the policy filter without the listener (SIGSYS, `EPERM`, `denials: null`, the refusals), and two race tests: one flips the sockaddr from another thread during `connect`, the other swaps an AF_UNIX and a TCP socket under the same fd number. Both assert that the denied server never sees a connection. The suite also checks the report and the log file, and, in a container with a writable cgroup2 (`--systemd=always`, `TEST_REQUIRE_CGROUP=true`), the delegated cgroup: OOM kills, `pids.max`, refusals, and that sbx leaves its cgroup as it found it. With Docker, run `make smoke DOCKER=docker SMOKE_CGROUP=false`; the suite then checks that sbx refuses the delegated mode, as it does under `make smoke-local`. [`tests/image-checks.sh`](tests/image-checks.sh) then exercises the runtime image as shipped (PID 1, signal forwarding, cleanup of leftover processes, the version, the report and log as PID 1, the refusal of the delegated mode on a read-only cgroupfs, and the gVisor example's probe).
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `make lint`, `make test` and `make smoke` on every push and pull request, on an amd64 and an arm64 runner. For pushes to `main` and tags `v*`, each runner pushes its tested image as `ghcr.io/ocramz/sbx:<sha>-amd64` or `:<sha>-arm64`, and `make manifest` joins the two into the multi-arch `:<sha>` and `:main`, or `:<tag>` and `:latest`. `:v0.3` and earlier are amd64 only.
 
@@ -438,6 +465,7 @@ rust-toolchain.toml              the Rust version, for cargo, CI and the image b
 policy/default.toml              shipped policy (no network)
 policy/egress.example.toml       egress rules + DNS proxy example
 policy/no-landlock.example.toml  the egress example with landlock.abi = "off"
+policy/gvisor.example.toml       for gVisor: no Landlock, no seccomp listener, no network
 src/main.rs                      CLI: run / probe / policy / version, environment, program lookup, report
 src/policy.rs                    policy model, overrides, validation
 src/report.rs                    setup stages, the run's outcome, the JSON report
@@ -447,7 +475,7 @@ src/series/codec.rs              the series' columns in memory: deltas, zigzag a
 src/destination.rs               safe paths for the report, the series and the log file, atomic writes
 src/cgroup.rs                    delegated cgroup: setup, limits, counters, teardown
 src/landlock_layer.rs            Landlock probe, ruleset, enforcement
-src/seccomp_layer.rs             rule table, BPF prelude and policy filter, evaluator
+src/seccomp_layer.rs             rule table, BPF prelude and policy filter (with or without the listener), evaluator
 src/notify.rs                    seccomp user notification: listener, dispatcher, denials
 src/egress.rs                    connect() decisions and emulation
 src/dns.rs                       DNS proxy, wire format, resolv.conf
@@ -462,4 +490,6 @@ tests/cloud-run.sh               live tests: build, push, deploy a Cloud Run ser
 tests/live.py                    Cloud Run platform facts and checks (run on the service and a job)
 tests/live_net.py                egress cases on the real network (run by live.py, and by a job with sbx as PID 1)
 tests/live_server.py             HTTP front that runs the suites on the service
+tests/gvisor.py                  checks under gVisor, as a Modal sandbox's own command (seccomp.notify = "off")
+tests/modal_gvisor.py            uv script: runs tests/gvisor.py in a Modal sandbox (make gvisor)
 ```

@@ -212,8 +212,9 @@ pub struct Ran {
     pub program: Option<Program>,
     pub timed_out: bool,
     pub supervisor_error: Option<String>,
-    /// Syscalls the policy filter denied, per name.
-    pub denials: Vec<(String, u64)>,
+    /// Syscalls the policy filter denied, per name. None with
+    /// seccomp.notify = "off": nothing saw them, so unknown, not none.
+    pub denials: Option<Vec<(String, u64)>>,
     /// Processes still running when the program exited, which sbx then
     /// killed; None when sbx had already killed the tree (timeout, signals,
     /// fatal error).
@@ -252,7 +253,8 @@ impl Outcome {
             timed_out: false,
             setup_error: None,
             supervisor_error: None,
-            denials: vec![],
+            // Nothing ran, so nothing was denied.
+            denials: Some(vec![]),
             killed_after_exit: None,
             wall_ms: None,
             rusage: None,
@@ -270,11 +272,11 @@ impl Outcome {
                 r.program = ran.program;
                 r.timed_out = ran.timed_out;
                 r.supervisor_error = ran.supervisor_error.as_deref();
-                r.denials = ran
-                    .denials
-                    .iter()
-                    .map(|(syscall, count)| JsonDenial { syscall, count: *count })
-                    .collect();
+                r.denials = ran.denials.as_ref().map(|d| {
+                    d.iter()
+                        .map(|(syscall, count)| JsonDenial { syscall, count: *count })
+                        .collect()
+                });
                 r.killed_after_exit = ran.killed_after_exit;
                 r.wall_ms = Some(ran.wall_ms);
                 r.rusage = Some(JsonUsage {
@@ -336,7 +338,7 @@ struct Json<'a> {
     timed_out: bool,
     setup_error: Option<JsonSetupError<'a>>,
     supervisor_error: Option<&'a str>,
-    denials: Vec<JsonDenial<'a>>,
+    denials: Option<Vec<JsonDenial<'a>>>,
     killed_after_exit: Option<u32>,
     wall_ms: Option<u64>,
     rusage: Option<JsonUsage>,
@@ -450,13 +452,18 @@ mod tests {
         assert_eq!(v["exit_code"], 127);
         assert_eq!(v["setup_error"]["stage"], "execve");
         assert!(v["program"].is_null() && v["wall_ms"].is_null() && v["cgroup"].is_null() && v["memory"].is_null());
+        assert_eq!(
+            v["denials"],
+            serde_json::json!([]),
+            "nothing ran, so nothing was denied"
+        );
 
-        let ran = Outcome::Ran(Box::new(Ran {
+        let ran = |denials: Option<Vec<(String, u64)>>| Ran {
             exit_code: 137,
             program: Some(Program::Signaled(9)),
             timed_out: false,
             supervisor_error: None,
-            denials: vec![("ptrace".into(), 2)],
+            denials,
             killed_after_exit: Some(1),
             wall_ms: 5,
             usage: Usage {
@@ -467,13 +474,21 @@ mod tests {
             cgroup: None,
             memory: None,
             series: None,
-        }));
-        let v: serde_json::Value = serde_json::from_slice(&ran.to_json("v0.4").unwrap()).unwrap();
+        };
+        let json = |r: Ran| -> serde_json::Value {
+            serde_json::from_slice(&Outcome::Ran(Box::new(r)).to_json("v0.4").unwrap()).unwrap()
+        };
+        let v = json(ran(Some(vec![("ptrace".into(), 2)])));
         assert_eq!(v["program"]["signaled"], 9);
         assert_eq!(v["denials"][0]["syscall"], "ptrace");
         assert_eq!(v["rusage"]["user_ms"], 2);
         assert!(v["setup_error"].is_null());
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(keys.len(), 12, "{keys:?}");
+
+        // seccomp.notify = "off": the key stays, as null.
+        let v = json(ran(None));
+        assert!(v["denials"].is_null(), "{v}");
+        assert_eq!(v.as_object().unwrap().len(), 12);
     }
 }
