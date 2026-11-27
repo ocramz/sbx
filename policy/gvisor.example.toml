@@ -74,6 +74,12 @@ egress = []
 [seccomp]
 notify = "off"             # gVisor has no seccomp user notification
 on_violation = "kill"      # SIGSYS: a denial at least shows, as the program's signal
+# gVisor has no /proc/sysvipc, so nothing outside the program can list or
+# remove a SysV IPC object it leaves behind. Where a later run must not find
+# one, deny the calls that create them (a call then kills the process; POSIX
+# shared memory in /dev/shm stays allowed), and "mq_open" too where
+# /dev/mqueue is not mounted, as in a Modal sandbox:
+# deny = ["msgget", "mq_open", "semget", "shmget"]
 deny = []                  # e.g. ["memfd_create", "execveat"]; "sendmsg" is allowed here too
 allow = []
 socket_families = ["unix"]

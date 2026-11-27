@@ -992,6 +992,22 @@ expect("off: egress mode is refused", 125, ["--", "/bin/true"],
 expect("a policy without seccomp.notify is refused with a hint", 125, ["--", "/bin/true"],
        pol=policy(drop="seccomp.notify"), log="new in sbx v0.6")
 
+# ---------------------------------------------------------------- SysV IPC and POSIX queues in seccomp.deny
+
+print("== SysV IPC and POSIX message queues in seccomp.deny")
+IPC = ("msgget", "mq_open", "semget", "shmget")
+# shmget(IPC_PRIVATE, 4096, 0600): exit 0 if it works (and remove the segment), 1 on EPERM.
+SHMGET = ("import ctypes, errno\nl = ctypes.CDLL(None, use_errno=True)\nid = l.shmget(0, 4096, 0o600)\n"
+          "if id >= 0: l.shmctl(id, 0, None); raise SystemExit(0)\n"
+          "raise SystemExit(1 if ctypes.get_errno() == errno.EPERM else 2)")
+expect("ipc: shmget works when it is not denied", 0, py(SHMGET))
+check_report("ipc: listener, errno: a denied shmget fails with EPERM and is counted", py(SHMGET),
+             lambda r: r["program"] == {"exited": 1} and {"syscall": "shmget", "count": 1} in r["denials"],
+             pol=policy(deny=IPC))
+check_report("ipc: off, kill: a denied shmget kills the program with SIGSYS; denials is null", py(SHMGET),
+             lambda r: r["exit_code"] == 159 and r["program"] == {"signaled": 31} and r["denials"] is None,
+             pol=policy(notify="off", on_violation="kill", deny=IPC))
+
 # ---------------------------------------------------------------- memory by kind
 
 print("== memory by kind")

@@ -2165,6 +2165,17 @@ answer_scopes = ["global"]
     }
 
     #[test]
+    fn seccomp_deny_accepts_the_ipc_calls() {
+        let src = MINIMAL.replacen("deny = []", r#"deny = ["msgget", "mq_open", "semget", "shmget"]"#, 1);
+        assert_eq!(parse(&src).unwrap().validate().unwrap(), Vec::<String>::new());
+        let w = parse(&without_listener(&src, "kill")).unwrap().validate().unwrap();
+        assert!(
+            w.len() == 1 && w[0].contains("seccomp.notify = \"off\""),
+            "only the warning that denials are not seen: {w:?}"
+        );
+    }
+
+    #[test]
     fn egress_needs_the_listener() {
         let src = egress_policy(r#"{ cidr = "10.0.0.0/8", ports = [5432] }"#, "");
         parse(&src).unwrap().validate().unwrap();

@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.6.1
+
+### Added
+
+- **`seccomp.deny` may name `shmget`, `semget`, `msgget` and `mq_open`** (#20). These calls create SysV IPC objects and POSIX message queues, which outlive the program. Deny them where the runtime can neither list nor remove those objects between runs: gVisor has no `/proc/sysvipc`. They are not denied by default. A denial counts in the report under the call's name with the listener, and kills with SIGSYS under `notify = "off"`, `on_violation = "kill"`. `policy/gvisor.example.toml` shows the line, commented out. See the README, [Without the listener](README.md#without-the-listener).
+NB this is a backward-compatible change.
+
 ## v0.6
 
 **Breaking:** every policy now needs `seccomp.notify`. To keep v0.5's behaviour, add:

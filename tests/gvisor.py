@@ -10,7 +10,8 @@ way a wrapper runs sbx there), or e.g. under docker run --runtime=runsc.
 
 It prints the platform facts, then checks that sbx enforces the policy
 filter without a listener: a denied call kills the process with SIGSYS (or
-fails with EPERM), and the report's denials is null. It creates /workspace
+fails with EPERM), and the report's denials is null. That includes shmget,
+once seccomp.deny names the SysV IPC calls and mq_open. It creates /workspace
 (the policy's workdir) if missing and writes reports under /var/lib. Exit
 code 1 if a check fails, 2 if the environment is wrong.
 """
@@ -85,6 +86,7 @@ LISTENER = variant("listener", ('notify = "off"', 'notify = "listener"'))
 ERRNO = variant("errno", ('on_violation = "kill"', 'on_violation = "errno"'))
 NO_SENDMSG = variant("no-sendmsg", ('on_violation = "kill"', 'on_violation = "errno"'),
                      ("deny = []", 'deny = ["sendmsg"]'))
+NO_IPC = variant("no-ipc", ("deny = []", 'deny = ["msgget", "mq_open", "semget", "shmget"]'))
 
 
 def sbx(args, pol=POLICY, cmd="run"):
@@ -110,6 +112,14 @@ def status_fields(text):
     return {k: v.strip() for k, v in (l.split(":", 1) for l in text.splitlines() if ":" in l)}
 
 
+def mounted(path):
+    try:
+        with open("/proc/mounts") as f:
+            return "yes" if any(l.split()[1:2] == [path] for l in f) else "no"
+    except OSError as e:
+        return f"? ({e.strerror})"
+
+
 def show(text):
     for line in text.splitlines():
         print(f"       {line}")
@@ -126,6 +136,8 @@ print(f"  this process    uid {os.getuid()}, Seccomp {me.get('Seccomp', '?')}, "
       f"{me.get('Seccomp_filters', '?')} filters, NoNewPrivs {me.get('NoNewPrivs', '?')}")
 print(f"  capabilities    CapBnd {me.get('CapBnd', '?')}, CapEff {me.get('CapEff', '?')}")
 print(f"  sbx             {subprocess.run([SBX, 'version'], capture_output=True, text=True).stdout.strip()}")
+print(f"  SysV IPC        /proc/sysvipc {'present' if os.path.isdir('/proc/sysvipc') else 'absent'}; "
+      f"/dev/mqueue mounted: {mounted('/dev/mqueue')}")
 
 print("== probe")
 rc, so, se, _ = sbx([], cmd="probe")
@@ -176,6 +188,16 @@ rc, so, se, r = sbx(py("import subprocess, sys\n"
 check("a forked child inherits the filter and is killed with SIGSYS", rc == 0, f"rc={rc} stderr={se[-600:]!r}")
 rc, so, se, r = sbx(py("import socket; socket.socketpair()"))
 check("AF_UNIX sockets work (the argument check lets them through)", rc == 0, f"rc={rc} stderr={se[-600:]!r}")
+# shmget(IPC_PRIVATE, 4096, 0600): exit 0 if it works (and remove the segment), 1 on EPERM.
+SHMGET = ("import ctypes, errno\nl = ctypes.CDLL(None, use_errno=True)\nid = l.shmget(0, 4096, 0o600)\n"
+          "if id >= 0: l.shmctl(id, 0, None); raise SystemExit(0)\n"
+          "raise SystemExit(1 if ctypes.get_errno() == errno.EPERM else 2)")
+rc, so, se, r = sbx(py(SHMGET))
+check("shmget works when it is not denied", rc == 0, f"rc={rc} stderr={se[-600:]!r}")
+rc, so, se, r = sbx(py(SHMGET), pol=NO_IPC)
+check("with the SysV calls and mq_open in seccomp.deny, shmget kills with SIGSYS; denials is null",
+      rc == 159 and r is not None and r["program"] == {"signaled": 31} and r["denials"] is None,
+      f"rc={rc} report={r} stderr={se[-600:]!r}")
 
 print("== denials, on_violation = \"errno\"")
 EPERM = ("import errno, socket\ntry: socket.socket()\n"

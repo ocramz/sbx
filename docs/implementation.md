@@ -420,3 +420,29 @@ Plan: [plans/v0.6-gvisor.md](plans/v0.6-gvisor.md).
   - `OnMatch::ret()` was dropped: `compile` maps to seccompiler's actions, and the tests use literals.
   - `make gvisor` creates the container without `--platform`. podman records the image as `linux/amd64/v8` (the arm64 build machine's variant), which a `--platform linux/amd64` lookup misses. The script's ELF check covers the architecture.
 - **Not verified here:** the amd64 CI runner; `docker run --runtime=runsc`, which `tests/gvisor.py` supports but no make target runs.
+
+## 2026-11-27: v0.6.1, SysV IPC and POSIX message queues in `seccomp.deny` (issue #20)
+
+Plan: [plans/v0.6.1-sysv-ipc.md](plans/v0.6.1-sysv-ipc.md).
+
+- **Filter (`src/seccomp_layer.rs`):** `SYS_shmget`, `SYS_semget`, `SYS_msgget` and `SYS_mq_open` joined `EXTRA_NAMES`, the list for both architectures. `lookup`, `syscall_name` and `build_table` read it already, so nothing else changed: a denial under the listener is logged and counted as `shmget` etc. They are not defaults.
+- **Policies:** `policy/gvisor.example.toml` has a commented `deny = ["msgget", "mq_open", "semget", "shmget"]`, with the reason.
+- **Version:** 0.6.1 (`Cargo.toml`, `Cargo.lock`).
+- **Tests:**
+  - property `denying_the_ipc_calls_changes_only_their_verdict`: for random policies (as in `any_policy()`), the filter compiled with the four added to `seccomp.deny` returns the policy's match verdict for each of their numbers with random arguments, under either `notify` and `on_violation`, and the same verdict as the filter without them on every other call from `any_calls()`.
+  - the four joined `samples()`, so the existing property runs them too.
+  - `names`: `lookup`, `is_default_denied` and `syscall_name` for each.
+  - policy: `seccomp_deny_accepts_the_ipc_calls`, with the listener (no warnings) and with `notify = "off"` (only its warning).
+  - smoke: a section "SysV IPC and POSIX message queues in seccomp.deny" with 3 checks. `shmget(IPC_PRIVATE, 4096, 0600)` through ctypes works under the base policy. With the four denied, it fails with `EPERM` and is counted in `denials` under the listener, and it kills with SIGSYS (159, `{"signaled": 31}`, `denials: null`) under off and kill.
+  - `tests/gvisor.py`: the same call works under the example and kills with SIGSYS with the four denied (2 checks), and the platform facts say whether `/proc/sysvipc` exists and whether `/dev/mqueue` is mounted.
+- **Verified** (arm64 Mac, podman machine, kernel 6.12.7):
+  - `cargo fmt --check`
+  - clippy `-D warnings` natively and for `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`, in `rust:1.97.0-slim-bookworm`
+  - 112 unit tests pass
+  - `make smoke` (delegated cgroup): 199 + 14 passed
+  - `tests/gvisor.py` in the test image on runc: 15 passed (`/proc/sysvipc` present, `/dev/mqueue` mounted)
+  - **Modal, gVisor** (`4.19.0-gvisor`, x86_64), with `make gvisor`: 16 passed. `/proc/sysvipc` is absent and `/dev/mqueue` is not mounted, so under gVisor on Modal `mq_open` belongs in the denial too, as #20 anticipated.
+- **Deviations from the plan:**
+  - The example's commented line and the README name `mq_open` as well, after the Modal run showed `/dev/mqueue` unmounted there; #20 proposed `["msgget", "semget", "shmget"]` pending that fact.
+  - `tests/gvisor.py` is not in the test image; on runc it ran from stdin (`python3 -`).
+- **Not verified here:** the amd64 CI runner.

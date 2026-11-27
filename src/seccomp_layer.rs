@@ -92,6 +92,8 @@ const EXTRA_NAMES: &[(&str, i64)] = syscalls![
     SYS_sched_setaffinity, SYS_setpriority, SYS_mknodat, SYS_symlinkat, SYS_linkat,
     SYS_mbind, SYS_migrate_pages, SYS_move_pages, SYS_set_mempolicy, SYS_personality,
     SYS_ioctl, SYS_pidfd_open, SYS_pidfd_send_signal, SYS_landlock_create_ruleset,
+    // SysV IPC objects and POSIX message queues outlive the process that makes them.
+    SYS_shmget, SYS_semget, SYS_msgget, SYS_mq_open,
 ];
 #[cfg(target_arch = "x86_64")]
 const EXTRA_NAMES_ARCH: &[(&str, i64)] = syscalls![SYS_fork, SYS_vfork, SYS_open, SYS_mknod];
@@ -791,6 +793,10 @@ pub mod tests {
             libc::SYS_memfd_create,
             libc::SYS_unshare,
             libc::SYS_execve,
+            libc::SYS_shmget,
+            libc::SYS_semget,
+            libc::SYS_msgget,
+            libc::SYS_mq_open,
         ] {
             v.push((nr, [0; 6]));
         }
@@ -867,7 +873,53 @@ pub mod tests {
         prop::collection::vec(call, 1..64)
     }
 
+    /// The calls that create SysV IPC objects and POSIX message queues.
+    const IPC: [(&str, i64); 4] = [
+        ("shmget", libc::SYS_shmget),
+        ("semget", libc::SYS_semget),
+        ("msgget", libc::SYS_msgget),
+        ("mq_open", libc::SYS_mq_open),
+    ];
+
+    fn compiled(p: &Policy) -> BpfProgram {
+        compile(&build_table(p).unwrap(), OnMatch::of(&p.seccomp)).unwrap()
+    }
+
+    /// Calls of the IPC syscalls, with any arguments.
+    fn ipc_calls() -> impl Strategy<Value = Vec<(i64, [u64; 6])>> {
+        let nrs = prop::sample::select(IPC.map(|(_, nr)| nr).to_vec());
+        prop::collection::vec((nrs, any::<[u64; 6]>()), 1..16)
+    }
+
     proptest! {
+        #[test]
+        fn denying_the_ipc_calls_changes_only_their_verdict(
+            p in any_policy(),
+            ipc in ipc_calls(),
+            calls in any_calls(),
+        ) {
+            let mut p = p;
+            p.seccomp.deny.retain(|n| IPC.iter().all(|(name, _)| n != name));
+            let before = compiled(&p);
+            p.seccomp.deny.extend(IPC.iter().map(|(name, _)| name.to_string()));
+            let after = compiled(&p);
+            let verdict = match_verdict(&p.seccomp);
+            for (nr, args) in ipc {
+                prop_assert_eq!(
+                    run_bpf(&after, nr, AUDIT_ARCH, &args), verdict,
+                    "{} args {:x?}", syscall_name(nr), args
+                );
+            }
+            for (nr, args) in calls.into_iter().filter(|(nr, _)| IPC.iter().all(|(_, n)| n != nr)) {
+                prop_assert_eq!(
+                    run_bpf(&after, nr, AUDIT_ARCH, &args),
+                    run_bpf(&before, nr, AUDIT_ARCH, &args),
+                    "{} args {:x?}", syscall_name(nr), args
+                );
+            }
+        }
+
+
         #[test]
         fn the_policy_filter_returns_its_verdict_exactly_when_a_rule_matches(p in any_policy(), calls in any_calls()) {
             let t = build_table(&p).unwrap();
@@ -1018,5 +1070,10 @@ pub mod tests {
         assert!(!is_default_denied("memfd_create"));
         assert_eq!(syscall_name(libc::SYS_setsockopt), "setsockopt");
         assert_eq!(syscall_name(libc::SYS_connect), "connect");
+        for (name, nr) in IPC {
+            assert_eq!(lookup(name), Some(nr), "{name}");
+            assert!(!is_default_denied(name), "{name} is not a default denial");
+            assert_eq!(syscall_name(nr), name);
+        }
     }
 }
