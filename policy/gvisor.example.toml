@@ -1,5 +1,5 @@
 # Example policy for gVisor (runsc, Modal sandboxes): no Landlock, no seccomp
-# user notification, no cgroup of its own, no network. See the README,
+# user notification, no cgroup of its own, no network. See docs/platforms.md,
 # "Without the listener" and "Without Landlock", for what this gives up. In
 # short:
 #
@@ -52,11 +52,11 @@ cpu_secs = "unlimited"
 mode = "off"               # gVisor offers no delegated cgroup v2
 
 [measure]
-memory_sample_ms = 0       # or e.g. 20 with CAP_SYS_PTRACE (README, "Memory by kind")
+memory_sample_ms = 0       # or e.g. 20 with CAP_SYS_PTRACE (docs/report.md, "Memory by kind")
 tmpfs = []                 # tmpfs mounts whose use is recorded, with sampling on
 
 [measure.series]
-mode = "off"               # or "on" with max_samples, max_processes and compression, for --series FILE (README, "Time series")
+mode = "off"               # or "on" with max_samples, max_processes and compression, for --series FILE (docs/report.md, "Time series")
 
 [env]
 pass = []

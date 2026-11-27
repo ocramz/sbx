@@ -446,3 +446,17 @@ Plan: [plans/v0.6.1-sysv-ipc.md](plans/v0.6.1-sysv-ipc.md).
   - The example's commented line and the README name `mq_open` as well, after the Modal run showed `/dev/mqueue` unmounted there; #20 proposed `["msgget", "semget", "shmget"]` pending that fact.
   - `tests/gvisor.py` is not in the test image; on runc it ran from stdin (`python3 -`).
 - **Not verified here:** the amd64 CI runner.
+
+## 2026-11-27: the README split into an introduction and topic docs
+
+Plan: [plans/readme-split.md](plans/readme-split.md).
+
+- **README.md** (from about 500 lines to about 190): a one-line pitch, an example with its output, what sbx enforces (one line each, linked), setup recipes (own image, network egress, batch jobs, a server that runs one sandbox per request, Cloud Run, gVisor, checking a setup), limits, a documentation index, building from source.
+- **docs/** has the README's reference text word for word, one file per topic: `how-it-works.md`, `configuration.md`, `egress.md`, `report.md`, `cgroup.md`, `platforms.md`, `development.md`. Links were rewritten (`#anchor` to `file.md#anchor`, repository paths with `../`). `configuration.md` has new subheadings (Policy file, Upgrading, Flags and environment variables, Commands, Exit codes), and the `sbx version` line moved there from the report section. `development.md` has subheadings CI and Checks under gVisor, and lists the docs in its file map.
+- **References to README sections** now name the docs files: the CHANGELOG's links, the two `src/cgroup.rs` error messages, `src/policy.rs` comments, the four policies' comments, the Makefile's help, `tests/cloud-run.sh` (comments and two `die` messages). CHANGELOG v0.6.1 has a "Changed" entry.
+- **Verified** (arm64 Mac, podman machine):
+  - a script: every sentence, table row and code line of the old README is in the new README or docs, link targets aside, except three edited on purpose (the `make gvisor` paragraph's first sentence, the `exit_code` row's link text, "then" dropped from the flags sentence); every relative link and anchor in README.md, docs/*.md and CHANGELOG.md resolves (94 links)
+  - the README's example output is from `podman run` of `make image`; the own-image Dockerfile built on `python:3.13-slim-bookworm` and ran a program with `--ro /code`; the egress recipe (example policy with a reachable upstream, `--cap-add=SYS_PTRACE`, `--egress pypi.org:443`) fetched from pypi.org and got NXDOMAIN for example.com
+  - `sbx policy` accepts the four edited policies
+  - `cargo fmt --check`, clippy `-D warnings` and the 112 unit tests in `rust:1.97.0-slim-bookworm`
+- **Not verified here:** the Cloud Run and gVisor recipes, which are the README's earlier commands; `make smoke`, since only comments and two error messages changed in the code.

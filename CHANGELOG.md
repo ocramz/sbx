@@ -4,8 +4,12 @@
 
 ### Added
 
-- **`seccomp.deny` may name `shmget`, `semget`, `msgget` and `mq_open`** (#20). These calls create SysV IPC objects and POSIX message queues, which outlive the program. Deny them where the runtime can neither list nor remove those objects between runs: gVisor has no `/proc/sysvipc`. They are not denied by default. A denial counts in the report under the call's name with the listener, and kills with SIGSYS under `notify = "off"`, `on_violation = "kill"`. `policy/gvisor.example.toml` shows the line, commented out. See the README, [Without the listener](README.md#without-the-listener).
+- **`seccomp.deny` may name `shmget`, `semget`, `msgget` and `mq_open`** (#20). These calls create SysV IPC objects and POSIX message queues, which outlive the program. Deny them where the runtime can neither list nor remove those objects between runs: gVisor has no `/proc/sysvipc`. They are not denied by default. A denial counts in the report under the call's name with the listener, and kills with SIGSYS under `notify = "off"`, `on_violation = "kill"`. `policy/gvisor.example.toml` shows the line, commented out. See [Without the listener](docs/platforms.md#without-the-listener).
 NB this is a backward-compatible change.
+
+### Changed
+
+- **The README is an introduction:** what sbx is, an example, and setup recipes for typical scenarios. The reference moved to `docs/`, one file per topic: [how sbx works](docs/how-it-works.md), [configuration](docs/configuration.md), [egress](docs/egress.md), [the report](docs/report.md), [cgroup limits](docs/cgroup.md), [platforms](docs/platforms.md) and [development](docs/development.md). The text is unchanged.
 
 ## v0.6
 
@@ -28,7 +32,7 @@ sbx refuses a policy without it and says what to add. The shipped policies alrea
   - **`policy/gvisor.example.toml`:** Landlock off, `notify = "off"`, `on_violation = "kill"`, cgroup off, no network, sampling off. The image ships it as `/etc/sbx/gvisor.example.toml` and validates it during the build.
   - **`make gvisor`** builds a static linux/amd64 sbx and runs `tests/gvisor.py` in a Modal sandbox under gVisor, through the uv script `tests/modal_gvisor.py` (`--runtime vm` for a control).
 
-  See the README, [Without the listener](README.md#without-the-listener).
+  See [Without the listener](docs/platforms.md#without-the-listener).
 
 ### Changed
 
@@ -56,7 +60,7 @@ sbx refuses a policy without it and says what to add. The shipped policies alrea
   - **Setup and probe:** `--series` with the mode off is refused at the new setup stage `series`. `sbx probe --series FILE` checks the destination.
   - **The report:** it keeps its 12 keys. If the series cannot be written, sbx exits 125 and the report's `supervisor_error` says why.
 
-  See the README, [Time series](README.md#time-series).
+  See [Time series](docs/report.md#time-series).
 
 ### Changed
 
@@ -88,7 +92,7 @@ sbx refuses a policy without it and says what to add. The shipped policies alrea
 
 ### Added
 
-- Memory by kind (#10). With `[measure] memory_sample_ms` above 0, sbx samples the sandbox's memory while the program runs and the report gets a `memory` key (`null` with sampling off): the largest process's anonymous, file-backed and shared resident memory, the tree's anonymous total, memfds (mapped or not), SysV segments (attached or not), the use of the tmpfs mounts listed in `[measure] tmpfs`, and, with a delegated cgroup, its `memory.stat` `anon` and `shmem`, plus how many processes exited before any sample saw them. Sampled peaks are lower bounds; `rusage.max_rss_kib` stays the exact single-process peak. Sampling needs `CAP_SYS_PTRACE`, which `sbx probe` and `sbx run` check. See the README, [Memory by kind](README.md#memory-by-kind).
+- Memory by kind (#10). With `[measure] memory_sample_ms` above 0, sbx samples the sandbox's memory while the program runs and the report gets a `memory` key (`null` with sampling off): the largest process's anonymous, file-backed and shared resident memory, the tree's anonymous total, memfds (mapped or not), SysV segments (attached or not), the use of the tmpfs mounts listed in `[measure] tmpfs`, and, with a delegated cgroup, its `memory.stat` `anon` and `shmem`, plus how many processes exited before any sample saw them. Sampled peaks are lower bounds; `rusage.max_rss_kib` stays the exact single-process peak. Sampling needs `CAP_SYS_PTRACE`, which `sbx probe` and `sbx run` check. See [Memory by kind](docs/report.md#memory-by-kind).
 
 ## v0.3.1
 
@@ -113,9 +117,9 @@ sbx refuses a policy without it and says what to add. The shipped policies alrea
 
 ### Added
 
-- `--report FILE` / `SBX_REPORT_FILE`: `sbx run` writes how the run ended to a root-owned JSON file. The report holds the exit code or signal, whether it timed out, the setup stage that failed, denied syscalls, processes left behind, wall and CPU time, and peak memory. The file is written once the sandbox is gone, and only to a directory the sandbox cannot write. `sbx probe --report FILE` checks the destination. See the README, [Job report and log file](README.md#job-report-and-log-file).
+- `--report FILE` / `SBX_REPORT_FILE`: `sbx run` writes how the run ended to a root-owned JSON file. The report holds the exit code or signal, whether it timed out, the setup stage that failed, denied syscalls, processes left behind, wall and CPU time, and peak memory. The file is written once the sandbox is gone, and only to a directory the sandbox cannot write. `sbx probe --report FILE` checks the destination. See [Job report and log file](docs/report.md#job-report-and-log-file).
 - `--log FILE` / `SBX_LOG_FILE`: sbx's own log lines go to a file instead of the program's stderr.
-- `[cgroup] mode = "delegated"` with `memory_mb` and `pids`: the sandbox runs in a cgroup of its own with `memory.max` and `pids.max`. An OOM kill then hits the program, not sbx, and the report records it. This needs a delegated cgroup v2, e.g. podman `--systemd=always`. See the README, [cgroup limits](README.md#cgroup-limits).
+- `[cgroup] mode = "delegated"` with `memory_mb` and `pids`: the sandbox runs in a cgroup of its own with `memory.max` and `pids.max`. An OOM kill then hits the program, not sbx, and the report records it. This needs a delegated cgroup v2, e.g. podman `--systemd=always`. See [cgroup limits](docs/cgroup.md).
 - `sbx version` prints the release tag.
 
 ### Changed

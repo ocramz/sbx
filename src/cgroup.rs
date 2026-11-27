@@ -187,7 +187,7 @@ impl Changes {
             Some(libc::EROFS) => format!(
                 "mkdir {}: {e}: {MOUNT} is mounted read-only, so no cgroup is delegated to sbx (podman: \
                  --systemd=always; Docker and Kubernetes give a writable cgroupfs only to privileged containers; \
-                 see the README, \"cgroup limits\")",
+                 see docs/cgroup.md)",
                 p.display()
             ),
             _ => format!("mkdir {}: {e}", p.display()),
@@ -257,7 +257,7 @@ impl Delegation {
         if !others.is_empty() {
             return Err(format!(
                 "sbx's cgroup {b} also contains {}; sbx needs a cgroup of its own (start it in a cgroup with \
-                 nothing else in it, see the README, \"cgroup limits\")",
+                 nothing else in it, see docs/cgroup.md)",
                 others.join(", ")
             ));
         }

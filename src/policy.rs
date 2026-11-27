@@ -110,7 +110,7 @@ pub struct Limits {
     pub cpu_secs: Limit,
 }
 
-/// cgroup v2 limits for the whole sandbox (see the README, "cgroup limits").
+/// cgroup v2 limits for the whole sandbox (see docs/cgroup.md).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawCgroup", into = "RawCgroup")]
 pub enum CgroupCfg {
@@ -173,8 +173,8 @@ impl From<CgroupCfg> for RawCgroup {
     }
 }
 
-/// What sbx measures while the program runs, besides rusage (see the
-/// README, "Job report and log file").
+/// What sbx measures while the program runs, besides rusage (see
+/// docs/report.md, "Memory by kind").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawMeasure", into = "RawMeasure")]
 pub enum MeasureCfg {
@@ -251,8 +251,8 @@ impl From<MeasureCfg> for RawMeasure {
     }
 }
 
-/// Whether sbx keeps every memory sample for `--series FILE` (see the
-/// README, "Time series"). Without `--series` nothing is kept.
+/// Whether sbx keeps every memory sample for `--series FILE` (see
+/// docs/report.md, "Time series"). Without `--series` nothing is kept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawSeries", into = "RawSeries")]
 pub enum SeriesCfg {
@@ -449,7 +449,7 @@ pub enum Notify {
     Listener,
     /// No listener, for kernels without seccomp user notification (gVisor):
     /// the kernel applies `on_violation` itself, and matches are neither
-    /// logged nor counted (see the README, "Without the listener").
+    /// logged nor counted (see docs/platforms.md, "Without the listener").
     Off,
 }
 
@@ -513,7 +513,7 @@ pub enum Timeout {
 }
 
 /// A Landlock ABI version, or "off": no Landlock at all, so files are
-/// protected by their permissions only (see the README, "Without Landlock").
+/// protected by their permissions only (see docs/platforms.md, "Without Landlock").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LandlockAbi {
     V(u8),
@@ -1863,7 +1863,7 @@ access = "rw"
         );
         assert!(errs("[]", MAX_SERIES_SAMPLES, 0).is_ok());
         assert!(errs("[]", 1, MAX_SERIES_PROCESSES).is_ok());
-        // The README's example, with one tmpfs mount measured: the path
+        // The example in docs/report.md, with one tmpfs mount measured: the path
         // need not exist for the bound.
         let over = |tmpfs: &str, samples: u32, procs: u32| {
             errs(tmpfs, samples, procs).is_err_and(|e| e.iter().any(|e| e.contains("ceiling")))

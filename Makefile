@@ -117,7 +117,7 @@ MODAL_IMAGE := localhost/sbx-modal:$(VERSION)
 MODAL_SBX   := target/modal/sbx
 
 .PHONY: gvisor
-gvisor: ## checks under gVisor in a Modal sandbox (uv, Modal credentials; README "Without the listener")
+gvisor: ## checks under gVisor in a Modal sandbox (uv, Modal credentials; docs/platforms.md, "Without the listener")
 	$(MAKE) --no-print-directory image PLATFORM=linux/amd64 REGISTRY=localhost IMAGE_NAME=sbx-modal
 	mkdir -p $(dir $(MODAL_SBX))
 # No --platform: podman may record the build machine's variant (amd64/v8),
@@ -156,7 +156,7 @@ manifest: ## push an index of ARCHS' pushed images as $(IMAGE):$(VERSION) and ea
 	$(DOCKER) manifest rm $(MANIFEST)
 
 .PHONY: live
-live: ## live tests on a Cloud Run service and jobs: build, push, deploy, run the tests, logs (README)
+live: ## live tests on a Cloud Run service and jobs: build, push, deploy, run the tests, logs (docs/development.md)
 	tests/cloud-run.sh all
 
 .PHONY: live-down
