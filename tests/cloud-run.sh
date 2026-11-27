@@ -2,7 +2,7 @@
 # Live tests on Cloud Run: build the test image on this machine, push it to
 # Artifact Registry, create or update a service and two jobs, run the suites
 # on them and print their logs. Authenticates with a service account JSON key
-# only; the one-time setup is in the README ("Live tests on Cloud Run").
+# only; the one-time setup is in docs/development.md ("Live tests on Cloud Run").
 #
 #   usage: tests/cloud-run.sh up|deploy|test|logs|down|all
 #
@@ -82,7 +82,7 @@ exists() {
 # login and configuration are never read or changed.
 auth() {
 	need gcloud jq
-	[ -n "${GCP_KEY_FILE:-}" ] || die "set GCP_KEY_FILE to the service account JSON key (README: Live tests on Cloud Run)"
+	[ -n "${GCP_KEY_FILE:-}" ] || die "set GCP_KEY_FILE to the service account JSON key (docs/development.md: Live tests on Cloud Run)"
 	[ -n "${GCP_REGION:-}" ] || die "set GCP_REGION, e.g. europe-west1"
 	[ -r "$GCP_KEY_FILE" ] || die "GCP_KEY_FILE $GCP_KEY_FILE is not readable"
 	[ "$(jq -r '.type // empty' "$GCP_KEY_FILE" 2>/dev/null)" = service_account ] ||
@@ -107,7 +107,7 @@ auth() {
 cmd_up() {
 	echo "== up"
 	exists iam service-accounts describe "$RUNTIME_SA" ||
-		die "service account $RUNTIME_SA does not exist (README, one-time setup)"
+		die "service account $RUNTIME_SA does not exist (docs/development.md, one-time setup)"
 	if exists artifacts repositories describe "$REPO"; then
 		echo "  repository $REPO exists"
 	else
@@ -255,7 +255,7 @@ spec:
 EOF
 	gcloud run jobs replace "$TMP/$SUITES_JOB.yaml"
 	echo "== deploy job $PID1_JOB ($1)"
-	# The README's job: the image's entrypoint (sbx run) is PID 1, configured
+	# The job in docs/platforms.md: the image's entrypoint (sbx run) is PID 1, configured
 	# through SBX_* variables, with an in-memory volume as the working directory.
 	cat >"$TMP/$PID1_JOB.yaml" <<EOF
 apiVersion: run.googleapis.com/v1
@@ -344,7 +344,7 @@ test_job() {
 	check_execution "job:smoke" succeeded "== [0-9]+ passed, 0 failed"
 	execute "$PID1_JOB" "" " passed, "
 	check_execution "job:pid1 egress" succeeded "landlock: off" "== [0-9]+ passed, 0 failed"
-	# A run with other arguments, as the README's per-execution example: sbx's
+	# A run with other arguments, as the per-execution example in docs/platforms.md: sbx's
 	# exit code 124 has to fail the task.
 	execute "$PID1_JOB" "--timeout=2,--,/bin/sleep,30" "timeout after 2s"
 	check_execution "job:pid1 timeout fails the task" failed "timeout after 2s"

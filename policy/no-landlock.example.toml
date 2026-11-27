@@ -1,6 +1,6 @@
 # Example policy for kernels without Landlock (Cloud Run, both generations):
-# the egress example with landlock.abi = "off". See the README, "Without
-# Landlock", for what this gives up. In short, files are protected by their
+# the egress example with landlock.abi = "off". See docs/platforms.md,
+# "Without Landlock", for what this gives up. In short, files are protected by their
 # permissions only, so the program can read everything world-readable in the
 # image and volumes, write everything world-writable, and run any
 # world-executable binary. Use it only if:
@@ -40,14 +40,14 @@ as_mb = "unlimited"
 cpu_secs = "unlimited"
 
 [cgroup]
-mode = "off"               # or "delegated" with memory_mb and pids (README, "cgroup limits")
+mode = "off"               # or "delegated" with memory_mb and pids (docs/cgroup.md)
 
 [measure]
-memory_sample_ms = 0       # or e.g. 20 to record memory by kind (README, "Job report and log file")
+memory_sample_ms = 0       # or e.g. 20 to record memory by kind (docs/report.md, "Memory by kind")
 tmpfs = []                 # tmpfs mounts whose use is recorded, with sampling on
 
 [measure.series]
-mode = "off"               # or "on" with max_samples, max_processes and compression, for --series FILE (README, "Time series")
+mode = "off"               # or "on" with max_samples, max_processes and compression, for --series FILE (docs/report.md, "Time series")
 
 [env]
 pass = []
@@ -74,7 +74,7 @@ timeout_ms = 2000
 answer_scopes = ["global"]
 
 [seccomp]
-notify = "listener"        # listener | off (README, "Without the listener")
+notify = "listener"        # listener | off (docs/platforms.md, "Without the listener")
 on_violation = "errno"
 deny = []
 allow = []

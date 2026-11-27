@@ -3,7 +3,7 @@
 # Every field is required and unknown fields are rejected; sbx has no
 # built-in defaults. Point SBX_POLICY_FILE (or --policy) at a copy to change
 # it, e.g. mounted from Secret Manager, or extend it per run with
-# SBX_FS_RO/RW/RX, SBX_EGRESS, --rw, --egress ... (see the README).
+# SBX_FS_RO/RW/RX, SBX_EGRESS, --rw, --egress ... (see docs/configuration.md).
 #
 # The image build runs `sbx policy` on this file, so a rule naming a path
 # that does not exist (or is a symlink) in the image fails the build.
@@ -29,7 +29,7 @@ as_mb = "unlimited"        # an address-space cap breaks Go, the JVM and V8
 cpu_secs = "unlimited"
 
 # Limits for the whole sandbox in a cgroup of its own. "delegated" needs a
-# writable cgroup v2 that holds only sbx (see the README, "cgroup limits"),
+# writable cgroup v2 that holds only sbx (see docs/cgroup.md),
 # which plain Docker and Kubernetes containers do not give; then also set
 #   memory_mb = 512          # memory.max (swap off); page cache and tmpfs count
 #   pids = 256               # pids.max: processes and threads
@@ -62,7 +62,7 @@ bind_tcp = []              # egress mode only
 egress = []                # egress mode only, see policy/egress.example.toml
 
 [seccomp]
-notify = "listener"        # listener | off (README, "Without the listener")
+notify = "listener"        # listener | off (docs/platforms.md, "Without the listener")
 on_violation = "errno"     # errno | kill
 deny = []                  # e.g. ["memfd_create", "execveat"]
 allow = []                 # e.g. ["ptrace"] to permit debuggers inside the sandbox
